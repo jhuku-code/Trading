@@ -8,7 +8,7 @@ ccxt
 tabulate
 matplotlib
 seaborn
-sklearn
+scikit-learn
 scipy
 defillama2
 dateutil
