@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+openpyxl
+yfinance
+requests
+ccxt
+tabulate
+matplotlib
+seaborn
+sklearn
+scipy
+defillama2
+dateutil
+tqdm
