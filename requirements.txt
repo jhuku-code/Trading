@@ -8,9 +8,9 @@ ccxt
 tabulate
 matplotlib
 seaborn
-sklearn
+scikit-learn
 scipy
 defillama2
-python-dateutil
-tqdm
+python-dateutil>=2.8.1
+
 
