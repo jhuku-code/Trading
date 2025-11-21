@@ -37,6 +37,14 @@ if "last_fetch" not in st.session_state:
     st.session_state.last_fetch = None
 if "fetch_status" not in st.session_state:
     st.session_state.fetch_status = "Idle"
+if "price_theme_version" not in st.session_state:
+    st.session_state.price_theme_version = None
+if "price_timeframe" not in st.session_state:
+    st.session_state.price_timeframe = None
+if "theme_values" not in st.session_state:
+    st.session_state.theme_values = None
+if "theme_list" not in st.session_state:
+    st.session_state.theme_list = None
 
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
@@ -55,6 +63,10 @@ def get_exchange():
     return exchange
 
 def fetch_price_theme(exchange, theme_list, timeframe="1d", limit=90, sleep_seconds=0.2):
+    """
+    theme_list: list of tickers (normalized, e.g., 'BTC', 'ETH')
+    returns: (price_theme_df, failures_list)
+    """
     frames = []
     pairs = [f"{sym}/USDT" for sym in theme_list]
 
@@ -78,6 +90,8 @@ def fetch_price_theme(exchange, theme_list, timeframe="1d", limit=90, sleep_seco
         i += 1
         try:
             base = pair.split('/')[0]
+            # ensure base ticker is uppercase to match Excel normalization
+            base = base.upper()
             ohlcv = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
             df_ohlc = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_ohlc['timestamp'] = pd.to_datetime(df_ohlc['timestamp'], unit='ms')
@@ -94,6 +108,10 @@ def fetch_price_theme(exchange, theme_list, timeframe="1d", limit=90, sleep_seco
 
     price_theme = pd.concat(frames, axis=1).sort_index()
     price_theme = price_theme.dropna(axis=1, how='all')
+
+    # Normalize column names to uppercase (defensive)
+    price_theme.columns = [str(c).upper() for c in price_theme.columns]
+
     return price_theme, failures
 
 def compute_final_df(price_theme, theme_list, themes, timeframe):
@@ -145,6 +163,7 @@ def compute_final_df(price_theme, theme_list, themes, timeframe):
     returns_df.index.name = 'Coin'
 
     # Map coin -> theme (be forgiving on case)
+    # theme_list should already be normalized to match price_theme columns (uppercase)
     ticker_to_theme = dict(zip(theme_list, themes))
     remaining_tickers = returns_df.T.columns.to_list()
     theme_values = []
@@ -235,8 +254,13 @@ if st.sidebar.button("🔄 Refresh / Fetch Data"):
                 # Map correct columns (case-insensitive)
                 symbol_col = next(c for c in df_themes.columns if c.lower() == 'symbol')
                 theme_col = next(c for c in df_themes.columns if c.lower() == 'theme')
-                theme_list = df_themes[symbol_col].astype(str).str.strip().tolist()
-                themes = df_themes[theme_col].astype(str).str.strip().tolist()
+
+                # Normalize symbols to uppercase to match fetch naming; preserve theme names as provided (trimmed)
+                theme_list_raw = df_themes[symbol_col].astype(str).str.strip().tolist()
+                themes_raw = df_themes[theme_col].astype(str).str.strip().tolist()
+
+                theme_list = [s.upper() for s in theme_list_raw]
+                themes = [t for t in themes_raw]
 
                 # start fetch
                 exchange = get_exchange()
@@ -250,6 +274,39 @@ if st.sidebar.button("🔄 Refresh / Fetch Data"):
                 with st.spinner("Computing final_df (returns & excess returns)..."):
                     st.session_state.final_df = compute_final_df(price_theme, theme_list, themes, timeframe)
                 st.session_state.fetch_status = "Done"
+
+                # --- NEW: expose the price_theme + theme mapping + friendly timeframe to other pages ---
+                # Ensure price_theme columns are uppercase strings
+                if price_theme is not None and not price_theme.empty:
+                    cols = [str(c).upper() for c in price_theme.columns]
+                    # rename to canonical uppercase (defensive)
+                    price_theme.columns = cols
+                    st.session_state.price_theme = price_theme
+                else:
+                    cols = theme_list  # fallback if fetch failed
+
+                # Create mapping ticker -> Theme (case-insensitive)
+                ticker_to_theme = {t: th for t, th in zip(theme_list, themes)}
+                ticker_to_theme_upper = {t.upper(): th for t, th in zip(theme_list, themes)}
+
+                # Create theme_values list aligned to price_theme.columns
+                theme_values_aligned = []
+                for c in cols:
+                    theme_values_aligned.append(
+                        ticker_to_theme.get(c, ticker_to_theme_upper.get(c.upper(), "Unknown"))
+                    )
+
+                # Save to session_state: other page will read these keys
+                st.session_state['price_theme'] = st.session_state.get('price_theme')  # DataFrame of wide prices
+                st.session_state['theme_values'] = theme_values_aligned  # list aligned to columns order
+                st.session_state['theme_list'] = cols  # list of tickers representing columns order
+
+                # Save a friendly timeframe label for the charting page
+                tf_map = {"1d": "daily", "4h": "4hourly", "1h": "1hourly"}
+                st.session_state['price_timeframe'] = tf_map.get(timeframe, timeframe)
+
+                # Optional: a small version token so other pages can detect updates and clear cache
+                st.session_state['price_theme_version'] = datetime.utcnow().timestamp()
 
                 # show any failed pairs in sidebar
                 if failures:
@@ -322,7 +379,7 @@ else:
     if show_returns_df:
         st.subheader("Raw returns_df (latest target date)")
         # Recompute a simple returns_df for debug display (or show subset of final_df)
-        lookback_cols = [c for c in display_df.columns if (c.endswith('H') or c.endswith('d')) and not c.endswith('_Excess')]
+        lookback_cols = [c for c in display_df.columns if (str(c).endswith('H') or str(c).endswith('d')) and not str(c).endswith('_Excess')]
         cols_to_show = ['Coin'] + lookback_cols
         st.dataframe(display_df[display_df.columns.intersection(cols_to_show)].head(200))
 
