@@ -138,7 +138,7 @@ except Exception:
 # Streamlit-based view controls (only these control the view/range)
 # -------------------------
 # Available options (period counts)
-period_options = ["1 period", "30 periods", "60 periods", "180 periods", "All"]
+period_options = ["1 period", "10 periods", "30 periods", "60 periods", "180 periods", "All"]
 
 # Use session_state to keep selection persistent and allow quick-button updates
 if "view_option" not in st.session_state:
@@ -146,7 +146,7 @@ if "view_option" not in st.session_state:
 
 # Quick buttons row: 1p, 30p, 60p, 180p, All
 btn_cols = st.columns([1, 1, 1, 1, 1])
-labels = ["1 period", "30 periods", "60 periods", "180 periods", "All"]
+labels = ["1 period", "10 periods", "30 periods", "60 periods", "180 periods", "All"]
 for c, label in zip(btn_cols, labels):
     if c.button(label.split()[0] + ("p" if "period" in label else ""), key=f"btn_{label}"):
         st.session_state.view_option = label
@@ -265,3 +265,4 @@ with st.expander("Show underlying price_theme (wide) and theme mapping"):
         st.write("Could not display mapping cleanly (unexpected format).")
 
 st.success("Chart ready — use Streamlit controls above to change the view window (periods) and rebase.")
+
