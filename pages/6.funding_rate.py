@@ -375,3 +375,4 @@ with col6:
     st.markdown("**Bottom coins (`bottom_coins`)**")
     bottom_z_filtered = filter_series(bottom_z)
     st.dataframe(bottom_z_filtered.to_frame(name="zscore_latest"))
+
