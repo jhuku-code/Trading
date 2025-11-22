@@ -1,14 +1,12 @@
-# funding_rates.py
+# app.py
 
 import time
-from datetime import datetime
 from typing import List, Dict
 
 import requests
 import pandas as pd
 import streamlit as st
 from scipy.stats import zscore
-
 
 # -----------------------------
 # Streamlit page configuration
@@ -59,7 +57,6 @@ class BinanceFundingRateCollector:
         all_data = []
         current_start = start_time
 
-        # Binance allows querying up to 1000 entries; we chunk by time
         while current_start < end_time:
             batch_end = min(current_start + (333 * 24 * 60 * 60 * 1000), end_time)
             batch_data = self.get_funding_rate_history(symbol, current_start, batch_end, 1000)
@@ -92,6 +89,10 @@ class BinanceFundingRateCollector:
         return df
 
     def get_active_futures_symbols(self) -> List[str]:
+        """
+        Try to get active USDT perpetual symbols from Binance.
+        May fail with 451 in some regions.
+        """
         url = f"{self.base_url}/fapi/v1/exchangeInfo"
         try:
             response = self.session.get(url)
@@ -108,6 +109,16 @@ class BinanceFundingRateCollector:
                     symbols.append(symbol_info['symbol'])
 
             return sorted(symbols)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 451:
+                st.warning(
+                    "Binance API returned **451 (Unavailable for legal reasons)**. "
+                    "This usually means futures data is restricted in your region. "
+                    "Use the *Custom symbol list* mode instead."
+                )
+            else:
+                st.error(f"HTTP error fetching symbols: {e}")
+            return []
         except requests.exceptions.RequestException as e:
             st.error(f"Error fetching symbols: {e}")
             return []
@@ -116,17 +127,20 @@ class BinanceFundingRateCollector:
 # -----------------------------
 # Core analysis functions
 # -----------------------------
-def analyze_annualized_rate_percent(days_back=90, outlier_method="iqr"):
+def analyze_annualized_rate_percent(
+    symbols: List[str],
+    days_back: int = 90,
+    outlier_method: str = "iqr"
+):
     collector = BinanceFundingRateCollector()
 
-    # Step 1: Get list of active USDT perpetual futures
-    all_symbols = collector.get_active_futures_symbols()
-    if not all_symbols:
+    if not symbols:
+        st.error("No symbols provided. Please add symbols in the sidebar.")
         return None, None, None, None
 
     all_data = []
     progress = st.progress(0)
-    for i, symbol in enumerate(all_symbols):
+    for i, symbol in enumerate(symbols):
         try:
             raw_data = collector.get_all_funding_rates(symbol, days_back)
             if raw_data:
@@ -136,15 +150,15 @@ def analyze_annualized_rate_percent(days_back=90, outlier_method="iqr"):
         except Exception as e:
             st.write(f"Skipping {symbol}: {e}")
 
-        progress.progress((i + 1) / len(all_symbols))
+        progress.progress((i + 1) / len(symbols))
 
     if not all_data:
-        st.error("No data collected from Binance.")
+        st.error("No data collected from Binance for the given symbols.")
         return None, None, None, None
 
     combined_df = pd.concat(all_data, ignore_index=True)
 
-    # Step 3: Outlier removal based on annualizedRatePercent
+    # Outlier removal
     if outlier_method == "iqr":
         q1 = combined_df['annualizedRatePercent'].quantile(0.25)
         q3 = combined_df['annualizedRatePercent'].quantile(0.75)
@@ -158,7 +172,7 @@ def analyze_annualized_rate_percent(days_back=90, outlier_method="iqr"):
     else:
         filtered_df = combined_df.copy()
 
-    # Step 4: Get latest value per symbol
+    # Latest value per symbol
     latest_df = (
         filtered_df.sort_values("fundingTime")
         .groupby("symbol")
@@ -166,10 +180,9 @@ def analyze_annualized_rate_percent(days_back=90, outlier_method="iqr"):
         .set_index("symbol")
     )
 
-    # Step 5: Compute z-score
+    # Z-score on latest annualizedRatePercent cross-section
     latest_df['zscore_annualized'] = zscore(latest_df['annualizedRatePercent'])
 
-    # Step 6: Top/Bottom 10
     top_10 = latest_df.sort_values("zscore_annualized", ascending=False).head(10)
     bottom_10 = latest_df.sort_values("zscore_annualized", ascending=True).head(10)
 
@@ -177,10 +190,6 @@ def analyze_annualized_rate_percent(days_back=90, outlier_method="iqr"):
 
 
 def reshape_funding_data_by_hour(filtered_data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reshapes filtered funding data into a time-indexed DataFrame with symbols as columns
-    and hourly funding rate values (annualizedRatePercent).
-    """
     if filtered_data is None or filtered_data.empty:
         raise ValueError("Input DataFrame is empty.")
 
@@ -196,30 +205,19 @@ def reshape_funding_data_by_hour(filtered_data: pd.DataFrame) -> pd.DataFrame:
     )
 
     pivot_df = grouped.pivot(index='fundingHour', columns='symbol', values='annualizedRatePercent')
-
     pivot_df = pivot_df.sort_index().sort_index(axis=1)
-
     return pivot_df
 
 
 def compute_latest_zscores_and_highlight(df_hourly_annualized: pd.DataFrame):
-    """
-    Compute latest z-scores for each coin vs its own history,
-    and return coins with extreme high/low scores.
-    """
-
-    # Compute z-scores for each column, preserving index and ignoring NaNs
     def col_z(col: pd.Series) -> pd.Series:
         if col.notna().sum() < 2:
-            # Cannot compute z-score with <2 points
             return pd.Series([pd.NA] * len(col), index=col.index)
         z = zscore(col, nan_policy='omit')
-        # zscore returns np.ndarray; keep same index
         return pd.Series(z, index=col.index)
 
     zscore_df = df_hourly_annualized.apply(col_z, axis=0)
 
-    # Latest z-score for each coin (last non-NaN)
     latest_zscores = zscore_df.ffill().iloc[-1]
 
     high_threshold = 0.9
@@ -231,11 +229,9 @@ def compute_latest_zscores_and_highlight(df_hourly_annualized: pd.DataFrame):
     return latest_zscores, top_coins, bottom_coins
 
 
-# -----------------------------
-# Wrapper to run full analysis
-# -----------------------------
-def run_full_analysis(days_back: int, outlier_method: str):
+def run_full_analysis(symbols: List[str], days_back: int, outlier_method: str):
     filtered_data, latest_data, top_10_z, bottom_10_z = analyze_annualized_rate_percent(
+        symbols=symbols,
         days_back=days_back,
         outlier_method=outlier_method
     )
@@ -279,21 +275,54 @@ outlier_method = st.sidebar.selectbox(
     help="Method for removing outliers on annualized funding rates."
 )
 
+symbol_source = st.sidebar.radio(
+    "Symbol source",
+    options=["Custom list", "Binance API"],
+    index=0,
+    help="Use a custom list to avoid Binance geo restrictions."
+)
+
+default_symbols_text = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+
+custom_symbols_text = st.sidebar.text_area(
+    "Custom futures symbols (comma-separated)",
+    value=default_symbols_text,
+    help="Example: BTCUSDT,ETHUSDT,SOLUSDT"
+)
+
 refresh_button = st.sidebar.button("🔄 Refresh data")
 
+
+# -----------------------------
+# Determine symbol list
+# -----------------------------
+collector_for_symbols = BinanceFundingRateCollector()
+
+if symbol_source == "Binance API":
+    api_symbols = collector_for_symbols.get_active_futures_symbols()
+    if not api_symbols:
+        st.warning(
+            "Could not fetch symbols from Binance. "
+            "Falling back to custom symbol list."
+        )
+        symbols = [s.strip().upper() for s in custom_symbols_text.split(",") if s.strip()]
+    else:
+        symbols = api_symbols
+else:
+    symbols = [s.strip().upper() for s in custom_symbols_text.split(",") if s.strip()]
 
 # -----------------------------
 # Data loading with refresh
 # -----------------------------
 if "funding_results" not in st.session_state or refresh_button:
     with st.spinner("Fetching funding rate data from Binance..."):
-        results = run_full_analysis(days_back, outlier_method)
+        results = run_full_analysis(symbols, days_back, outlier_method)
         st.session_state["funding_results"] = results
 
 results = st.session_state.get("funding_results", None)
 
 if not results:
-    st.stop()  # nothing to show
+    st.stop()
 
 latest_data = results["latest_data"]
 top_10_z = results["top_10_z"]
@@ -322,7 +351,6 @@ def filter_indexed_df(df: pd.DataFrame) -> pd.DataFrame:
         return df
     if not selected_symbols:
         return df
-    # Assume index contains symbols
     return df[df.index.isin(selected_symbols)]
 
 
@@ -335,7 +363,7 @@ def filter_series(s: pd.Series) -> pd.Series:
 
 
 # -----------------------------
-# Section 1: Latest funding & z-scores (from latest_df)
+# Section 1: latest_df, top_10, bottom_10
 # -----------------------------
 st.markdown("## Latest Annualized Funding Rates (Per Symbol)")
 
@@ -355,7 +383,7 @@ with col3:
 
 
 # -----------------------------
-# Section 2: Latest z-scores vs own history
+# Section 2: latest_zscores, top_coins, bottom_coins
 # -----------------------------
 st.markdown("## Latest Z-Scores vs Each Coin's Own History")
 
@@ -375,4 +403,3 @@ with col6:
     st.markdown("**Bottom coins (`bottom_coins`)**")
     bottom_z_filtered = filter_series(bottom_z)
     st.dataframe(bottom_z_filtered.to_frame(name="zscore_latest"))
-
