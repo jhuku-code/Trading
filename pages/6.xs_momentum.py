@@ -56,7 +56,7 @@ if "xs_momentum_results" not in st.session_state:
 # ---------------------------------------------------------
 def clean_returns(returns_h: pd.DataFrame, rolling_window: int = 60) -> pd.DataFrame:
     cleaned_data = returns_h.copy()
-    if (cleaned_data.iloc[0] == 0).all():
+    if len(cleaned_data) > 0 and (cleaned_data.iloc[0] == 0).all():
         cleaned_data = cleaned_data.iloc[1:].copy()
 
     for col in cleaned_data.columns:
@@ -74,6 +74,9 @@ def compute_idmag_weighted(
 ):
     """
     Compute IDMAG as in Equation (2) of 'Frog in the Pan'.
+
+    If there is not enough data for any coin (idmag_df ends up empty),
+    we **skip** the Momentum Quality filter and return the full universe.
     """
     weights_by_quintile = {
         0: 5 / 15,  # Q1 (smallest abs)
@@ -89,6 +92,7 @@ def compute_idmag_weighted(
         r = returns_cleaned_h[coin].dropna()
 
         if len(r) < lookback:
+            # Not enough history for this coin
             idmag_all[coin] = np.nan
             continue
 
@@ -99,9 +103,13 @@ def compute_idmag_weighted(
             abs_returns = window_returns.abs()
 
             # Rank returns into 5 quintiles (labels 0-4)
-            quintile_labels = pd.qcut(
-                abs_returns, 5, labels=False, duplicates="drop"
-            )
+            try:
+                quintile_labels = pd.qcut(
+                    abs_returns, 5, labels=False, duplicates="drop"
+                )
+            except ValueError:
+                # Not enough unique values to form 5 buckets; skip this window
+                continue
 
             # Assign weights according to quintile
             weights = quintile_labels.map(weights_by_quintile)
@@ -120,17 +128,44 @@ def compute_idmag_weighted(
         # Average across all rolling windows
         idmag_all[coin] = np.mean(idmag_values) if len(idmag_values) > 0 else np.nan
 
-    # Create dataframe
-    idmag_df = pd.DataFrame(
-        [{"Name": coin, "IDMAG": idmag_all[coin]} for coin in idmag_all if not pd.isna(idmag_all[coin])]
-    )
+    # Build rows only for non-NaN IDMAG
+    rows = [
+        {"Name": coin, "IDMAG": idmag_val}
+        for coin, idmag_val in idmag_all.items()
+        if not pd.isna(idmag_val)
+    ]
+
+    if len(rows) == 0:
+        # No valid IDMAG values → skip filter
+        st.warning(
+            "IDMAG (Momentum Quality) could not be computed (not enough history vs lookback). "
+            "Using full universe without IDMAG filter."
+        )
+        idmag_df = pd.DataFrame(columns=["Name", "IDMAG"])
+        Mom_Qual = list(returns_cleaned_h.columns)
+        returns_cleaned_h_filtered = returns_cleaned_h.copy()
+
+        return {
+            "idmag_df": idmag_df,
+            "Mom_Qual": Mom_Qual,
+            "returns_cleaned_h_filtered": returns_cleaned_h_filtered,
+        }
+
+    # Normal case: we have IDMAG values
+    idmag_df = pd.DataFrame(rows)
+
+    # Sort by IDMAG (ascending)
     idmag_df = idmag_df.sort_values(by="IDMAG", ascending=True)
 
     # Filter top 80% (drop top 20%)
     cutoff = int(len(idmag_df) * 0.8)
-    Mom_Qual = idmag_df.iloc[:cutoff]["Name"].tolist()
+    if cutoff == 0:
+        # Degenerate case where we have very few coins
+        Mom_Qual = idmag_df["Name"].tolist()
+    else:
+        Mom_Qual = idmag_df.iloc[:cutoff]["Name"].tolist()
 
-    # Filter dataframes
+    # Filter dataframe
     returns_cleaned_h_filtered = returns_cleaned_h[Mom_Qual]
 
     return {
@@ -144,11 +179,11 @@ def get_high_idmag_list(idmag_df: pd.DataFrame, top_pct: float = 0.2):
     """
     Returns list of coin names in the top `top_pct` by IDMAG value.
     """
-    if len(idmag_df) == 0:
+    if idmag_df is None or idmag_df.empty or "IDMAG" not in idmag_df.columns:
         return []
 
     top_cutoff = int(len(idmag_df) * top_pct)
-    if top_cutoff == 0:
+    if top_cutoff <= 0:
         return []
 
     high_idmag_df = idmag_df.iloc[-top_cutoff:]  # Top 20% → end of ascending-sorted df
@@ -159,7 +194,7 @@ def get_high_idmag_list(idmag_df: pd.DataFrame, top_pct: float = 0.2):
 def clean_vol_scaled_returns(vol_scaled_returns: pd.DataFrame, rolling_window: int = 60):
     cleaned_data = vol_scaled_returns.copy()
 
-    if (cleaned_data.iloc[0] == 0).all():
+    if len(cleaned_data) > 0 and (cleaned_data.iloc[0] == 0).all():
         cleaned_data = cleaned_data.iloc[1:].copy()
 
     for col in cleaned_data.columns:
@@ -209,6 +244,9 @@ def calculate_momentum_scores(
 
 
 def generate_signals(ranks: pd.DataFrame, top_n: int = 8, bottom_n: int = 8):
+    if ranks is None or ranks.empty:
+        return pd.Series(dtype=object), pd.Series(dtype=object)
+
     buy_signals_dict = {}
     sell_signals_dict = {}
 
@@ -220,16 +258,19 @@ def generate_signals(ranks: pd.DataFrame, top_n: int = 8, bottom_n: int = 8):
             buy_signals_dict[idx] = buy_list
             sell_signals_dict[idx] = sell_list
 
-    buy_signals = pd.Series(buy_signals_dict)
-    sell_signals = pd.Series(sell_signals_dict)
+    buy_signals = pd.Series(buy_signals_dict, dtype=object)
+    sell_signals = pd.Series(sell_signals_dict, dtype=object)
     return buy_signals, sell_signals
 
 
 def format_signal_series_for_display(signal_series: pd.Series) -> pd.DataFrame:
     """
     Turn a pd.Series with index=date, values=list/iterable of tickers
-    into a DataFrame with Date / Ticketers column as comma-separated strings.
+    into a DataFrame with Date / Tickers column as comma-separated strings.
     """
+    if signal_series is None or len(signal_series) == 0:
+        return pd.DataFrame(columns=["Date", "Tickers"]).set_index("Date")
+
     def _to_str(val):
         if isinstance(val, (list, tuple, pd.Index, np.ndarray)):
             return ", ".join(map(str, val))
@@ -266,6 +307,10 @@ if refresh or st.session_state["xs_momentum_results"] is None:
 
     # ===== VOLATILITY SCALING =====
     returns_h = returns_cleaned_h_filtered.copy()
+
+    if returns_h is None or returns_h.empty:
+        st.error("No data available after IDMAG filtering / cleaning. Please check your price_theme input.")
+        st.stop()
 
     # Full period volatility (per coin)
     vol_full_period = returns_h.std()
@@ -401,7 +446,6 @@ st.subheader("Excess Momentum Signals – Universe")
 
 if len(universe_buy_df) > 0:
     available_datetimes = universe_buy_df.index.unique()
-    # Ensure sorted
     available_datetimes = available_datetimes.sort_values()
 
     selected_dt = st.selectbox(
