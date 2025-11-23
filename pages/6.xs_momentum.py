@@ -340,24 +340,32 @@ if refresh or st.session_state["xs_momentum_results"] is None:
     universe_sell_df = format_signal_series_for_display(sell_signals_universe)
 
     # ===== EXCESS MOMENTUM FOR EACH SECTOR / THEME =====
-    # Map filtered tickers to themes
+    # Map filtered tickers to themes (using current mapping)
     filtered_tickers_h = vol_scaled_returns_cleaned.columns.to_list()
     filtered_theme_values_h = [ticker_to_theme.get(t, "UNKNOWN") for t in filtered_tickers_h]
 
     vol_scaled_returns_cleaned_T = vol_scaled_returns_cleaned.T
     vol_scaled_returns_cleaned_T["Theme"] = filtered_theme_values_h
 
-    # Short list of themes (can edit as needed)
-    theme_list_short = ["DEX", "AI", "DEPIN", "L2", "GAMEFI", "RWA", "ZKPROOF", "CROSS_CHAIN", "MEME", "LENDING"]
+    # ---- DYNAMIC THEME LIST (this is the key change) ----
+    # Use the themes actually present in the mapping, ignore UNKNOWN / empty
+    theme_list_all = sorted(
+        {theme for theme in filtered_theme_values_h if theme and theme.upper() != "UNKNOWN"}
+    )
+
+    # Optionally show for debugging
+    st.write("Detected themes for XS momentum:", theme_list_all)
 
     # Build per-theme datasets (time index, tickers as columns, like vol_scaled_returns_cleaned)
     theme_datasets = {}
-    for theme in theme_list_short:
+    min_coins_per_theme = 3  # change to 5 if you want stricter filter
+
+    for theme in theme_list_all:
         theme_tickers = [
             t for t in filtered_tickers_h
-            if ticker_to_theme.get(t, None) == theme
+            if ticker_to_theme.get(t, "UNKNOWN") == theme
         ]
-        if len(theme_tickers) >= 1:
+        if len(theme_tickers) >= min_coins_per_theme:
             theme_datasets[theme] = vol_scaled_returns_cleaned[theme_tickers]
 
     # Generate buy/sell signals per theme (using only last date)
@@ -485,4 +493,8 @@ else:
 
 # ---- Sector / Theme momentum signals ----
 st.subheader("Excess Momentum Signals – By Theme / Sector")
-st.dataframe(consolidated_signals, use_container_width=True)
+
+if consolidated_signals is None or consolidated_signals.empty:
+    st.info("No theme-level signals generated. Check detected theme names above and data length per theme.")
+else:
+    st.dataframe(consolidated_signals, use_container_width=True)
