@@ -76,7 +76,7 @@ def compute_idmag_weighted(
     Compute IDMAG as in Equation (2) of 'Frog in the Pan'.
 
     If there is not enough data for any coin (idmag_df ends up empty),
-    we skip the Momentum Quality filter and return the full universe.
+    we **skip** the Momentum Quality filter and return the full universe.
     """
     weights_by_quintile = {
         0: 5 / 15,  # Q1 (smallest abs)
@@ -92,6 +92,7 @@ def compute_idmag_weighted(
         r = returns_cleaned_h[coin].dropna()
 
         if len(r) < lookback:
+            # Not enough history for this coin
             idmag_all[coin] = np.nan
             continue
 
@@ -124,8 +125,10 @@ def compute_idmag_weighted(
             idmag = -(1 / lookback) * sgn_pret * np.sum(signed_weights)
             idmag_values.append(idmag)
 
+        # Average across all rolling windows
         idmag_all[coin] = np.mean(idmag_values) if len(idmag_values) > 0 else np.nan
 
+    # Build rows only for non-NaN IDMAG
     rows = [
         {"Name": coin, "IDMAG": idmag_val}
         for coin, idmag_val in idmag_all.items()
@@ -148,16 +151,21 @@ def compute_idmag_weighted(
             "returns_cleaned_h_filtered": returns_cleaned_h_filtered,
         }
 
-    # Normal case
+    # Normal case: we have IDMAG values
     idmag_df = pd.DataFrame(rows)
+
+    # Sort by IDMAG (ascending)
     idmag_df = idmag_df.sort_values(by="IDMAG", ascending=True)
 
+    # Filter top 80% (drop top 20%)
     cutoff = int(len(idmag_df) * 0.8)
     if cutoff == 0:
+        # Degenerate case where we have very few coins
         Mom_Qual = idmag_df["Name"].tolist()
     else:
         Mom_Qual = idmag_df.iloc[:cutoff]["Name"].tolist()
 
+    # Filter dataframe
     returns_cleaned_h_filtered = returns_cleaned_h[Mom_Qual]
 
     return {
@@ -168,6 +176,9 @@ def compute_idmag_weighted(
 
 
 def get_high_idmag_list(idmag_df: pd.DataFrame, top_pct: float = 0.2):
+    """
+    Returns list of coin names in the top `top_pct` by IDMAG value.
+    """
     if idmag_df is None or idmag_df.empty or "IDMAG" not in idmag_df.columns:
         return []
 
@@ -175,8 +186,9 @@ def get_high_idmag_list(idmag_df: pd.DataFrame, top_pct: float = 0.2):
     if top_cutoff <= 0:
         return []
 
-    high_idmag_df = idmag_df.iloc[-top_cutoff:]
-    return high_idmag_df["Name"].tolist()
+    high_idmag_df = idmag_df.iloc[-top_cutoff:]  # Top 20% → end of ascending-sorted df
+    High_IDMAG_List = high_idmag_df["Name"].tolist()
+    return High_IDMAG_List
 
 
 def clean_vol_scaled_returns(vol_scaled_returns: pd.DataFrame, rolling_window: int = 60):
@@ -191,6 +203,7 @@ def clean_vol_scaled_returns(vol_scaled_returns: pd.DataFrame, rolling_window: i
             rolling_mean = cleaned_data[col].rolling(window=rolling_window, min_periods=1).mean()
             cleaned_data.loc[zero_mask, col] = rolling_mean.loc[zero_mask]
 
+        # Remove extreme outliers
         mean_val = cleaned_data[col].mean()
         std_val = cleaned_data[col].std()
         if std_val > 0:
@@ -211,6 +224,7 @@ def calculate_momentum_scores(
     shifted_returns = vol_scaled_returns.shift(exclude_last)
     cum_returns = shifted_returns.rolling(window=lookback).sum()
 
+    # Winsorize by column
     for col in cum_returns.columns:
         col_data = cum_returns[col].dropna()
         if len(col_data) > 0:
@@ -218,11 +232,14 @@ def calculate_momentum_scores(
             q95 = col_data.quantile(0.95)
             cum_returns[col] = cum_returns[col].clip(lower=q5, upper=q95)
 
+    # Cross-sectional z-scores
     mean_cs = cum_returns.mean(axis=1, skipna=True).values[:, None]
     std_cs = cum_returns.std(axis=1, skipna=True).values[:, None]
     z_scores = (cum_returns - mean_cs) / std_cs
 
+    # Ranks: higher z = better momentum ⇒ higher rank
     ranks = z_scores.rank(axis=1, ascending=False)
+
     return z_scores, ranks
 
 
@@ -247,6 +264,10 @@ def generate_signals(ranks: pd.DataFrame, top_n: int = 8, bottom_n: int = 8):
 
 
 def format_signal_series_for_display(signal_series: pd.Series) -> pd.DataFrame:
+    """
+    Turn a pd.Series with index=date, values=list/iterable of tickers
+    into a DataFrame with Date / Tickers column as comma-separated strings.
+    """
     if signal_series is None or len(signal_series) == 0:
         return pd.DataFrame(columns=["Date", "Tickers"]).set_index("Date")
 
@@ -265,15 +286,17 @@ def format_signal_series_for_display(signal_series: pd.Series) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------
-# MAIN CALCULATION
+# MAIN CALCULATION (RUN ON REFRESH OR FIRST TIME)
 # ---------------------------------------------------------
 if refresh or st.session_state["xs_momentum_results"] is None:
+    # ===== RETURNS & CLEANING =====
     returns_h_raw = df_4h.pct_change()
     returns_cleaned_h = clean_returns(returns_h_raw).dropna()
 
+    # ===== IDMAG & MOMENTUM QUALITY FILTER =====
     idmag_result = compute_idmag_weighted(
         returns_cleaned_h=returns_cleaned_h,
-        lookback=360,
+        lookback=360,  # configurable
     )
 
     idmag_df = idmag_result["idmag_df"]
@@ -282,16 +305,24 @@ if refresh or st.session_state["xs_momentum_results"] is None:
 
     High_IDMAG_List = get_high_idmag_list(idmag_df, top_pct=0.2)
 
+    # ===== VOLATILITY SCALING =====
     returns_h = returns_cleaned_h_filtered.copy()
+
     if returns_h is None or returns_h.empty:
         st.error("No data available after IDMAG filtering / cleaning. Please check your price_theme input.")
         st.stop()
 
+    # Full period volatility (per coin)
     vol_full_period = returns_h.std()
+
+    # Scale each coin's returns by its full-period volatility
     vol_scaled_returns = returns_h.divide(vol_full_period, axis="columns")
+
+    # Clean up NaN/inf
     vol_scaled_returns = vol_scaled_returns.replace([np.inf, -np.inf], np.nan).fillna(0)
     vol_scaled_returns_cleaned = clean_vol_scaled_returns(vol_scaled_returns)
 
+    # ===== EXCESS MOMENTUM ACROSS UNIVERSE =====
     lookback_universe = 60
     z_scores_universe, ranks_universe = calculate_momentum_scores(
         vol_scaled_returns_cleaned,
@@ -304,23 +335,31 @@ if refresh or st.session_state["xs_momentum_results"] is None:
         bottom_n=bottom_n_universe,
     )
 
+    # Universe signals formatted for display
     universe_buy_df = format_signal_series_for_display(buy_signals_universe)
     universe_sell_df = format_signal_series_for_display(sell_signals_universe)
 
-    # THEME-LEVEL
+    # ===== EXCESS MOMENTUM FOR EACH SECTOR / THEME =====
+    # Map filtered tickers to themes (using current mapping)
     filtered_tickers_h = vol_scaled_returns_cleaned.columns.to_list()
     filtered_theme_values_h = [ticker_to_theme.get(t, "UNKNOWN") for t in filtered_tickers_h]
 
     vol_scaled_returns_cleaned_T = vol_scaled_returns_cleaned.T
     vol_scaled_returns_cleaned_T["Theme"] = filtered_theme_values_h
 
+    # ---- DYNAMIC THEME LIST (this is the key change) ----
+    # Use the themes actually present in the mapping, ignore UNKNOWN / empty
     theme_list_all = sorted(
         {theme for theme in filtered_theme_values_h if theme and theme.upper() != "UNKNOWN"}
     )
+
+    # Optionally show for debugging
     st.write("Detected themes for XS momentum:", theme_list_all)
 
+    # Build per-theme datasets (time index, tickers as columns, like vol_scaled_returns_cleaned)
     theme_datasets = {}
-    min_coins_per_theme = 3
+    min_coins_per_theme = 3  # change to 5 if you want stricter filter
+
     for theme in theme_list_all:
         theme_tickers = [
             t for t in filtered_tickers_h
@@ -329,7 +368,9 @@ if refresh or st.session_state["xs_momentum_results"] is None:
         if len(theme_tickers) >= min_coins_per_theme:
             theme_datasets[theme] = vol_scaled_returns_cleaned[theme_tickers]
 
+    # Generate buy/sell signals per theme (using only last date)
     all_signals = []
+
     for theme_name, dataset in theme_datasets.items():
         try:
             z_scores_theme, ranks_theme = calculate_momentum_scores(
@@ -379,6 +420,7 @@ if refresh or st.session_state["xs_momentum_results"] is None:
 
     consolidated_signals = pd.DataFrame(all_signals).set_index("Theme")
 
+    # Store everything in session_state
     st.session_state["xs_momentum_results"] = {
         "idmag_df": idmag_df,
         "High_IDMAG_List": High_IDMAG_List,
@@ -402,14 +444,18 @@ universe_buy_df = results["universe_buy_df"]
 universe_sell_df = results["universe_sell_df"]
 consolidated_signals = results["consolidated_signals"]
 
+# ---- High IDMAG coins (filtered out) ----
 st.subheader("High IDMAG Coins (Top 20% – Filtered Out)")
 st.write(f"Number of coins filtered out: **{len(High_IDMAG_List)}**")
-st.dataframe(pd.DataFrame({"Name": High_IDMAG_List}), width="stretch")
+st.dataframe(pd.DataFrame({"Name": High_IDMAG_List}), use_container_width=True)
 
+# ---- Universe momentum signals ----
 st.subheader("Excess Momentum Signals – Universe")
 
 if len(universe_buy_df) > 0:
-    available_datetimes = universe_buy_df.index.unique().sort_values()
+    available_datetimes = universe_buy_df.index.unique()
+    available_datetimes = available_datetimes.sort_values()
+
     selected_dt = st.selectbox(
         "Select datetime (4H bar) for universe signals",
         options=list(available_datetimes),
@@ -438,15 +484,17 @@ if len(universe_buy_df) > 0:
         col_u1, col_u2 = st.columns(2)
         with col_u1:
             st.markdown("**Universe Buy Signals (all dates)**")
-            st.dataframe(universe_buy_df, width="stretch")
+            st.dataframe(universe_buy_df, use_container_width=True)
         with col_u2:
             st.markdown("**Universe Sell Signals (all dates)**")
-            st.dataframe(universe_sell_df, width="stretch")
+            st.dataframe(universe_sell_df, use_container_width=True)
 else:
     st.info("No universe signals available. Try adjusting parameters and clicking Refresh.")
 
+# ---- Sector / Theme momentum signals ----
 st.subheader("Excess Momentum Signals – By Theme / Sector")
+
 if consolidated_signals is None or consolidated_signals.empty:
     st.info("No theme-level signals generated. Check detected theme names above and data length per theme.")
 else:
-    st.dataframe(consolidated_signals, width="stretch")
+    st.dataframe(consolidated_signals, use_container_width=True)
