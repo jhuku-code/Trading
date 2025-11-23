@@ -45,6 +45,9 @@ if "theme_values" not in st.session_state:
     st.session_state.theme_values = None
 if "theme_list" not in st.session_state:
     st.session_state.theme_list = None
+# NEW: mapping ticker -> theme for other pages (e.g., xs_momentum)
+if "ticker_to_theme" not in st.session_state:
+    st.session_state.ticker_to_theme = None
 
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
@@ -283,7 +286,7 @@ if st.sidebar.button("🔄 Refresh / Fetch Data"):
                 else:
                     cols = theme_list  # fallback if fetch failed
 
-                # Create mapping ticker -> Theme (case-insensitive)
+                # Create mapping ticker -> Theme (from full theme_list)
                 ticker_to_theme = {t: th for t, th in zip(theme_list, themes)}
                 ticker_to_theme_upper = {t.upper(): th for t, th in zip(theme_list, themes)}
 
@@ -294,10 +297,14 @@ if st.sidebar.button("🔄 Refresh / Fetch Data"):
                         ticker_to_theme.get(c, ticker_to_theme_upper.get(c.upper(), "Unknown"))
                     )
 
-                # Save to session_state: other page will read these keys
+                # Save to session_state: for other pages (e.g., xs_momentum)
                 st.session_state['price_theme'] = st.session_state.get('price_theme')  # DataFrame of wide prices
                 st.session_state['theme_values'] = theme_values_aligned  # list aligned to columns order
                 st.session_state['theme_list'] = cols  # list of tickers representing columns order
+
+                # NEW: mapping for price_theme columns -> theme (this is what xs_momentum will use)
+                ticker_to_theme_for_price_theme = {c: tv for c, tv in zip(cols, theme_values_aligned)}
+                st.session_state['ticker_to_theme'] = ticker_to_theme_for_price_theme
 
                 # Save a friendly timeframe label for the charting page
                 tf_map = {"1d": "daily", "4h": "4hourly", "1h": "1hourly"}
