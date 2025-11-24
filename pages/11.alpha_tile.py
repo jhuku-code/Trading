@@ -14,7 +14,7 @@ st.title("Alpha Percentile vs BTC")
 # REFRESH BUTTON
 # ---------------------------------------------------------
 if st.button("🔄 Refresh data"):
-    st.experimental_rerun()
+    st.rerun()
 
 # ---------------------------------------------------------
 # INPUT DATA FROM SESSION STATE
