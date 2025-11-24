@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.title("Price Range Breakout")
+st.title("Price Range Breakout (Looser Thresholds)")
 
 # ---------------------------------------------------------
 # INPUT DATA FROM SESSION STATE
@@ -25,18 +25,18 @@ with refresh_col:
         st.rerun()
 
 # ---------------------------------------------------------
-# SUPPORT / RESISTANCE DETECTION
+# SUPPORT / RESISTANCE DETECTION (LOOSER THRESHOLDS)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=True)
 def detect_sr_channels_coins_only(df, 
-                                  prd=5,
-                                  loopback=200,
+                                  prd=3,             # was 5 → more pivots
+                                  loopback=150,      # was 200 → slightly shorter lookback
                                   min_strength=1,
-                                  channel_w_start=0.1,
-                                  channel_w_max=0.3,
-                                  proximity_start=0.02,
-                                  proximity_max=0.1,
-                                  top_n=15):
+                                  channel_w_start=0.15,  # was 0.10 → wider channel
+                                  channel_w_max=0.5,     # was 0.30
+                                  proximity_start=0.03,  # was 0.02 → more lenient
+                                  proximity_max=0.15,    # was 0.10
+                                  top_n=15):             # allow more candidates
 
     def detect_once(df, prd, loopback, min_strength, channel_w, proximity):
         results = { "near_support": [], "near_resistance": [],
@@ -87,7 +87,8 @@ def detect_sr_channels_coins_only(df,
                     if (lows[-k] <= hi and highs[-k] >= lo):
                         ch[2] += 1
 
-            channels = sorted(channels, key=lambda x: x[2], reverse=True)[:3]
+            # keep strongest few
+            channels = sorted(channels, key=lambda x: x[2], reverse=True)[:5]
 
             # Step 4: classify
             last, prev = closes[-1], closes[-2]
@@ -96,14 +97,14 @@ def detect_sr_channels_coins_only(df,
 
             if support:
                 lo, hi, s = max(support, key=lambda x: x[2])
-                if abs(last - lo)/last <= proximity:
+                if abs(last - lo) / last <= proximity:
                     results["near_support"].append((coin, s))
                 if prev >= lo and last < lo:
                     results["broke_support"].append((coin, s))
 
             if resistance:
                 lo, hi, s = max(resistance, key=lambda x: x[2])
-                if abs(last - hi)/last <= proximity:
+                if abs(last - hi) / last <= proximity:
                     results["near_resistance"].append((coin, s))
                 if prev <= hi and last > hi:
                     results["broke_resistance"].append((coin, s))
@@ -113,8 +114,11 @@ def detect_sr_channels_coins_only(df,
 
         return results
 
-    # Adaptive loop
+    # Adaptive loop (starts already quite lenient)
     channel_w, proximity = channel_w_start, proximity_start
+    unique_res = { "near_support": [], "near_resistance": [],
+                   "broke_support": [], "broke_resistance": [] }
+
     while channel_w <= channel_w_max and proximity <= proximity_max:
         res = detect_once(df, prd, loopback, min_strength, channel_w, proximity)
 
@@ -132,14 +136,15 @@ def detect_sr_channels_coins_only(df,
         for k in unique_res:
             unique_res[k] = [c for c, _ in unique_res[k][:top_n]]
 
-        if any(len(unique_res[k]) > 0 for k in unique_res):
+        # If we have a reasonable number of signals in any bucket, accept
+        if any(len(unique_res[k]) >= 4 for k in unique_res):  # target ~4+ signals
             return unique_res
 
-        # Relax thresholds
-        channel_w *= 1.5
-        proximity *= 1.5
+        # Relax thresholds further
+        channel_w *= 1.4
+        proximity *= 1.4
 
-    # Return last unique_res even if empty
+    # Return even if still relatively sparse
     return unique_res
 
 # ---------------------------------------------------------
@@ -150,7 +155,7 @@ signals = detect_sr_channels_coins_only(price_d)
 # ---------------------------------------------------------
 # DISPLAY RESULTS AS TABLES
 # ---------------------------------------------------------
-st.subheader("Support / Resistance Signals")
+st.subheader("Support / Resistance Signals (Looser)")
 
 col1, col2 = st.columns(2)
 
