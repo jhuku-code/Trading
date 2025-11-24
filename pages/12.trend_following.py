@@ -6,7 +6,7 @@ import streamlit as st
 # PAGE SETUP
 # ---------------------------------------------------------
 st.set_page_config(page_title="Trend Following", layout="wide")
-st.title("Trend Following (Filtered Momentum Theme)")
+st.title("Trend Following (Unfiltered Universe)")
 
 # ---------------------------------------------------------
 # REFRESH BUTTON
@@ -20,28 +20,22 @@ if st.button("🔄 Refresh data"):
 df_h = st.session_state.get("price_theme", None)
 
 if df_h is None:
-    st.error("`price_theme` not found in session_state. Please load prices into `st.session_state['price_theme']` first.")
+    st.error(
+        "`price_theme` not found in session_state. "
+        "Please load prices into `st.session_state['price_theme']` first."
+    )
     st.stop()
 
-# You should already have these from earlier steps in the app
-# filtered_tickers_h, buy_list, short_list must be created before this block
-if "filtered_tickers_h" not in st.session_state:
-    st.error("`filtered_tickers_h` not found in session_state. Please compute and store it first.")
-    st.stop()
-
-filtered_tickers_h = st.session_state["filtered_tickers_h"]
-
-# Optional: allow user to see the filtered tickers
-with st.expander("Show filtered tickers used for trend following"):
-    st.write(filtered_tickers_h)
+# Ensure index is sorted and work on a copy
+df_h = df_h.sort_index().copy()
 
 # ---------------------------------------------------------
-# KEEP ONLY FILTERED COINS
+# USE FULL UNIVERSE (NO FILTERED_TICKERS_H)
 # ---------------------------------------------------------
-df_short_h = df_h[filtered_tickers_h].copy()
+df_short_h = df_h.copy()
 
 # ---------------------------------------------------------
-# PARAMETERS (kept for reference, even if not directly used below)
+# PARAMETERS (kept for reference, in case you use them later)
 # ---------------------------------------------------------
 base_length = 15
 nw_start = 150  # 25 * 6 times/day
@@ -55,7 +49,7 @@ phase = 0.5
 hold_days = 16
 
 # ---------------------------------------------------------
-# SMOOTHING FUNCTIONS (if you need them elsewhere in this page)
+# SMOOTHING FUNCTIONS (if you need them for signals)
 # ---------------------------------------------------------
 def adaptive_ema(series, period):
     ema = series.copy()
@@ -99,10 +93,9 @@ def nadaraya_watson_vectorized(series, h, r, start_regression_at_bar):
     return pd.Series(smoothed, index=series.index)
 
 # ---------------------------------------------------------
-# BUY / SHORT LISTS
+# BUY / SELL LISTS
 # ---------------------------------------------------------
-# Expect these to be defined earlier in the script; you can also
-# store them in session_state if you prefer.
+# Expect these to be defined earlier in your app; we try session_state first.
 if "buy_list" in st.session_state:
     buy_list = st.session_state["buy_list"]
 elif "buy_list" in locals():
@@ -125,13 +118,13 @@ with col_a:
     st.write(buy_list if buy_list else "No tickers in buy list.")
 
 with col_b:
-    st.markdown("**Short / Sell List**")
-    st.write(short_list if short_list else "No tickers in short list.")
+    st.markdown("**Sell / Short List**")
+    st.write(short_list if short_list else "No tickers in sell list.")
 
 # ---------------------------------------------------------
 # RETURNS CALCULATION
 # ---------------------------------------------------------
-# 7-day and 30-day returns assuming 4H data: 7d=42 bars, 30d=180 bars
+# Assuming 4H data: 7 days ≈ 42 bars, 30 days ≈ 180 bars
 returns_7d = df_short_h.pct_change(42, fill_method=None).iloc[-1] * 100
 returns_30d = df_short_h.pct_change(180, fill_method=None).iloc[-1] * 100
 
@@ -146,7 +139,7 @@ def get_return_table_df(ticker_list, label):
                     "30-Day Return (%)": round(returns_30d[ticker], 2),
                 }
             )
-    # Always add BTC as benchmark if available
+    # Add BTC as benchmark if available
     if "BTC" in returns_7d.index and "BTC" in returns_30d.index:
         rows.append(
             {
@@ -158,7 +151,7 @@ def get_return_table_df(ticker_list, label):
     return pd.DataFrame(rows)
 
 buy_return_table = get_return_table_df(buy_list, "Buy")
-short_return_table = get_return_table_df(short_list, "Short")
+sell_return_table = get_return_table_df(short_list, "Sell")
 
 # ---------------------------------------------------------
 # DISPLAY RETURN TABLES
@@ -175,8 +168,8 @@ with col1:
         st.dataframe(buy_return_table, use_container_width=True)
 
 with col2:
-    st.markdown("**Short Return Table**")
-    if short_return_table.empty:
-        st.write("No return data for short list.")
+    st.markdown("**Sell Return Table**")
+    if sell_return_table.empty:
+        st.write("No return data for sell list.")
     else:
-        st.dataframe(short_return_table, use_container_width=True)
+        st.dataframe(sell_return_table, use_container_width=True)
