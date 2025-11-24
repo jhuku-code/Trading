@@ -95,24 +95,31 @@ df_alpha_hist_pct = df_alpha.apply(lambda x: x.rank(pct=True))
 df_alpha_xsec_pct = df_alpha.rank(axis=1, pct=True)
 
 # ---------------------------------------------------------
-# STEP 5: Last-day rankings and top/bottom 20%
+# STEP 5: Last-day rankings & "2nd decile" buckets
 # ---------------------------------------------------------
 last_hist_pct = df_alpha_hist_pct.iloc[-1].dropna()
 last_xsec_pct = df_alpha_xsec_pct.iloc[-1].dropna()
 
-# Top/bottom 20% (historical)
-top_20_hist = last_hist_pct.nlargest(max(1, int(len(last_hist_pct) * 0.20)))
-bottom_20_hist = last_hist_pct.nsmallest(max(1, int(len(last_hist_pct) * 0.20)))
+def get_bucket(series, lower_pct, upper_pct):
+    """
+    Return values whose percentile is between lower_pct and upper_pct
+    using quantiles of the given series.
+    """
+    if series.empty:
+        return series
+    lo = series.quantile(lower_pct)
+    hi = series.quantile(upper_pct)
+    mask = (series >= lo) & (series < hi)
+    # For consistency, show from high to low
+    return series[mask].sort_values(ascending=False)
 
-# Top/bottom 20% (cross-sectional)
-top_20_xsec = last_xsec_pct.nlargest(max(1, int(len(last_xsec_pct) * 0.20)))
-bottom_20_xsec = last_xsec_pct.nsmallest(max(1, int(len(last_xsec_pct) * 0.20)))
+# 2nd decile from TOP (80–90th percentile)
+top_2nd_hist = get_bucket(last_hist_pct, 0.8, 0.9)
+top_2nd_xsec = get_bucket(last_xsec_pct, 0.8, 0.9)
 
-# Get the "2nd decile"-like slices: [17:]
-top_20_hist_2nd = top_20_hist.iloc[17:]
-bottom_20_hist_2nd = bottom_20_hist.iloc[17:]
-top_20_xsec_2nd = top_20_xsec.iloc[17:]
-bottom_20_xsec_2nd = bottom_20_xsec.iloc[17:]
+# 2nd decile from BOTTOM (10–20th percentile)
+bottom_2nd_hist = get_bucket(last_hist_pct, 0.1, 0.2)
+bottom_2nd_xsec = get_bucket(last_xsec_pct, 0.1, 0.2)
 
 # Convert to DataFrames for table display
 def series_to_table(s, value_name="Percentile"):
@@ -122,35 +129,35 @@ def series_to_table(s, value_name="Percentile"):
     df.columns = ["Coin", value_name]
     return df
 
-top_20_hist_table = series_to_table(top_20_hist_2nd, "Hist Percentile")
-bottom_20_hist_table = series_to_table(bottom_20_hist_2nd, "Hist Percentile")
-top_20_xsec_table = series_to_table(top_20_xsec_2nd, "X-sec Percentile")
-bottom_20_xsec_table = series_to_table(bottom_20_xsec_2nd, "X-sec Percentile")
+top_2nd_hist_table = series_to_table(top_2nd_hist, "Hist Percentile (80–90%)")
+bottom_2nd_hist_table = series_to_table(bottom_2nd_hist, "Hist Percentile (10–20%)")
+top_2nd_xsec_table = series_to_table(top_2nd_xsec, "X-sec Percentile (80–90%)")
+bottom_2nd_xsec_table = series_to_table(bottom_2nd_xsec, "X-sec Percentile (10–20%)")
 
 # ---------------------------------------------------------
 # DISPLAY TABLES
 # ---------------------------------------------------------
-st.subheader("Alpha Percentile Tables (2nd decile slices)")
+st.subheader("Alpha Percentile Tables – 2nd Decile Buckets")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("**Top 20% Historical (2nd slice: [17:])**")
-    st.dataframe(top_20_hist_table, use_container_width=True)
+    st.markdown("**Historical alpha – 80–90th percentile (2nd decile from top)**")
+    st.dataframe(top_2nd_hist_table, use_container_width=True)
 
 with col2:
-    st.markdown("**Bottom 20% Historical (2nd slice: [17:])**")
-    st.dataframe(bottom_20_hist_table, use_container_width=True)
+    st.markdown("**Historical alpha – 10–20th percentile (2nd decile from bottom)**")
+    st.dataframe(bottom_2nd_hist_table, use_container_width=True)
 
 col3, col4 = st.columns(2)
 
 with col3:
-    st.markdown("**Top 20% Cross-sectional (2nd slice: [17:])**")
-    st.dataframe(top_20_xsec_table, use_container_width=True)
+    st.markdown("**Cross-sectional alpha – 80–90th percentile (2nd decile from top)**")
+    st.dataframe(top_2nd_xsec_table, use_container_width=True)
 
 with col4:
-    st.markdown("**Bottom 20% Cross-sectional (2nd slice: [17:])**")
-    st.dataframe(bottom_20_xsec_table, use_container_width=True)
+    st.markdown("**Cross-sectional alpha – 10–20th percentile (2nd decile from bottom)**")
+    st.dataframe(bottom_2nd_xsec_table, use_container_width=True)
 
 # ---------------------------------------------------------
 # PLOTTING SECTION
