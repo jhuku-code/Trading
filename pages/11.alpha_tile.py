@@ -95,11 +95,49 @@ df_alpha_hist_pct = df_alpha.apply(lambda x: x.rank(pct=True))
 df_alpha_xsec_pct = df_alpha.rank(axis=1, pct=True)
 
 # ---------------------------------------------------------
-# STEP 5: Last-day rankings & "2nd decile" buckets
+# STEP 5: Last-day rankings
 # ---------------------------------------------------------
 last_hist_pct = df_alpha_hist_pct.iloc[-1].dropna()
 last_xsec_pct = df_alpha_xsec_pct.iloc[-1].dropna()
 
+# ---------------------------------------------------------
+# SLIDERS FOR BANDS
+# ---------------------------------------------------------
+st.subheader("Configure Percentile Bands")
+
+col_band1, col_band2 = st.columns(2)
+
+with col_band1:
+    top_band = st.slider(
+        "Top band (quantile range)",
+        min_value=0.0,
+        max_value=1.0,
+        value=(0.8, 0.9),
+        step=0.01,
+        help="Coins whose percentile is within this range are considered in the 'top' band.",
+    )
+
+with col_band2:
+    bottom_band = st.slider(
+        "Bottom band (quantile range)",
+        min_value=0.0,
+        max_value=1.0,
+        value=(0.1, 0.2),
+        step=0.01,
+        help="Coins whose percentile is within this range are considered in the 'bottom' band.",
+    )
+
+top_low, top_high = top_band
+bottom_low, bottom_high = bottom_band
+
+# Ensure bands are valid (avoid exact same bounds)
+if top_low >= top_high or bottom_low >= bottom_high:
+    st.error("Each band must have lower bound < upper bound.")
+    st.stop()
+
+# ---------------------------------------------------------
+# BUCKET FUNCTIONS
+# ---------------------------------------------------------
 def get_bucket(series, lower_pct, upper_pct):
     """
     Return values whose percentile is between lower_pct and upper_pct
@@ -113,15 +151,17 @@ def get_bucket(series, lower_pct, upper_pct):
     # For consistency, show from high to low
     return series[mask].sort_values(ascending=False)
 
-# 2nd decile from TOP (80–90th percentile)
-top_2nd_hist = get_bucket(last_hist_pct, 0.8, 0.9)
-top_2nd_xsec = get_bucket(last_xsec_pct, 0.8, 0.9)
+# Top band (e.g. 80–90th)
+top_hist_band = get_bucket(last_hist_pct, top_low, top_high)
+top_xsec_band = get_bucket(last_xsec_pct, top_low, top_high)
 
-# 2nd decile from BOTTOM (10–20th percentile)
-bottom_2nd_hist = get_bucket(last_hist_pct, 0.1, 0.2)
-bottom_2nd_xsec = get_bucket(last_xsec_pct, 0.1, 0.2)
+# Bottom band (e.g. 10–20th)
+bottom_hist_band = get_bucket(last_hist_pct, bottom_low, bottom_high)
+bottom_xsec_band = get_bucket(last_xsec_pct, bottom_low, bottom_high)
 
-# Convert to DataFrames for table display
+# ---------------------------------------------------------
+# CONVERT SERIES TO TABLES
+# ---------------------------------------------------------
 def series_to_table(s, value_name="Percentile"):
     if s is None or s.empty:
         return pd.DataFrame(columns=["Coin", value_name])
@@ -129,35 +169,47 @@ def series_to_table(s, value_name="Percentile"):
     df.columns = ["Coin", value_name]
     return df
 
-top_2nd_hist_table = series_to_table(top_2nd_hist, "Hist Percentile (80–90%)")
-bottom_2nd_hist_table = series_to_table(bottom_2nd_hist, "Hist Percentile (10–20%)")
-top_2nd_xsec_table = series_to_table(top_2nd_xsec, "X-sec Percentile (80–90%)")
-bottom_2nd_xsec_table = series_to_table(bottom_2nd_xsec, "X-sec Percentile (10–20%)")
+top_hist_table = series_to_table(
+    top_hist_band,
+    f"Hist Percentile ({int(top_low*100)}–{int(top_high*100)}%)"
+)
+bottom_hist_table = series_to_table(
+    bottom_hist_band,
+    f"Hist Percentile ({int(bottom_low*100)}–{int(bottom_high*100)}%)"
+)
+top_xsec_table = series_to_table(
+    top_xsec_band,
+    f"X-sec Percentile ({int(top_low*100)}–{int(top_high*100)}%)"
+)
+bottom_xsec_table = series_to_table(
+    bottom_xsec_band,
+    f"X-sec Percentile ({int(bottom_low*100)}–{int(bottom_high*100)}%)"
+)
 
 # ---------------------------------------------------------
 # DISPLAY TABLES
 # ---------------------------------------------------------
-st.subheader("Alpha Percentile Tables – 2nd Decile Buckets")
+st.subheader("Alpha Percentile Tables – Configurable Bands")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("**Historical alpha – 80–90th percentile (2nd decile from top)**")
-    st.dataframe(top_2nd_hist_table, use_container_width=True)
+    st.markdown(f"**Historical alpha – Top band ({int(top_low*100)}–{int(top_high*100)}%)**")
+    st.dataframe(top_hist_table, use_container_width=True)
 
 with col2:
-    st.markdown("**Historical alpha – 10–20th percentile (2nd decile from bottom)**")
-    st.dataframe(bottom_2nd_hist_table, use_container_width=True)
+    st.markdown(f"**Historical alpha – Bottom band ({int(bottom_low*100)}–{int(bottom_high*100)}%)**")
+    st.dataframe(bottom_hist_table, use_container_width=True)
 
 col3, col4 = st.columns(2)
 
 with col3:
-    st.markdown("**Cross-sectional alpha – 80–90th percentile (2nd decile from top)**")
-    st.dataframe(top_2nd_xsec_table, use_container_width=True)
+    st.markdown(f"**Cross-sectional alpha – Top band ({int(top_low*100)}–{int(top_high*100)}%)**")
+    st.dataframe(top_xsec_table, use_container_width=True)
 
 with col4:
-    st.markdown("**Cross-sectional alpha – 10–20th percentile (2nd decile from bottom)**")
-    st.dataframe(bottom_2nd_xsec_table, use_container_width=True)
+    st.markdown(f"**Cross-sectional alpha – Bottom band ({int(bottom_low*100)}–{int(bottom_high*100)}%)**")
+    st.dataframe(bottom_xsec_table, use_container_width=True)
 
 # ---------------------------------------------------------
 # PLOTTING SECTION
