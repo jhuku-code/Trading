@@ -22,9 +22,15 @@ st.title("Open Interest Market Share Dashboard")
 API_KEY = st.secrets.get("API_KEY", "xxxxxx")
 BASE_URL = "https://api.coinalyze.net/v1"
 
+# GitHub repo info – CHANGE THESE TO YOURS
+GITHUB_USER = "jhuku-code"
+GITHUB_REPO = "Trading"
+BRANCH = "main"  # or "master" or another branch name
+
 # Build raw GitHub URL for /Input-Files/perps_list.xlsx
 GITHUB_EXCEL_URL = (
-    f"Input-Files/perps_list.xlsx"
+    f"https://raw.githubusercontent.com/{GITHUB_USER}/"
+    f"{GITHUB_REPO}/{BRANCH}/Input-Files/perps_list.xlsx"
 )
 
 # ---------------------------------------------------------
