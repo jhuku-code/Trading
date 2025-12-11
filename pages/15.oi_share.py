@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+import io
 import streamlit as st
 
 # ---------------------------------------------------------
@@ -15,10 +16,6 @@ st.title("Open Interest Market Share Dashboard")
 # ---------------------------------------------------------
 # CONSTANTS / CONFIG
 # ---------------------------------------------------------
-
-# Coinalyze API
-# Put your real key in .streamlit/secrets.toml as:
-# COINALYZE_API_KEY = "your_real_key"
 API_KEY = st.secrets.get("API_KEY", "xxxxxx")
 BASE_URL = "https://api.coinalyze.net/v1"
 
@@ -62,9 +59,33 @@ top_bottom_n = st.sidebar.number_input(
     step=5,
 )
 
-# Refresh button to clear cached data and refetch
-if st.sidebar.button("Refresh data"):
+# Sidebar short-circuit cache-clear button (manual)
+if st.sidebar.button("Clear cached API data"):
     st.cache_data.clear()
+    st.sidebar.success("Cache cleared. Click 'Run analysis' to fetch fresh data.")
+
+# ---------------------------------------------------------
+# PAGE-LEVEL CONTROL: do not auto-run heavy code
+# ---------------------------------------------------------
+if "run_analysis" not in st.session_state:
+    st.session_state["run_analysis"] = False
+
+col_run, col_force = st.columns([1, 1])
+
+with col_run:
+    if st.button("Run analysis / Refresh calculations"):
+        st.session_state["run_analysis"] = True
+
+with col_force:
+    if st.button("Force refresh (clear cache & run)"):
+        st.cache_data.clear()
+        st.session_state["run_analysis"] = True
+
+# Optional: a 'clear results' button to hide results without clearing cache
+if st.button("Clear results (hide)"):
+    st.session_state["run_analysis"] = False
+
+st.write("Tip: The page won't fetch or compute OI until you click **Run analysis**.")
 
 # ---------------------------------------------------------
 # LOAD SYMBOL LIST FROM GITHUB /Input-Files/perps_list.xlsx
@@ -77,8 +98,8 @@ def load_symbols_from_github(url: str):
     """
     resp = requests.get(url)
     resp.raise_for_status()  # will raise if not 200
-    # resp.content is bytes; pd.read_excel can read from it
-    df = pd.read_excel(resp.content)
+    # Use BytesIO to be robust
+    df = pd.read_excel(io.BytesIO(resp.content))
     if "Symbol" not in df.columns:
         raise ValueError("Excel file must contain a 'Symbol' column.")
     return df["Symbol"].dropna().tolist()
@@ -93,7 +114,7 @@ if not usdt_perp_symbols:
     st.error("No symbols found in perps_list.xlsx on GitHub.")
     st.stop()
 
-st.success(f"Loaded {len(usdt_perp_symbols)} perp symbols from GitHub.")
+st.info(f"Loaded {len(usdt_perp_symbols)} perp symbols from GitHub (symbols list loaded; data fetch is manual).")
 
 # ---------------------------------------------------------
 # HELPER: chunked
@@ -103,7 +124,7 @@ def chunked(iterable, n):
         yield iterable[i : i + n]
 
 # ---------------------------------------------------------
-# FETCH OPEN INTEREST DATA (CACHED)
+# FETCH OPEN INTEREST DATA (CACHED) - only called when run
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=True)
 def fetch_oi_data(symbols, months_back, api_key):
@@ -192,82 +213,86 @@ def fetch_oi_data(symbols, months_back, api_key):
 
     return df_wide
 
+# ---------------------------------------------------------
+# RUN ANALYSIS (only when user requests it)
+# ---------------------------------------------------------
+if st.session_state["run_analysis"]:
+    with st.spinner("Fetching open interest data from Coinalyze and running analysis..."):
+        try:
+            oi_data = fetch_oi_data(usdt_perp_symbols, months_back, API_KEY)
+        except Exception as e:
+            st.error(f"Error fetching OI data: {e}")
+            st.stop()
 
-with st.spinner("Fetching open interest data from Coinalyze..."):
-    try:
-        oi_data = fetch_oi_data(usdt_perp_symbols, months_back, API_KEY)
-    except Exception as e:
-        st.error(f"Error fetching OI data: {e}")
-        st.stop()
+    st.success("OI data loaded successfully.")
 
-st.success("OI data loaded successfully.")
+    # ----------------------------------------------------------
+    # 1. Total OI values over time + line chart
+    # ----------------------------------------------------------
+    st.subheader("Total Open Interest Over Time")
+    total_oi = oi_data.sum(axis=1)
+    st.line_chart(total_oi)
 
-# ----------------------------------------------------------
-# 1. Total OI values over time + line chart
-# ----------------------------------------------------------
-st.subheader("Total Open Interest Over Time")
+    # ----------------------------------------------------------
+    # 2. Market share dataframe (oi_share_df)
+    # ----------------------------------------------------------
+    oi_share_df = oi_data.div(oi_data.sum(axis=1), axis=0) * 100
+    oi_share_df = oi_share_df.round(3)
 
-total_oi = oi_data.sum(axis=1)
+    # ----------------------------------------------------------
+    # 3. Compute market_share_avg (excluding last day)
+    # ----------------------------------------------------------
+    oi_share_df.index = pd.to_datetime(oi_share_df.index)
+    temp = oi_share_df.copy()
+    temp["date"] = temp.index.date
 
-st.line_chart(total_oi)
+    last_day = temp["date"].max()
+    market_share_avg = {}
 
-# ----------------------------------------------------------
-# 2. Market share dataframe (oi_share_df)
-# ----------------------------------------------------------
-oi_share_df = oi_data.div(oi_data.sum(axis=1), axis=0) * 100
-oi_share_df = oi_share_df.round(3)
+    for symbol in oi_share_df.columns:
+        filtered = temp[temp["date"] != last_day][symbol]
+        market_share_avg[symbol] = filtered.mean()
 
-# ----------------------------------------------------------
-# 3. Compute market_share_avg (excluding last day)
-# ----------------------------------------------------------
-oi_share_df.index = pd.to_datetime(oi_share_df.index)
-temp = oi_share_df.copy()
-temp["date"] = temp.index.date
+    market_share_avg = pd.Series(market_share_avg)
 
-last_day = temp["date"].max()
-market_share_avg = {}
+    # ----------------------------------------------------------
+    # 4. Create oi_diff dataframe
+    # ----------------------------------------------------------
+    last_market_share = oi_share_df.iloc[-1]
+    oi_diff = last_market_share - market_share_avg
 
-for symbol in oi_share_df.columns:
-    filtered = temp[temp["date"] != last_day][symbol]
-    market_share_avg[symbol] = filtered.mean()
+    oi_diff_df = pd.DataFrame(
+        {
+            "symbol": oi_diff.index,
+            "diff": oi_diff.values,
+            "last_market_share": last_market_share.values,
+            "avg_market_share": market_share_avg.values,
+        }
+    ).sort_values("diff", ascending=False).reset_index(drop=True)
 
-market_share_avg = pd.Series(market_share_avg)
+    # ----------------------------------------------------------
+    # 5. Top N and Bottom N symbols by difference
+    # ----------------------------------------------------------
+    st.subheader(
+        f"Top {int(top_bottom_n)} and Bottom {int(top_bottom_n)} Symbols by OI Market Share Change"
+    )
 
-# ----------------------------------------------------------
-# 4. Create oi_diff dataframe
-# ----------------------------------------------------------
-last_market_share = oi_share_df.iloc[-1]
-oi_diff = last_market_share - market_share_avg
+    col1, col2 = st.columns(2)
 
-oi_diff_df = pd.DataFrame(
-    {
-        "symbol": oi_diff.index,
-        "diff": oi_diff.values,
-        "last_market_share": last_market_share.values,
-        "avg_market_share": market_share_avg.values,
-    }
-).sort_values("diff", ascending=False).reset_index(drop=True)
+    top_n = oi_diff_df.nlargest(int(top_bottom_n), "diff")
+    bottom_n = oi_diff_df.nsmallest(int(top_bottom_n), "diff")
 
-# ----------------------------------------------------------
-# 5. Top N and Bottom N symbols by difference
-# ----------------------------------------------------------
-st.subheader(
-    f"Top {int(top_bottom_n)} and Bottom {int(top_bottom_n)} Symbols by OI Market Share Change"
-)
+    with col1:
+        st.markdown(f"### Top {int(top_bottom_n)} (Increase in OI Share)")
+        st.dataframe(top_n, use_container_width=True)
 
-col1, col2 = st.columns(2)
+    with col2:
+        st.markdown(f"### Bottom {int(top_bottom_n)} (Decrease in OI Share)")
+        st.dataframe(bottom_n, use_container_width=True)
 
-top_n = oi_diff_df.nlargest(int(top_bottom_n), "diff")
-bottom_n = oi_diff_df.nsmallest(int(top_bottom_n), "diff")
+    # Optional: show the full diff dataframe
+    with st.expander("Show full OI market share difference table"):
+        st.dataframe(oi_diff_df, use_container_width=True)
 
-with col1:
-    st.markdown(f"### Top {int(top_bottom_n)} (Increase in OI Share)")
-    st.dataframe(top_n, use_container_width=True)
-
-with col2:
-    st.markdown(f"### Bottom {int(top_bottom_n)} (Decrease in OI Share)")
-    st.dataframe(bottom_n, use_container_width=True)
-
-# Optional: show the full diff dataframe
-with st.expander("Show full OI market share difference table"):
-    st.dataframe(oi_diff_df, use_container_width=True)
+else:
+    st.info("Analysis not run. Click 'Run analysis / Refresh calculations' to fetch data and compute results.")
