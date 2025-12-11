@@ -21,7 +21,8 @@ top_n = st.number_input(
     min_value=5,
     max_value=100,
     value=15,
-    step=5
+    step=5,
+    key="top_n",
 )
 
 # Lookback months (optional UI; default 3 months as your code)
@@ -30,31 +31,25 @@ lookback_months = st.number_input(
     min_value=1,
     max_value=12,
     value=3,
-    step=1
+    step=1,
+    key="lookback_months",
 )
-
-# Refresh button: clears cache and reruns app
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.experimental_rerun()
 
 # ---------------------------------------------------------
 # CONFIG: API KEY & BASE URL
 # ---------------------------------------------------------
 # Read API key securely from Streamlit secrets (.streamlit/secrets.toml)
-# In secrets.toml:
-# [default]
-# COINALYZE_API_KEY = "xxxx"
-API_KEY = st.secrets["API_KEY"]
+API_KEY = st.secrets.get("API_KEY", "")
 BASE_URL = "https://api.coinalyze.net/v1"
+
+if not API_KEY:
+    st.error("API_KEY not found in Streamlit secrets. Please add it to .streamlit/secrets.toml")
+    st.stop()
 
 # ---------------------------------------------------------
 # READ PERPS LIST FROM GITHUB
 # ---------------------------------------------------------
 st.subheader("Perpetual Symbols Universe")
-
-# NOTE: Change <user>, <repo>, <branch> to your actual GitHub path
-# e.g. "https://raw.githubusercontent.com/yourname/yourrepo/main/Input-Files/perps_list.xlsx"
 GITHUB_PERPS_URL = (
     "https://raw.githubusercontent.com/jhuku-code/Trading/main/Input-Files/perps_list.xlsx"
 )
@@ -70,7 +65,6 @@ except Exception as e:
     st.error(f"Error loading perps_list.xlsx from GitHub: {e}")
     st.stop()
 
-# Extract symbols list
 if "Symbol" not in df_perps.columns:
     st.error("Column 'Symbol' not found in perps_list.xlsx")
     st.stop()
@@ -88,8 +82,9 @@ def chunked(iterable, n):
 # ---------------------------------------------------------
 # FETCH FUNDING RATE HISTORY (CACHED)
 # ---------------------------------------------------------
-@st.cache_data(ttl=1800)  # cache results for 30 minutes
-def fetch_funding_rates(symbols, months_back: int, api_key: str) -> pd.DataFrame:
+@st.cache_data(ttl=1800)
+def fetch_funding_rates_cached(symbols, months_back: int, api_key: str) -> pd.DataFrame:
+    """This function is cached by streamlit so repeated calls with same args use cache."""
     fr_url = f"{BASE_URL}/funding-rate-history"
 
     from_timestamp = int((datetime.now() - relativedelta(months=months_back)).timestamp())
@@ -110,11 +105,9 @@ def fetch_funding_rates(symbols, months_back: int, api_key: str) -> pd.DataFrame
         while True:
             resp = requests.get(fr_url, params=params)
 
-            # If OK, process and break out of retry loop
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, list):
-                    # Unexpected format; skip this batch
                     break
 
                 for entry in data:
@@ -130,11 +123,9 @@ def fetch_funding_rates(symbols, months_back: int, api_key: str) -> pd.DataFrame
                     df["symbol"] = symbol
                     all_rows.append(df)
 
-                # polite pause
                 time.sleep(1)
                 break
 
-            # If rate limited, respect Retry-After header and retry
             elif resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 try:
@@ -142,15 +133,12 @@ def fetch_funding_rates(symbols, months_back: int, api_key: str) -> pd.DataFrame
                 except ValueError:
                     retry_after = 30
 
-                # Streamlit message instead of print
                 st.warning(
                     f"429 Too Many Requests for batch starting with {batch[0]}... "
                     f"sleeping {retry_after} seconds before retrying"
                 )
                 time.sleep(retry_after)
-                # continue the while True loop
 
-            # Other errors: log and skip this batch
             else:
                 st.error(
                     f"Error for batch starting with {batch[0]}: "
@@ -173,26 +161,68 @@ def fetch_funding_rates(symbols, months_back: int, api_key: str) -> pd.DataFrame
     return df_wide
 
 # ---------------------------------------------------------
-# MAIN DATA FETCH + CALCULATIONS
+# SESSION-STATE CONTROLLED FETCH
+# ---------------------------------------------------------
+def get_data_from_session_or_fetch(symbols, months_back, api_key):
+    """Return DataFrame from session_state if present, otherwise fetch and store it."""
+    if "fr_data" in st.session_state and st.session_state.get("fr_data") is not None:
+        return st.session_state["fr_data"]
+
+    # not present -> fetch now (first load)
+    with st.spinner("Fetching funding rate history from Coinalyze API..."):
+        try:
+            df = fetch_funding_rates_cached(symbols, months_back, api_key)
+            st.session_state["fr_data"] = df
+            st.session_state["fr_last_update"] = datetime.now()
+            return df
+        except Exception as e:
+            st.error(f"Error fetching funding rate data: {e}")
+            st.session_state["fr_data"] = None
+            st.stop()
+
+# Refresh button: clear cache & session data then fetch again
+if st.button("🔄 Refresh Data"):
+    # Clear streamlit cache for the fetch function
+    try:
+        st.cache_data.clear()
+    except Exception:
+        # older streamlit compatibility, ignore if not available
+        pass
+
+    # Remove session stored data so new fetch occurs
+    st.session_state.pop("fr_data", None)
+    st.session_state.pop("fr_last_update", None)
+
+    # Immediately fetch and store new data (gives user immediate feedback)
+    with st.spinner("Refreshing funding rate data (this may take a while)..."):
+        try:
+            fr_data = fetch_funding_rates_cached(usdt_perp_symbols, lookback_months, API_KEY)
+            st.session_state["fr_data"] = fr_data
+            st.session_state["fr_last_update"] = datetime.now()
+            st.success("Refresh complete.")
+        except Exception as e:
+            st.error(f"Refresh failed: {e}")
+            st.session_state["fr_data"] = None
+
+# ---------------------------------------------------------
+# MAIN DATA FETCH + CALCULATIONS (use cached session value)
 # ---------------------------------------------------------
 st.subheader("Funding Rate Data")
+fr_data = get_data_from_session_or_fetch(usdt_perp_symbols, lookback_months, API_KEY)
 
-with st.spinner("Fetching funding rate history from Coinalyze API..."):
-    try:
-        fr_data = fetch_funding_rates(usdt_perp_symbols, lookback_months, API_KEY)
-    except Exception as e:
-        st.error(f"Error fetching funding rate data: {e}")
-        st.stop()
+if fr_data is None or fr_data.empty:
+    st.warning("No funding rate data available.")
+    st.stop()
 
 st.write("Data shape:", fr_data.shape)
 st.write("Latest timestamp in data:", fr_data.index.max())
+if "fr_last_update" in st.session_state:
+    st.write("Last fetched:", st.session_state["fr_last_update"].strftime("%Y-%m-%d %H:%M:%S"))
 
 # ---------------------------------------------------------
 # Z-SCORES
 # ---------------------------------------------------------
-fr_zscores = (fr_data - fr_data.mean(numeric_only=True)) / fr_data.std(
-    numeric_only=True
-)
+fr_zscores = (fr_data - fr_data.mean(numeric_only=True)) / fr_data.std(numeric_only=True)
 
 latest_zscores = fr_zscores.iloc[-1]
 latest_rates = fr_data.iloc[-1]
@@ -203,8 +233,8 @@ sorted_zscores = latest_zscores.sort_values(ascending=False)
 top_symbols_z = sorted_zscores.head(top_n).index
 bottom_symbols_z = sorted_zscores.tail(top_n).index
 
-top_z_list = [(symbol, latest_zscores[symbol], latest_rates[symbol]) for symbol in top_symbols_z]
-bottom_z_list = [(symbol, latest_zscores[symbol], latest_rates[symbol]) for symbol in bottom_symbols_z]
+top_z_list = [(symbol, float(latest_zscores[symbol]), float(latest_rates[symbol])) for symbol in top_symbols_z]
+bottom_z_list = [(symbol, float(latest_zscores[symbol]), float(latest_rates[symbol])) for symbol in bottom_symbols_z]
 
 # ---------------------------------------------------------
 # RAW FUNDING RATE RANKING
