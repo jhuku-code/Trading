@@ -1,4 +1,3 @@
-
 import time
 import requests
 import pandas as pd
@@ -56,55 +55,30 @@ interval = st.selectbox(
 convert_usd = st.checkbox("Convert liquidation values to USD", value=True)
 units_label = "USD" if convert_usd else "native units"
 
-# Refresh button: clears cache and reruns app
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.experimental_rerun()
+# Small status area
+status_placeholder = st.empty()
 
 # ---------------------------------------------------------
 # CONFIG: API KEY & BASE URL
+# (note: we won't access API until Refresh is pressed)
 # ---------------------------------------------------------
-API_KEY = st.secrets["API_KEY"]
+API_KEY = st.secrets.get("API_KEY")
 BASE_URL = "https://api.coinalyze.net/v1"
 
 # ---------------------------------------------------------
-# READ PERPS LIST FROM GITHUB
-# ---------------------------------------------------------
-st.subheader("Perpetual Symbols Universe")
-
-# TODO: replace <user>/<repo>/<branch> with your actual GitHub path
-GITHUB_PERPS_URL = (
-    "https://raw.githubusercontent.com/jhuku-code/Trading/main/Input-Files/perps_list.xlsx"
-)
-
-@st.cache_data(ttl=3600)
-def load_perps_list(url: str) -> pd.DataFrame:
-    return pd.read_excel(url)
-
-try:
-    df_perps = load_perps_list(GITHUB_PERPS_URL)
-    st.write("Loaded symbols from GitHub `Input-Files/perps_list.xlsx`")
-except Exception as e:
-    st.error(f"Error loading perps_list.xlsx from GitHub: {e}")
-    st.stop()
-
-if "Symbol" not in df_perps.columns:
-    st.error("Column 'Symbol' not found in perps_list.xlsx")
-    st.stop()
-
-usdt_perp_symbols = df_perps["Symbol"].dropna().astype(str).tolist()
-st.write(f"Total symbols loaded: {len(usdt_perp_symbols)}")
-
-# ---------------------------------------------------------
-# HELPER: CHUNK LIST
+# HELPERS / CACHED FUNCTIONS (these only *define* work)
 # ---------------------------------------------------------
 def chunked(iterable, n):
     for i in range(0, len(iterable), n):
         yield iterable[i : i + n]
 
-# ---------------------------------------------------------
-# FETCH LIQUIDATION HISTORY (CACHED)
-# ---------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def load_perps_list_from_github(url: str) -> pd.DataFrame:
+    """Cached small helper to load perps list from GitHub raw URL."""
+    return pd.read_excel(url)
+
+
 @st.cache_data(ttl=1800)
 def fetch_liquidations(symbols, months_back: int, interval: str, api_key: str, convert_usd_flag: bool):
     """
@@ -192,86 +166,171 @@ def fetch_liquidations(symbols, months_back: int, interval: str, api_key: str, c
 
     return liq_long_wide, liq_short_wide
 
-# ---------------------------------------------------------
-# MAIN DATA FETCH + CALCULATIONS
-# ---------------------------------------------------------
-st.subheader("Liquidations Data")
 
-with st.spinner("Fetching liquidation history from Coinalyze API..."):
+# ---------------------------------------------------------
+# COMPUTE PIPELINE (runs only when Refresh pressed)
+# ---------------------------------------------------------
+def compute_all(run_clear_cache: bool = True):
+    """
+    Fetch perps list, liquidations and perform calculations.
+    Stores results in st.session_state for later display.
+    """
     try:
+        # Optionally clear caches to force fresh API calls
+        if run_clear_cache:
+            st.cache_data.clear()
+
+        status_placeholder.info("Loading perps list from GitHub...")
+        GITHUB_PERPS_URL = (
+            "https://raw.githubusercontent.com/jhuku-code/Trading/main/Input-Files/perps_list.xlsx"
+        )
+        df_perps = load_perps_list_from_github(GITHUB_PERPS_URL)
+
+        if "Symbol" not in df_perps.columns:
+            st.session_state["compute_error"] = "Column 'Symbol' not found in perps_list.xlsx"
+            return
+
+        usdt_perp_symbols = df_perps["Symbol"].dropna().astype(str).tolist()
+        st.session_state["perps_loaded_count"] = len(usdt_perp_symbols)
+
+        # Fetch liquidations (this is the heavy part)
+        status_placeholder.info("Fetching liquidation history from Coinalyze API...")
         liq_long_data, liq_short_data = fetch_liquidations(
             usdt_perp_symbols, lookback_months, interval, API_KEY, convert_usd
         )
-    except Exception as e:
-        st.error(f"Error fetching liquidation data: {e}")
-        st.stop()
 
+        # Basic checks
+        if liq_long_data.empty or liq_short_data.empty:
+            st.session_state["compute_error"] = "Empty dataframes returned from fetch."
+            return
+
+        # Save raw to session_state
+        st.session_state["liq_long_data"] = liq_long_data
+        st.session_state["liq_short_data"] = liq_short_data
+
+        # Z-scores
+        long_zscores = (liq_long_data - liq_long_data.mean(numeric_only=True)) / liq_long_data.std(
+            numeric_only=True
+        )
+        short_zscores = (liq_short_data - liq_short_data.mean(numeric_only=True)) / liq_short_data.std(
+            numeric_only=True
+        )
+        latest_long_z = long_zscores.iloc[-1]
+        latest_short_z = short_zscores.iloc[-1]
+
+        st.session_state["latest_long_z"] = latest_long_z
+        st.session_state["latest_short_z"] = latest_short_z
+
+        # Share of total & excess vs trailing average
+        rolling_window = 30
+
+        total_long = liq_long_data.sum(axis=1)
+        total_short = liq_short_data.sum(axis=1)
+        total_long_safe = total_long.replace(0, np.nan)
+        total_short_safe = total_short.replace(0, np.nan)
+
+        ratio_long = liq_long_data.div(total_long_safe, axis=0)
+        ratio_short = liq_short_data.div(total_short_safe, axis=0)
+
+        long_ratio_ma = ratio_long.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
+        short_ratio_ma = ratio_short.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
+
+        latest_long_ratio = ratio_long.iloc[-1]
+        latest_short_ratio = ratio_short.iloc[-1]
+        latest_long_ratio_ma = long_ratio_ma.iloc[-1]
+        latest_short_ratio_ma = short_ratio_ma.iloc[-1]
+
+        long_excess = latest_long_ratio - latest_long_ratio_ma
+        short_excess = latest_short_ratio - latest_short_ratio_ma
+
+        long_excess_clean = long_excess.dropna()
+        short_excess_clean = short_excess.dropna()
+
+        sorted_long_excess = long_excess_clean.sort_values(ascending=False)
+        sorted_short_excess = short_excess_clean.sort_values(ascending=False)
+
+        sorted_long_z = latest_long_z.sort_values(ascending=False)
+        sorted_short_z = latest_short_z.sort_values(ascending=False)
+
+        # Put computed objects in session_state
+        st.session_state["ratio_long"] = ratio_long
+        st.session_state["ratio_short"] = ratio_short
+        st.session_state["latest_long_ratio"] = latest_long_ratio
+        st.session_state["latest_short_ratio"] = latest_short_ratio
+        st.session_state["latest_long_ratio_ma"] = latest_long_ratio_ma
+        st.session_state["latest_short_ratio_ma"] = latest_short_ratio_ma
+        st.session_state["long_excess"] = long_excess
+        st.session_state["short_excess"] = short_excess
+        st.session_state["sorted_long_excess"] = sorted_long_excess
+        st.session_state["sorted_short_excess"] = sorted_short_excess
+        st.session_state["sorted_long_z"] = sorted_long_z
+        st.session_state["sorted_short_z"] = sorted_short_z
+
+        st.session_state["data_loaded"] = True
+        st.session_state.pop("compute_error", None)
+        status_placeholder.success("Data loaded and calculations complete.")
+    except Exception as e:
+        st.session_state["compute_error"] = str(e)
+        st.session_state["data_loaded"] = False
+        status_placeholder.error(f"Error during compute: {e}")
+
+
+# ---------------------------------------------------------
+# REFRESH BUTTON (user triggers everything explicitly)
+# ---------------------------------------------------------
+col_top = st.columns([1, 5])[0]
+with col_top:
+    if st.button("🔄 Refresh Data (fetch & compute)"):
+        # run_clear_cache=True will clear cache_data before compute (fresh pull).
+        # Change to False if you want to keep cached fetch results.
+        compute_all(run_clear_cache=True)
+
+# ---------------------------------------------------------
+# SHOW MESSAGE IF DATA NOT LOADED
+# ---------------------------------------------------------
+if not st.session_state.get("data_loaded", False):
+    if "compute_error" in st.session_state:
+        st.error(f"Last run error: {st.session_state['compute_error']}")
+    status_placeholder.info("No computed data in session. Click 'Refresh Data' to fetch and run calculations.")
+    # offer to show perps count if loaded earlier
+    if st.session_state.get("perps_loaded_count") is not None:
+        st.write(f"Perps list last loaded has {st.session_state['perps_loaded_count']} symbols.")
+    # stop here — heavy code will not run until user clicks Refresh
+    st.stop()
+
+# ---------------------------------------------------------
+# If we reach here, data is available in session_state -> show results
+# ---------------------------------------------------------
+liq_long_data = st.session_state["liq_long_data"]
+liq_short_data = st.session_state["liq_short_data"]
+latest_long_z = st.session_state["latest_long_z"]
+latest_short_z = st.session_state["latest_short_z"]
+
+ratio_long = st.session_state["ratio_long"]
+ratio_short = st.session_state["ratio_short"]
+latest_long_ratio = st.session_state["latest_long_ratio"]
+latest_short_ratio = st.session_state["latest_short_ratio"]
+latest_long_ratio_ma = st.session_state["latest_long_ratio_ma"]
+latest_short_ratio_ma = st.session_state["latest_short_ratio_ma"]
+long_excess = st.session_state["long_excess"]
+short_excess = st.session_state["short_excess"]
+sorted_long_excess = st.session_state["sorted_long_excess"]
+sorted_short_excess = st.session_state["sorted_short_excess"]
+sorted_long_z = st.session_state["sorted_long_z"]
+sorted_short_z = st.session_state["sorted_short_z"]
+
+st.subheader("Liquidations Data")
 st.write("Data shape (long, short):", liq_long_data.shape, liq_short_data.shape)
 st.write("Latest timestamp in data:", liq_long_data.index.max())
 
 # ---------------------------------------------------------
-# Z-SCORES (LONG & SHORT SEPARATE)
+# BUILD TOP / BOTTOM SYMBOL LISTS (same logic)
 # ---------------------------------------------------------
-long_zscores = (liq_long_data - liq_long_data.mean(numeric_only=True)) / liq_long_data.std(
-    numeric_only=True
-)
-short_zscores = (liq_short_data - liq_short_data.mean(numeric_only=True)) / liq_short_data.std(
-    numeric_only=True
-)
-
-latest_long_z = long_zscores.iloc[-1]
-latest_short_z = short_zscores.iloc[-1]
-
-# ---------------------------------------------------------
-# SHARE OF TOTAL & EXCESS VS 30-PERIOD AVERAGE
-# ---------------------------------------------------------
-rolling_window = 30  # you can parameterize this later if needed
-
-# 1) Total across all symbols per timestamp
-total_long = liq_long_data.sum(axis=1)
-total_short = liq_short_data.sum(axis=1)
-
-# Avoid division by zero by replacing 0 with NaN
-total_long_safe = total_long.replace(0, np.nan)
-total_short_safe = total_short.replace(0, np.nan)
-
-# 2) Ratio (share of total) per symbol per timestamp
-ratio_long = liq_long_data.div(total_long_safe, axis=0)
-ratio_short = liq_short_data.div(total_short_safe, axis=0)
-
-# 3) 30-period trailing average of the ratio
-long_ratio_ma = ratio_long.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
-short_ratio_ma = ratio_short.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
-
-# Latest values
-latest_long_ratio = ratio_long.iloc[-1]
-latest_short_ratio = ratio_short.iloc[-1]
-latest_long_ratio_ma = long_ratio_ma.iloc[-1]
-latest_short_ratio_ma = short_ratio_ma.iloc[-1]
-
-# 4) Excess = latest ratio - trailing average
-long_excess = latest_long_ratio - latest_long_ratio_ma
-short_excess = latest_short_ratio - latest_short_ratio_ma
-
-# Drop symbols where excess is NaN (e.g. insufficient history)
-long_excess_clean = long_excess.dropna()
-short_excess_clean = short_excess.dropna()
-
-# Sort for top / bottom
-sorted_long_excess = long_excess_clean.sort_values(ascending=False)
-sorted_short_excess = short_excess_clean.sort_values(ascending=False)
-
 top_long_excess_symbols = sorted_long_excess.head(top_n).index
 bottom_long_excess_symbols = sorted_long_excess.tail(top_n).index
 
 top_short_excess_symbols = sorted_short_excess.head(top_n).index
 bottom_short_excess_symbols = sorted_short_excess.tail(top_n).index
-
-# ---------------------------------------------------------
-# Z-SCORE RANKINGS (UNCHANGED LOGIC, BUT DISPLAY ONLY Z-SCORE)
-# ---------------------------------------------------------
-sorted_long_z = latest_long_z.sort_values(ascending=False)
-sorted_short_z = latest_short_z.sort_values(ascending=False)
 
 top_long_z_symbols = sorted_long_z.head(top_n).index
 bottom_long_z_symbols = sorted_long_z.tail(top_n).index
@@ -280,7 +339,7 @@ top_short_z_symbols = sorted_short_z.head(top_n).index
 bottom_short_z_symbols = sorted_short_z.tail(top_n).index
 
 # ---------------------------------------------------------
-# DISPLAY RESULTS IN STREAMLIT
+# DISPLAY RESULTS (same as before)
 # ---------------------------------------------------------
 st.subheader("Top / Bottom Symbols")
 
@@ -518,4 +577,3 @@ with st.expander("Show full latest snapshot (all symbols)"):
             }
         )
     )
-
