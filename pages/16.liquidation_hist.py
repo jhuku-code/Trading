@@ -1,3 +1,4 @@
+
 import time
 import requests
 import pandas as pd
@@ -12,84 +13,66 @@ from dateutil.relativedelta import relativedelta
 st.set_page_config(page_title="Liquidations Z-Score / Share Monitor", layout="wide")
 st.title("Liquidations Monitor (Z-Score + Share vs Total)")
 
-# =========================================================
-# SECTION 1 — CONTROL EXECUTION (NO AUTO-RUN)
-# =========================================================
+# ---------------------------------------------------------
+# INPUTS / CONTROLS
+# ---------------------------------------------------------
+# Number of symbols in top/bottom lists
+top_n = st.number_input(
+    "Number of symbols to show in Top/Bottom lists",
+    min_value=5,
+    max_value=100,
+    value=15,
+    step=5,
+)
 
-# Initialize session flag
-if "run_analysis" not in st.session_state:
-    st.session_state["run_analysis"] = False
+# Lookback months (default 3 months)
+lookback_months = st.number_input(
+    "Lookback window (months)",
+    min_value=1,
+    max_value=12,
+    value=3,
+    step=1,
+)
 
-colA, colB, colC = st.columns([1, 1, 1])
+# Interval selection
+interval = st.selectbox(
+    "Interval / Granularity",
+    options=[
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1hour",
+        "2hour",
+        "4hour",
+        "6hour",
+        "12hour",
+        "daily",
+    ],
+    index=6,  # default "4hour"
+)
 
-with colA:
-    if st.button("▶️ Run Analysis / Refresh Calculations"):
-        st.session_state["run_analysis"] = True
+# Toggle: convert liquidation values to USD or keep in native units
+convert_usd = st.checkbox("Convert liquidation values to USD", value=True)
+units_label = "USD" if convert_usd else "native units"
 
-with colB:
-    if st.button("♻️ Force Refresh (Clear Cache + Run)"):
-        st.cache_data.clear()
-        st.session_state["run_analysis"] = True
+# Refresh button: clears cache and reruns app
+if st.button("🔄 Refresh Data"):
+    st.cache_data.clear()
+    st.experimental_rerun()
 
-with colC:
-    if st.button("🧹 Clear Results (Hide)"):
-        st.session_state["run_analysis"] = False
-
-st.write("---")
-st.info("Nothing will run until you click **Run Analysis / Refresh Calculations**.")
-
-# =========================================================
-# SECTION 2 — INPUTS / CONTROLS
-# =========================================================
-
-if st.session_state["run_analysis"]:
-    # Number of symbols in top/bottom lists
-    top_n = st.number_input(
-        "Number of symbols to show in Top/Bottom lists",
-        min_value=5,
-        max_value=100,
-        value=15,
-        step=5,
-    )
-
-    # Lookback months
-    lookback_months = st.number_input(
-        "Lookback window (months)",
-        min_value=1,
-        max_value=12,
-        value=3,
-        step=1,
-    )
-
-    # Interval selection
-    interval = st.selectbox(
-        "Interval / Granularity",
-        options=[
-            "1min",
-            "5min",
-            "15min",
-            "30min",
-            "1hour",
-            "2hour",
-            "4hour",
-            "6hour",
-            "12hour",
-            "daily",
-        ],
-        index=6,
-    )
-
-    convert_usd = st.checkbox("Convert liquidation values to USD", value=True)
-    units_label = "USD" if convert_usd else "native units"
-
-# =========================================================
-# SECTION 3 — LOAD PERPS LIST
-# =========================================================
-
+# ---------------------------------------------------------
+# CONFIG: API KEY & BASE URL
+# ---------------------------------------------------------
 API_KEY = st.secrets["API_KEY"]
 BASE_URL = "https://api.coinalyze.net/v1"
 
-# GitHub perpetual symbols list
+# ---------------------------------------------------------
+# READ PERPS LIST FROM GITHUB
+# ---------------------------------------------------------
+st.subheader("Perpetual Symbols Universe")
+
+# TODO: replace <user>/<repo>/<branch> with your actual GitHub path
 GITHUB_PERPS_URL = (
     "https://raw.githubusercontent.com/jhuku-code/Trading/main/Input-Files/perps_list.xlsx"
 )
@@ -98,34 +81,36 @@ GITHUB_PERPS_URL = (
 def load_perps_list(url: str) -> pd.DataFrame:
     return pd.read_excel(url)
 
-if st.session_state["run_analysis"]:
-    try:
-        df_perps = load_perps_list(GITHUB_PERPS_URL)
-        st.success("Loaded symbols from GitHub `Input-Files/perps_list.xlsx`")
-    except Exception as e:
-        st.error(f"Error loading perps_list.xlsx from GitHub: {e}")
-        st.stop()
+try:
+    df_perps = load_perps_list(GITHUB_PERPS_URL)
+    st.write("Loaded symbols from GitHub `Input-Files/perps_list.xlsx`")
+except Exception as e:
+    st.error(f"Error loading perps_list.xlsx from GitHub: {e}")
+    st.stop()
 
-    if "Symbol" not in df_perps.columns:
-        st.error("Column 'Symbol' not found in perps_list.xlsx")
-        st.stop()
+if "Symbol" not in df_perps.columns:
+    st.error("Column 'Symbol' not found in perps_list.xlsx")
+    st.stop()
 
-    usdt_perp_symbols = df_perps["Symbol"].dropna().astype(str).tolist()
-    st.write(f"Total symbols loaded: {len(usdt_perp_symbols)}")
+usdt_perp_symbols = df_perps["Symbol"].dropna().astype(str).tolist()
+st.write(f"Total symbols loaded: {len(usdt_perp_symbols)}")
 
-# =========================================================
-# SECTION 4 — FETCH LIQUIDATION HISTORY
-# =========================================================
-
+# ---------------------------------------------------------
+# HELPER: CHUNK LIST
+# ---------------------------------------------------------
 def chunked(iterable, n):
     for i in range(0, len(iterable), n):
         yield iterable[i : i + n]
 
+# ---------------------------------------------------------
+# FETCH LIQUIDATION HISTORY (CACHED)
+# ---------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_liquidations(symbols, months_back: int, interval: str, api_key: str, convert_usd_flag: bool):
     """
     Returns:
-        liq_long_wide, liq_short_wide
+        liq_long_wide: DataFrame (index=time, columns=symbol, values=long liquidations)
+        liq_short_wide: DataFrame (index=time, columns=symbol, values=short liquidations)
     """
     liq_url = f"{BASE_URL}/liquidation-history"
 
@@ -134,9 +119,10 @@ def fetch_liquidations(symbols, months_back: int, interval: str, api_key: str, c
 
     all_rows = []
 
-    for batch in chunked(symbols, 20):
+    for batch in chunked(symbols, 20):  # max 20 per request
+        symbols_param = ",".join(batch)
         params = {
-            "symbols": ",".join(batch),
+            "symbols": symbols_param,
             "interval": interval,
             "from": from_timestamp,
             "to": to_timestamp,
@@ -146,143 +132,390 @@ def fetch_liquidations(symbols, months_back: int, interval: str, api_key: str, c
 
         while True:
             resp = requests.get(liq_url, params=params)
+
             if resp.status_code == 200:
                 data = resp.json()
-                if isinstance(data, list):
-                    for entry in data:
-                        symbol = entry.get("symbol")
-                        hist = entry.get("history", [])
-                        if not symbol or not hist:
-                            continue
-                        df = pd.DataFrame(hist)
-                        df["time"] = pd.to_datetime(df["t"], unit="s")
-                        df.rename(columns={"l": "liq_long", "s": "liq_short"}, inplace=True)
-                        df = df[["time", "liq_long", "liq_short"]]
-                        df["symbol"] = symbol
-                        all_rows.append(df)
-                time.sleep(1)
+                if not isinstance(data, list):
+                    # Unexpected format; skip this batch
+                    break
+
+                for entry in data:
+                    symbol = entry.get("symbol")
+                    history = entry.get("history", [])
+                    if not symbol or not history:
+                        continue
+
+                    df = pd.DataFrame(history)
+                    # t = timestamp, l = long liqs, s = short liqs
+                    df["time"] = pd.to_datetime(df["t"], unit="s")
+                    df.rename(columns={"l": "liq_long", "s": "liq_short"}, inplace=True)
+                    df = df[["time", "liq_long", "liq_short"]]
+                    df["symbol"] = symbol
+                    all_rows.append(df)
+
+                time.sleep(1)  # polite pause
                 break
 
             elif resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "30"))
-                st.warning(f"429 rate-limited. Waiting {retry_after}s …")
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    retry_after = int(retry_after) if retry_after is not None else 30
+                except ValueError:
+                    retry_after = 30
+
+                st.warning(
+                    f"429 Too Many Requests for batch starting with {batch[0]}... "
+                    f"sleeping {retry_after} seconds before retrying"
+                )
                 time.sleep(retry_after)
+
             else:
-                st.error(f"Error fetching batch starting {batch[0]}: {resp.text}")
+                st.error(
+                    f"Error for batch starting with {batch[0]}: "
+                    f"{resp.status_code} - {resp.text}"
+                )
                 break
 
     if not all_rows:
-        raise Exception("No liquidation data received.")
+        raise Exception("No data received for any symbol.")
 
     df_long = pd.concat(all_rows, ignore_index=True)
 
-    liq_long_wide = df_long.pivot_table(index="time", columns="symbol", values="liq_long").sort_index()
-    liq_short_wide = df_long.pivot_table(index="time", columns="symbol", values="liq_short").sort_index()
+    liq_long_wide = (
+        df_long.pivot_table(index="time", columns="symbol", values="liq_long")
+        .sort_index()
+    )
+    liq_short_wide = (
+        df_long.pivot_table(index="time", columns="symbol", values="liq_short")
+        .sort_index()
+    )
 
     return liq_long_wide, liq_short_wide
 
-# =========================================================
-# SECTION 5 — RUN DATA PIPELINE ONLY WHEN BUTTON CLICKED
-# =========================================================
+# ---------------------------------------------------------
+# MAIN DATA FETCH + CALCULATIONS
+# ---------------------------------------------------------
+st.subheader("Liquidations Data")
 
-if st.session_state["run_analysis"]:
+with st.spinner("Fetching liquidation history from Coinalyze API..."):
+    try:
+        liq_long_data, liq_short_data = fetch_liquidations(
+            usdt_perp_symbols, lookback_months, interval, API_KEY, convert_usd
+        )
+    except Exception as e:
+        st.error(f"Error fetching liquidation data: {e}")
+        st.stop()
 
-    st.subheader("Fetching Liquidation Data")
+st.write("Data shape (long, short):", liq_long_data.shape, liq_short_data.shape)
+st.write("Latest timestamp in data:", liq_long_data.index.max())
 
-    with st.spinner("Calling Coinalyze API…"):
-        try:
-            liq_long_data, liq_short_data = fetch_liquidations(
-                usdt_perp_symbols, lookback_months, interval, API_KEY, convert_usd
+# ---------------------------------------------------------
+# Z-SCORES (LONG & SHORT SEPARATE)
+# ---------------------------------------------------------
+long_zscores = (liq_long_data - liq_long_data.mean(numeric_only=True)) / liq_long_data.std(
+    numeric_only=True
+)
+short_zscores = (liq_short_data - liq_short_data.mean(numeric_only=True)) / liq_short_data.std(
+    numeric_only=True
+)
+
+latest_long_z = long_zscores.iloc[-1]
+latest_short_z = short_zscores.iloc[-1]
+
+# ---------------------------------------------------------
+# SHARE OF TOTAL & EXCESS VS 30-PERIOD AVERAGE
+# ---------------------------------------------------------
+rolling_window = 30  # you can parameterize this later if needed
+
+# 1) Total across all symbols per timestamp
+total_long = liq_long_data.sum(axis=1)
+total_short = liq_short_data.sum(axis=1)
+
+# Avoid division by zero by replacing 0 with NaN
+total_long_safe = total_long.replace(0, np.nan)
+total_short_safe = total_short.replace(0, np.nan)
+
+# 2) Ratio (share of total) per symbol per timestamp
+ratio_long = liq_long_data.div(total_long_safe, axis=0)
+ratio_short = liq_short_data.div(total_short_safe, axis=0)
+
+# 3) 30-period trailing average of the ratio
+long_ratio_ma = ratio_long.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
+short_ratio_ma = ratio_short.rolling(window=rolling_window, min_periods=rolling_window // 2).mean()
+
+# Latest values
+latest_long_ratio = ratio_long.iloc[-1]
+latest_short_ratio = ratio_short.iloc[-1]
+latest_long_ratio_ma = long_ratio_ma.iloc[-1]
+latest_short_ratio_ma = short_ratio_ma.iloc[-1]
+
+# 4) Excess = latest ratio - trailing average
+long_excess = latest_long_ratio - latest_long_ratio_ma
+short_excess = latest_short_ratio - latest_short_ratio_ma
+
+# Drop symbols where excess is NaN (e.g. insufficient history)
+long_excess_clean = long_excess.dropna()
+short_excess_clean = short_excess.dropna()
+
+# Sort for top / bottom
+sorted_long_excess = long_excess_clean.sort_values(ascending=False)
+sorted_short_excess = short_excess_clean.sort_values(ascending=False)
+
+top_long_excess_symbols = sorted_long_excess.head(top_n).index
+bottom_long_excess_symbols = sorted_long_excess.tail(top_n).index
+
+top_short_excess_symbols = sorted_short_excess.head(top_n).index
+bottom_short_excess_symbols = sorted_short_excess.tail(top_n).index
+
+# ---------------------------------------------------------
+# Z-SCORE RANKINGS (UNCHANGED LOGIC, BUT DISPLAY ONLY Z-SCORE)
+# ---------------------------------------------------------
+sorted_long_z = latest_long_z.sort_values(ascending=False)
+sorted_short_z = latest_short_z.sort_values(ascending=False)
+
+top_long_z_symbols = sorted_long_z.head(top_n).index
+bottom_long_z_symbols = sorted_long_z.tail(top_n).index
+
+top_short_z_symbols = sorted_short_z.head(top_n).index
+bottom_short_z_symbols = sorted_short_z.tail(top_n).index
+
+# ---------------------------------------------------------
+# DISPLAY RESULTS IN STREAMLIT
+# ---------------------------------------------------------
+st.subheader("Top / Bottom Symbols")
+
+tab_z, tab_share, tab_search = st.tabs(
+    ["By Z-Score (Long / Short)", "By Share vs 30-Period Avg", "Search by Symbol"]
+)
+
+# ---------- TAB 1: Z-SCORES ----------
+with tab_z:
+    col1, col2 = st.columns(2)
+
+    # LONG
+    with col1:
+        st.markdown(f"### Long Liquidations - Top {top_n} by Z-Score")
+        df_top_long_z = (
+            pd.DataFrame(
+                {"Symbol": top_long_z_symbols, "Long Z-Score": latest_long_z[top_long_z_symbols].values}
             )
-        except Exception as e:
-            st.error(f"Error fetching liquidation data: {e}")
-            st.stop()
+            .set_index("Symbol")
+        )
+        st.dataframe(df_top_long_z.style.format({"Long Z-Score": "{:.2f}"}))
 
-    st.success("Liquidation data loaded successfully.")
-    st.write("Data shape:", liq_long_data.shape, liq_short_data.shape)
-    st.write("Latest timestamp:", liq_long_data.index.max())
+        st.markdown(f"### Long Liquidations - Bottom {top_n} by Z-Score")
+        df_bottom_long_z = (
+            pd.DataFrame(
+                {"Symbol": bottom_long_z_symbols, "Long Z-Score": latest_long_z[bottom_long_z_symbols].values}
+            )
+            .set_index("Symbol")
+        )
+        st.dataframe(df_bottom_long_z.style.format({"Long Z-Score": "{:.2f}"}))
 
-    # =====================================================
-    # All original calculations follow exactly as before
-    # =====================================================
+    # SHORT
+    with col2:
+        st.markdown(f"### Short Liquidations - Top {top_n} by Z-Score")
+        df_top_short_z = (
+            pd.DataFrame(
+                {"Symbol": top_short_z_symbols, "Short Z-Score": latest_short_z[top_short_z_symbols].values}
+            )
+            .set_index("Symbol")
+        )
+        st.dataframe(df_top_short_z.style.format({"Short Z-Score": "{:.2f}"}))
 
-    # ---------- Z-SCORES ----------
-    long_zscores = (liq_long_data - liq_long_data.mean()) / liq_long_data.std()
-    short_zscores = (liq_short_data - liq_short_data.mean()) / liq_short_data.std()
+        st.markdown(f"### Short Liquidations - Bottom {top_n} by Z-Score")
+        df_bottom_short_z = (
+            pd.DataFrame(
+                {"Symbol": bottom_short_z_symbols, "Short Z-Score": latest_short_z[bottom_short_z_symbols].values}
+            )
+            .set_index("Symbol")
+        )
+        st.dataframe(df_bottom_short_z.style.format({"Short Z-Score": "{:.2f}"}))
 
-    latest_long_z = long_zscores.iloc[-1]
-    latest_short_z = short_zscores.iloc[-1]
+# ---------- TAB 2: SHARE VS 30-PERIOD AVERAGE ----------
+with tab_share:
+    col1, col2 = st.columns(2)
 
-    # ---------- SHARE / EXCESS ----------
-    total_long = liq_long_data.sum(axis=1).replace(0, np.nan)
-    total_short = liq_short_data.sum(axis=1).replace(0, np.nan)
+    # LONG SIDE
+    with col1:
+        st.markdown(f"### Long Liquidations - Top {top_n} Excess Share vs 30-Period Avg")
+        df_top_long_excess = pd.DataFrame(
+            {
+                "Symbol": top_long_excess_symbols,
+                "Latest Share (%)": (latest_long_ratio[top_long_excess_symbols] * 100.0).values,
+                "30-Period Avg Share (%)": (latest_long_ratio_ma[top_long_excess_symbols] * 100.0).values,
+                "Excess (% pts)": (long_excess[top_long_excess_symbols] * 100.0).values,
+            }
+        ).set_index("Symbol")
+        st.dataframe(
+            df_top_long_excess.style.format(
+                {
+                    "Latest Share (%)": "{:.3f}",
+                    "30-Period Avg Share (%)": "{:.3f}",
+                    "Excess (% pts)": "{:.3f}",
+                }
+            )
+        )
 
-    ratio_long = liq_long_data.div(total_long, axis=0)
-    ratio_short = liq_short_data.div(total_short, axis=0)
+        st.markdown(f"### Long Liquidations - Bottom {top_n} Excess Share vs 30-Period Avg")
+        df_bottom_long_excess = pd.DataFrame(
+            {
+                "Symbol": bottom_long_excess_symbols,
+                "Latest Share (%)": (latest_long_ratio[bottom_long_excess_symbols] * 100.0).values,
+                "30-Period Avg Share (%)": (latest_long_ratio_ma[bottom_long_excess_symbols] * 100.0).values,
+                "Excess (% pts)": (long_excess[bottom_long_excess_symbols] * 100.0).values,
+            }
+        ).set_index("Symbol")
+        st.dataframe(
+            df_bottom_long_excess.style.format(
+                {
+                    "Latest Share (%)": "{:.3f}",
+                    "30-Period Avg Share (%)": "{:.3f}",
+                    "Excess (% pts)": "{:.3f}",
+                }
+            )
+        )
 
-    long_ratio_ma = ratio_long.rolling(30, min_periods=15).mean()
-    short_ratio_ma = ratio_short.rolling(30, min_periods=15).mean()
+    # SHORT SIDE
+    with col2:
+        st.markdown(f"### Short Liquidations - Top {top_n} Excess Share vs 30-Period Avg")
+        df_top_short_excess = pd.DataFrame(
+            {
+                "Symbol": top_short_excess_symbols,
+                "Latest Share (%)": (latest_short_ratio[top_short_excess_symbols] * 100.0).values,
+                "30-Period Avg Share (%)": (latest_short_ratio_ma[top_short_excess_symbols] * 100.0).values,
+                "Excess (% pts)": (short_excess[top_short_excess_symbols] * 100.0).values,
+            }
+        ).set_index("Symbol")
+        st.dataframe(
+            df_top_short_excess.style.format(
+                {
+                    "Latest Share (%)": "{:.3f}",
+                    "30-Period Avg Share (%)": "{:.3f}",
+                    "Excess (% pts)": "{:.3f}",
+                }
+            )
+        )
 
-    latest_long_ratio = ratio_long.iloc[-1]
-    latest_short_ratio = ratio_short.iloc[-1]
-    latest_long_ratio_ma = long_ratio_ma.iloc[-1]
-    latest_short_ratio_ma = short_ratio_ma.iloc[-1]
+        st.markdown(f"### Short Liquidations - Bottom {top_n} Excess Share vs 30-Period Avg")
+        df_bottom_short_excess = pd.DataFrame(
+            {
+                "Symbol": bottom_short_excess_symbols,
+                "Latest Share (%)": (latest_short_ratio[bottom_short_excess_symbols] * 100.0).values,
+                "30-Period Avg Share (%)": (latest_short_ratio_ma[bottom_short_excess_symbols] * 100.0).values,
+                "Excess (% pts)": (short_excess[bottom_short_excess_symbols] * 100.0).values,
+            }
+        ).set_index("Symbol")
+        st.dataframe(
+            df_bottom_short_excess.style.format(
+                {
+                    "Latest Share (%)": "{:.3f}",
+                    "30-Period Avg Share (%)": "{:.3f}",
+                    "Excess (% pts)": "{:.3f}",
+                }
+            )
+        )
 
-    long_excess = (latest_long_ratio - latest_long_ratio_ma).dropna()
-    short_excess = (latest_short_ratio - latest_short_ratio_ma).dropna()
+# ---------- TAB 3: SEARCH BY SYMBOL ----------
+with tab_search:
+    st.markdown("### Search Long / Short Metrics by Symbol")
 
-    sorted_long_excess = long_excess.sort_values(ascending=False)
-    sorted_short_excess = short_excess.sort_values(ascending=False)
+    search_symbol = st.text_input(
+        "Enter symbol (exact as in perps list, e.g. BTCUSDT_PERP.A)",
+        value="",
+    ).strip()
 
-    # ---------- DISPLAY TABS ----------
-    st.subheader("Analysis Outputs")
+    if search_symbol:
+        symbol = search_symbol.upper()
 
-    tab_z, tab_share, tab_search = st.tabs(
-        ["By Z-Score", "By Share vs 30-Period Avg", "Search Symbol"]
+        if symbol not in liq_long_data.columns:
+            st.error(f"Symbol '{symbol}' not found in data.")
+        else:
+            # Handle possible NaNs safely
+            def safe(x):
+                return np.nan if pd.isna(x) else x
+
+            metrics = [
+                "Long Share (%)",
+                "Short Share (%)",
+                "Long 30-Period Avg Share (%)",
+                "Short 30-Period Avg Share (%)",
+                "Long Excess (% pts)",
+                "Short Excess (% pts)",
+                "Long Z-Score",
+                "Short Z-Score",
+            ]
+            values = [
+                safe(latest_long_ratio.get(symbol, np.nan) * 100.0),
+                safe(latest_short_ratio.get(symbol, np.nan) * 100.0),
+                safe(latest_long_ratio_ma.get(symbol, np.nan) * 100.0),
+                safe(latest_short_ratio_ma.get(symbol, np.nan) * 100.0),
+                safe(long_excess.get(symbol, np.nan) * 100.0),
+                safe(short_excess.get(symbol, np.nan) * 100.0),
+                safe(latest_long_z.get(symbol, np.nan)),
+                safe(latest_short_z.get(symbol, np.nan)),
+            ]
+
+            df_search = pd.DataFrame({"Metric": metrics, "Value": values}).set_index("Metric")
+
+            def fmt_value(val, metric):
+                if pd.isna(val):
+                    return "N/A"
+                if "Share" in metric or "Excess" in metric:
+                    return f"{val:.3f}"
+                else:
+                    return f"{val:.2f}"
+
+            df_search_display = df_search.copy()
+            df_search_display["Value"] = [
+                fmt_value(v, m) for m, v in zip(df_search_display.index, df_search_display["Value"])
+            ]
+            st.dataframe(df_search_display)
+
+            # Ranks based on excess share (where available)
+            rank_lines = []
+            if symbol in sorted_long_excess.index:
+                long_ex_rank = sorted_long_excess.index.get_loc(symbol) + 1
+                rank_lines.append(
+                    f"- Long Excess Share: rank {long_ex_rank} of {len(sorted_long_excess)} (1 = highest positive excess)"
+                )
+            if symbol in sorted_short_excess.index:
+                short_ex_rank = sorted_short_excess.index.get_loc(symbol) + 1
+                rank_lines.append(
+                    f"- Short Excess Share: rank {short_ex_rank} of {len(sorted_short_excess)} (1 = highest positive excess)"
+                )
+
+            if rank_lines:
+                st.markdown("#### Approximate Ranks")
+                for line in rank_lines:
+                    st.write(line)
+
+# Optional: Show full latest snapshot
+with st.expander("Show full latest snapshot (all symbols)"):
+    snapshot_df = pd.DataFrame(
+        {
+            "Long Share (%)": latest_long_ratio * 100.0,
+            "Short Share (%)": latest_short_ratio * 100.0,
+            "Long 30-Period Avg Share (%)": latest_long_ratio_ma * 100.0,
+            "Short 30-Period Avg Share (%)": latest_short_ratio_ma * 100.0,
+            "Long Excess (% pts)": long_excess * 100.0,
+            "Short Excess (% pts)": short_excess * 100.0,
+            "Long Z-Score": latest_long_z,
+            "Short Z-Score": latest_short_z,
+        }
+    )
+    st.dataframe(
+        snapshot_df.sort_values("Long Excess (% pts)", ascending=False).style.format(
+            {
+                "Long Share (%)": "{:.3f}",
+                "Short Share (%)": "{:.3f}",
+                "Long 30-Period Avg Share (%)": "{:.3f}",
+                "Short 30-Period Avg Share (%)": "{:.3f}",
+                "Long Excess (% pts)": "{:.3f}",
+                "Short Excess (% pts)": "{:.3f}",
+                "Long Z-Score": "{:.2f}",
+                "Short Z-Score": "{:.2f}",
+            }
+        )
     )
 
-    # ------------------------------------------------------
-    # TAB 1: Z-SCORES
-    # ------------------------------------------------------
-    with tab_z:
-        st.write("Top & Bottom Z-score values")
-
-        st.write("### Long Liquidations")
-        st.dataframe(latest_long_z.sort_values(ascending=False).head(top_n))
-
-        st.write("### Short Liquidations")
-        st.dataframe(latest_short_z.sort_values(ascending=False).head(top_n))
-
-    # ------------------------------------------------------
-    # TAB 2: SHARE vs AVERAGE
-    # ------------------------------------------------------
-    with tab_share:
-        st.write("### Top Excess (Long)")
-        st.dataframe(sorted_long_excess.head(top_n))
-
-        st.write("### Bottom Excess (Long)")
-        st.dataframe(sorted_long_excess.tail(top_n))
-
-        st.write("### Top Excess (Short)")
-        st.dataframe(sorted_short_excess.head(top_n))
-
-        st.write("### Bottom Excess (Short)")
-        st.dataframe(sorted_short_excess.tail(top_n))
-
-    # ------------------------------------------------------
-    # TAB 3: Search
-    # ------------------------------------------------------
-    with tab_search:
-        symbol = st.text_input("Enter symbol")
-        if symbol:
-            symbol = symbol.upper()
-            if symbol not in liq_long_data.columns:
-                st.error("Symbol not found.")
-            else:
-                st.write("Z-Score (Long):", latest_long_z[symbol])
-                st.write("Z-Score (Short):", latest_short_z[symbol])
-
-                st.write("Share (Long):", latest_long_ratio[symbol])
-                st.write("Share Avg (Long):", latest_long_ratio_ma[symbol])
-
-                st.write("Share (Short):", lat
