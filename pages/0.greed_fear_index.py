@@ -26,7 +26,7 @@ st.subheader("Crypto Fear & Greed Index Over Time")
 
 chart = (
     alt.Chart(df)
-    .mark_line(point=True)
+    .mark_line()        # ← markers removed
     .encode(
         x=alt.X("date:T", title="Date"),
         y=alt.Y("value:Q", title="Fear & Greed Index (0–100)"),
