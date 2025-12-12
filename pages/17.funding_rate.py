@@ -294,6 +294,60 @@ with tab2:
         ).set_index("Symbol")
         st.dataframe(df_bottom_rates.style.format({"Funding Rate (%)": "{:.4f}"}))
 
+# ---------------------------------------------------------
+# 30-PERIOD MOVING AVERAGE FOR A SPECIFIC COIN
+# ---------------------------------------------------------
+st.subheader("30-Period Moving Average (by symbol)")
+
+# Provide a small text input to filter symbols (acts like type-to-search/autofill)
+symbol_search = st.text_input("Type to filter symbols (substring match):", value="", key="fr_symbol_search")
+
+# Filter the full symbols list by the typed substring (case-insensitive)
+filtered_symbols = [s for s in usdt_perp_symbols if symbol_search.strip().lower() in s.lower()]
+
+if not filtered_symbols:
+    st.warning("No symbols match that filter. Clear the search box or type a different substring.")
+else:
+    # Use a selectbox to choose one symbol from the filtered list
+    selected_symbol = st.selectbox(
+        "Select symbol to view 30-period MA:",
+        options=filtered_symbols,
+        index=0,
+        format_func=lambda x: x,
+        key="fr_selected_symbol",
+    )
+
+    # Ensure the selected symbol exists in fr_data
+    if selected_symbol not in fr_data.columns:
+        st.error(f"Selected symbol {selected_symbol} not found in funding rate data.")
+    else:
+        series = fr_data[selected_symbol].dropna()
+        if series.empty:
+            st.warning(f"No funding rate datapoints available for {selected_symbol}.")
+        else:
+            ma30 = series.rolling(window=30).mean()
+
+            # Show a small summary table
+            latest_rate = series.iloc[-1]
+            latest_ma30 = ma30.iloc[-1]
+            # Format latest_ma30 safely if NaN
+            if np.isnan(latest_ma30):
+                latest_ma30_display = "N/A (insufficient periods)"
+            else:
+                latest_ma30_display = f"{latest_ma30:.6f}%"
+
+            st.write(
+                f"Latest {selected_symbol} funding rate: **{latest_rate:.6f}%**,  "
+                f"Latest 30-period MA: **{latest_ma30_display}**"
+            )
+
+            # Plot funding rate + MA
+            plot_df = pd.DataFrame({
+                f"{selected_symbol} Funding Rate (%)": series,
+                "MA30 (%)": ma30
+            })
+            st.line_chart(plot_df)
+
 # Optional: Show the full latest funding rate snapshot
 with st.expander("Show full latest funding rate snapshot (all symbols)"):
     st.dataframe(latest_rates.to_frame("Funding Rate (%)").sort_values("Funding Rate (%)", ascending=False))
