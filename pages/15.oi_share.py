@@ -239,6 +239,40 @@ if st.session_state["run_analysis"]:
     oi_share_df = oi_data.div(oi_data.sum(axis=1), axis=0) * 100
     oi_share_df = oi_share_df.round(3)
 
+    # ---------------------- NEW: Single-symbol OI share chart ----------------------
+    # Let user pick a symbol (dropdown that can be typed into). Show its series (percent).
+    st.subheader("Open Interest Market Share — Single Symbol View")  # <-- ADDED
+    # Provide a helpful instruction
+    st.markdown("Select a symbol to view its open interest market share (percent) time series. You can start typing to filter the list.")  # <-- ADDED
+
+    # Ensure the symbols list matches columns in oi_share_df (in case some symbols had no data)
+    available_symbols = list(oi_share_df.columns)
+    if not available_symbols:
+        st.warning("No symbols available to plot (oi_share_df is empty).")
+    else:
+        # Use selectbox — supports typing to filter (autofill-like)
+        default_idx = 0
+        try:
+            # prefer to preselect a sensible default if present (e.g., first symbol in your list)
+            default_symbol = available_symbols[default_idx]
+        except Exception:
+            default_symbol = available_symbols[0]
+
+        selected_symbol = st.selectbox(
+            "Pick a symbol:",
+            options=available_symbols,
+            index=available_symbols.index(default_symbol) if default_symbol in available_symbols else 0,
+        )  # <-- ADDED
+
+        # Plot the percent time series for the selected symbol
+        # Convert to Series with datetime index (oi_share_df is already datetime-indexed)
+        symbol_series = oi_share_df[selected_symbol].dropna()
+        if symbol_series.empty:
+            st.info(f"No market share data available for {selected_symbol}.")
+        else:
+            st.line_chart(symbol_series)  # percentage values (rounded to 3 dp) plotted over time
+    # -------------------- END NEW BLOCK --------------------
+
     # ----------------------------------------------------------
     # 3. Compute market_share_avg (excluding last day)
     # ----------------------------------------------------------
