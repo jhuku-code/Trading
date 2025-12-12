@@ -261,47 +261,59 @@ if available_themes:
     if not tickers_for_theme:
         st.info("No tickers found for the selected theme.")
     else:
-        st.write(f"Showing {len(tickers_for_theme)} tickers for theme: **{selected_theme}**")
+        # Allow user to pick a subset of tickers to display (multiselect). Default = all tickers for the theme.
+        selected_tickers = st.multiselect(
+            "Select tickers to show (type to filter)",
+            options=tickers_for_theme,
+            default=tickers_for_theme,
+            help="Type to filter tickers. Unselect some to hide them from the chart.",
+            key="multiselect_theme_tickers"
+        )
 
-        # Extract price sub-DF for tickers
-        price_sub = price_theme[tickers_for_theme].copy()
-        # ensure datetime index
-        try:
-            price_sub.index = pd.to_datetime(price_sub.index)
-        except Exception:
-            pass
-
-        # Compute period returns (decimal) and cumulative series per coin (base 100)
-        coin_returns = price_sub.pct_change().dropna()
-        if coin_returns.empty:
-            st.info("Not enough price bars for selected tickers to compute returns. Fetch more data.")
+        if not selected_tickers:
+            st.info("No tickers selected — select one or more tickers to display the chart.")
         else:
-            coin_cum = (1 + coin_returns).cumprod() * 100
-            # coin_cum: index = dates ascending, columns = tickers
+            st.write(f"Showing {len(selected_tickers)} tickers for theme: **{selected_theme}**")
 
-            # Slice & rebase coin-level cumulative using the same view window
-            coin_view_df, coin_start_idx, coin_used_count = slice_and_rebase_by_periods(coin_cum, view_option)
-
-            # Prepare plotting dataframe
-            coin_plot_df = coin_view_df.reset_index().melt(id_vars=coin_view_df.index.name or "index", value_vars=coin_view_df.columns, var_name="Ticker", value_name="Cumulative")
-            if (coin_view_df.index.name is None) or (coin_view_df.index.name == "index"):
-                coin_plot_df = coin_plot_df.rename(columns={"index": "Date"})
-            else:
-                coin_plot_df = coin_plot_df.rename(columns={coin_view_df.index.name: "Date"})
+            # Extract price sub-DF for selected tickers
+            price_sub = price_theme[selected_tickers].copy()
+            # ensure datetime index
             try:
-                coin_plot_df["Date"] = pd.to_datetime(coin_plot_df["Date"])
+                price_sub.index = pd.to_datetime(price_sub.index)
             except Exception:
                 pass
 
-            fig2 = px.line(coin_plot_df, x="Date", y="Cumulative", color="Ticker",
-                           title=f"Coin-level cumulative returns for theme '{selected_theme}' (rebased over selected periods)",
-                           labels={"Cumulative": "Cumulative (base 100)", "Date": "Date"})
-            fig2.update_layout(
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(t=60, b=40, l=40, r=20)
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+            # Compute period returns (decimal) and cumulative series per coin (base 100)
+            coin_returns = price_sub.pct_change().dropna()
+            if coin_returns.empty:
+                st.info("Not enough price bars for selected tickers to compute returns. Fetch more data.")
+            else:
+                coin_cum = (1 + coin_returns).cumprod() * 100
+                # coin_cum: index = dates ascending, columns = tickers
+
+                # Slice & rebase coin-level cumulative using the same view window
+                coin_view_df, coin_start_idx, coin_used_count = slice_and_rebase_by_periods(coin_cum, view_option)
+
+                # Prepare plotting dataframe
+                coin_plot_df = coin_view_df.reset_index().melt(id_vars=coin_view_df.index.name or "index", value_vars=coin_view_df.columns, var_name="Ticker", value_name="Cumulative")
+                if (coin_view_df.index.name is None) or (coin_view_df.index.name == "index"):
+                    coin_plot_df = coin_plot_df.rename(columns={"index": "Date"})
+                else:
+                    coin_plot_df = coin_plot_df.rename(columns={coin_view_df.index.name: "Date"})
+                try:
+                    coin_plot_df["Date"] = pd.to_datetime(coin_plot_df["Date"])
+                except Exception:
+                    pass
+
+                fig2 = px.line(coin_plot_df, x="Date", y="Cumulative", color="Ticker",
+                               title=f"Coin-level cumulative returns for theme '{selected_theme}' (rebased over selected periods)",
+                               labels={"Cumulative": "Cumulative (base 100)", "Date": "Date"})
+                fig2.update_layout(
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(t=60, b=40, l=40, r=20)
+                )
+                st.plotly_chart(fig2, use_container_width=True)
 
             with st.expander("Show tickers in this theme"):
                 st.write(tickers_for_theme)
