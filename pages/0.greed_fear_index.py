@@ -1,16 +1,14 @@
 import streamlit as st
-import streamlit.components.v1 as components
+from datetime import datetime
 
-st.set_page_config(page_title="Fear & Greed Index", layout="wide")
+st.set_page_config(page_title="Fear & Greed (embed)", layout="wide")
+st.title("Crypto Fear & Greed — Embedded (Alternative.me image)")
 
-st.title("Crypto Fear & Greed Index — Embedded from CoinMarketCap")
+# Alternative.me image widget (always shows latest)
+img_url = "https://alternative.me/crypto/fear-and-greed-index.png"
 
-components.html(
-    f"""
-    <iframe 
-        src="https://coinmarketcap.com/charts/fear-and-greed-index/" 
-        style="width: 100%; height: 800px; border:none;"
-    ></iframe>
-    """,
-    height=820
-)
+st.markdown("**Source:** alternative.me — updates daily")
+st.image(img_url, use_column_width=True)
+
+# optional: show a link back to the source
+st.markdown("[Open full index on alternative.me](https://alternative.me/crypto/fear-and-greed-index/)")
