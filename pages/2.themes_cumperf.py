@@ -233,6 +233,82 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------
+# NEW SECTION: Theme-specific coin-level cumulative chart
+# -------------------------
+# This section adds a dropdown (type-to-filter) of available themes. When a theme is selected,
+# it finds all tickers mapped to that theme, computes each coin's cumulative performance over the
+# same display window (view_option) and plots them (rebased to 100 over the selected window).
+
+# Build theme options from theme_values (aligned to price_theme.columns)
+try:
+    theme_series_full = pd.Series(list(theme_values), index=list(price_theme.columns))
+    available_themes = sorted(pd.Series(theme_series_full.values).dropna().astype(str).unique().tolist())
+except Exception:
+    available_themes = []
+
+st.markdown("---")
+st.subheader("Per-theme — coin-level cumulative performance")
+
+if available_themes:
+    selected_theme = st.selectbox("Select a theme (type to filter)", options=available_themes, index=0, key="select_theme_for_coins")
+
+    # Find tickers for selected theme
+    try:
+        tickers_for_theme = [t for t, th in zip(price_theme.columns, theme_values) if str(th) == str(selected_theme)]
+    except Exception:
+        tickers_for_theme = []
+
+    if not tickers_for_theme:
+        st.info("No tickers found for the selected theme.")
+    else:
+        st.write(f"Showing {len(tickers_for_theme)} tickers for theme: **{selected_theme}**")
+
+        # Extract price sub-DF for tickers
+        price_sub = price_theme[tickers_for_theme].copy()
+        # ensure datetime index
+        try:
+            price_sub.index = pd.to_datetime(price_sub.index)
+        except Exception:
+            pass
+
+        # Compute period returns (decimal) and cumulative series per coin (base 100)
+        coin_returns = price_sub.pct_change().dropna()
+        if coin_returns.empty:
+            st.info("Not enough price bars for selected tickers to compute returns. Fetch more data.")
+        else:
+            coin_cum = (1 + coin_returns).cumprod() * 100
+            # coin_cum: index = dates ascending, columns = tickers
+
+            # Slice & rebase coin-level cumulative using the same view window
+            coin_view_df, coin_start_idx, coin_used_count = slice_and_rebase_by_periods(coin_cum, view_option)
+
+            # Prepare plotting dataframe
+            coin_plot_df = coin_view_df.reset_index().melt(id_vars=coin_view_df.index.name or "index", value_vars=coin_view_df.columns, var_name="Ticker", value_name="Cumulative")
+            if (coin_view_df.index.name is None) or (coin_view_df.index.name == "index"):
+                coin_plot_df = coin_plot_df.rename(columns={"index": "Date"})
+            else:
+                coin_plot_df = coin_plot_df.rename(columns={coin_view_df.index.name: "Date"})
+            try:
+                coin_plot_df["Date"] = pd.to_datetime(coin_plot_df["Date"])
+            except Exception:
+                pass
+
+            fig2 = px.line(coin_plot_df, x="Date", y="Cumulative", color="Ticker",
+                           title=f"Coin-level cumulative returns for theme '{selected_theme}' (rebased over selected periods)",
+                           labels={"Cumulative": "Cumulative (base 100)", "Date": "Date"})
+            fig2.update_layout(
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(t=60, b=40, l=40, r=20)
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+            with st.expander("Show tickers in this theme"):
+                st.write(tickers_for_theme)
+else:
+    st.info("No theme mapping available to show per-theme coin-level chart.")
+
+# -------------------------
 # Extras: medians preview, CSV download, mapping preview
 # -------------------------
 with st.expander("Show per-period median returns used to compute cumulative series"):
@@ -265,4 +341,3 @@ with st.expander("Show underlying price_theme (wide) and theme mapping"):
         st.write("Could not display mapping cleanly (unexpected format).")
 
 st.success("Chart ready — use Streamlit controls above to change the view window (periods) and rebase.")
-
