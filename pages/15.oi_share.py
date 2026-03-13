@@ -213,6 +213,10 @@ if st.session_state["run_analysis"]:
     with st.spinner("Fetching open interest data from Coinalyze and running analysis..."):
         try:
             oi_data = fetch_oi_data(usdt_perp_symbols, months_back, API_KEY)
+
+            # SAVE TO Session state
+            st.session_state["oi_data"] = oi_data
+            st.session_state["oi_last_update"] = datetime.now()
         except Exception as e:
             st.error(f"Error fetching OI data: {e}")
             st.stop()
