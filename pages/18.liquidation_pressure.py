@@ -53,7 +53,7 @@ symbols = load_symbols()
 st.write(f"{len(symbols)} symbols loaded")
 
 # ---------------------------------------------------------
-# HELPER
+# HELPERS
 # ---------------------------------------------------------
 
 def chunked(iterable,n):
@@ -64,7 +64,6 @@ def chunked(iterable,n):
 # FETCH LIQUIDATIONS
 # ---------------------------------------------------------
 
-@st.cache_data(ttl=1800)
 def fetch_liquidations(symbols):
 
     url = f"{BASE_URL}/liquidation-history"
@@ -85,7 +84,10 @@ def fetch_liquidations(symbols):
             "api_key":API_KEY
         }
 
-        r = requests.get(url,params=params)
+        try:
+            r = requests.get(url,params=params)
+        except:
+            continue
 
         if r.status_code != 200:
             continue
@@ -105,9 +107,6 @@ def fetch_liquidations(symbols):
 
             df = pd.DataFrame(history)
 
-            if df.empty:
-                continue
-
             df["time"] = pd.to_datetime(df["t"],unit="s")
             df["symbol"] = symbol
 
@@ -115,7 +114,7 @@ def fetch_liquidations(symbols):
 
             rows.append(df[["time","symbol","long","short"]])
 
-        time.sleep(1)
+        time.sleep(0.3)
 
     if len(rows)==0:
         return pd.DataFrame(),pd.DataFrame()
@@ -131,7 +130,6 @@ def fetch_liquidations(symbols):
 # FETCH OPEN INTEREST
 # ---------------------------------------------------------
 
-@st.cache_data(ttl=1800)
 def fetch_oi(symbols):
 
     url=f"{BASE_URL}/open-interest-history"
@@ -151,7 +149,10 @@ def fetch_oi(symbols):
             "api_key":API_KEY
         }
 
-        r=requests.get(url,params=params)
+        try:
+            r=requests.get(url,params=params)
+        except:
+            continue
 
         if r.status_code!=200:
             continue
@@ -171,9 +172,6 @@ def fetch_oi(symbols):
 
             df=pd.DataFrame(history)
 
-            if df.empty:
-                continue
-
             df["time"]=pd.to_datetime(df["t"],unit="s")
             df["symbol"]=symbol
 
@@ -181,7 +179,7 @@ def fetch_oi(symbols):
 
             rows.append(df[["time","symbol","oi"]])
 
-        time.sleep(1)
+        time.sleep(0.3)
 
     if len(rows)==0:
         return pd.DataFrame()
@@ -194,7 +192,6 @@ def fetch_oi(symbols):
 # FETCH FUNDING
 # ---------------------------------------------------------
 
-@st.cache_data(ttl=1800)
 def fetch_funding(symbols):
 
     url=f"{BASE_URL}/funding-rate-history"
@@ -214,7 +211,10 @@ def fetch_funding(symbols):
             "api_key":API_KEY
         }
 
-        r=requests.get(url,params=params)
+        try:
+            r=requests.get(url,params=params)
+        except:
+            continue
 
         if r.status_code!=200:
             continue
@@ -234,9 +234,6 @@ def fetch_funding(symbols):
 
             df=pd.DataFrame(history)
 
-            if df.empty:
-                continue
-
             df["time"]=pd.to_datetime(df["t"],unit="s")
             df["symbol"]=symbol
 
@@ -244,7 +241,7 @@ def fetch_funding(symbols):
 
             rows.append(df[["time","symbol","fund"]])
 
-        time.sleep(1)
+        time.sleep(0.3)
 
     if len(rows)==0:
         return pd.DataFrame()
@@ -254,20 +251,20 @@ def fetch_funding(symbols):
     return df.pivot(index="time",columns="symbol",values="fund")*100
 
 # ---------------------------------------------------------
-# RUN BUTTON
+# RUN ANALYSIS
 # ---------------------------------------------------------
 
 if st.button("Run LPI Analysis"):
 
-    with st.spinner("Downloading data from Coinalyze..."):
+    with st.spinner("Downloading data..."):
 
         liq_long,liq_short = fetch_liquidations(symbols)
         oi_df = fetch_oi(symbols)
         funding_df = fetch_funding(symbols)
 
-    if liq_long.empty or oi_df.empty or funding_df.empty:
-        st.error("One or more datasets returned empty from API.")
-        st.stop()
+    st.write("Symbols with liquidation data:",len(liq_long.columns))
+    st.write("Symbols with OI data:",len(oi_df.columns))
+    st.write("Symbols with funding data:",len(funding_df.columns))
 
     # -----------------------------------------------------
     # ALIGN SYMBOLS
@@ -282,6 +279,12 @@ if st.button("Run LPI Analysis"):
 
     common_symbols = list(common_symbols)
 
+    if len(common_symbols)==0:
+        st.error("No common symbols across datasets")
+        st.stop()
+
+    st.write("Symbols used for LPI:",len(common_symbols))
+
     liq_long = liq_long[common_symbols]
     liq_short = liq_short[common_symbols]
     oi_df = oi_df[common_symbols]
@@ -292,27 +295,18 @@ if st.button("Run LPI Analysis"):
     # -----------------------------------------------------
 
     liq_signal = np.log((liq_long+1)/(liq_short+1))
-
     oi_velocity = oi_df.pct_change(6)
-
     funding_accel = funding_df.diff()
 
-    # -----------------------------------------------------
-    # Z-SCORES
-    # -----------------------------------------------------
-
     liq_z = (liq_signal - liq_signal.rolling(z_window).mean()) / liq_signal.rolling(z_window).std()
-
     oi_z = (oi_velocity - oi_velocity.rolling(z_window).mean()) / oi_velocity.rolling(z_window).std()
-
     fund_z = (funding_accel - funding_accel.rolling(z_window).mean()) / funding_accel.rolling(z_window).std()
 
     lpi_df = 0.4*liq_z + 0.35*oi_z + 0.25*fund_z
-
     lpi_df = lpi_df.rolling(smoothing).mean()
 
     # -----------------------------------------------------
-    # MARKET LPI (BTC + ETH)
+    # MARKET LPI
     # -----------------------------------------------------
 
     btc_cols = [c for c in lpi_df.columns if "BTC" in c]
@@ -322,10 +316,6 @@ if st.button("Run LPI Analysis"):
     eth_lpi = lpi_df[eth_cols].mean(axis=1)
 
     market_lpi = btc_weight*btc_lpi + (1-btc_weight)*eth_lpi
-
-    # -----------------------------------------------------
-    # MARKET LPI CHART
-    # -----------------------------------------------------
 
     st.subheader("BTC+ETH Weighted Market LPI")
 
@@ -339,7 +329,7 @@ if st.button("Run LPI Analysis"):
         )
     )
 
-    fig.update_layout(height=500,hovermode="x unified")
+    fig.update_layout(height=500)
 
     st.plotly_chart(fig,use_container_width=True)
 
@@ -362,7 +352,7 @@ if st.button("Run LPI Analysis"):
         st.dataframe(latest.tail(20))
 
     # -----------------------------------------------------
-    # COIN LPI TIME SERIES
+    # COIN LPI CHART
     # -----------------------------------------------------
 
     st.subheader("Coin LPI Time Series")
@@ -379,6 +369,6 @@ if st.button("Run LPI Analysis"):
         )
     )
 
-    fig2.update_layout(height=500,hovermode="x unified")
+    fig2.update_layout(height=500)
 
     st.plotly_chart(fig2,use_container_width=True)
