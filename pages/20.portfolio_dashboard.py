@@ -7,11 +7,10 @@ st.set_page_config(page_title="Portfolio Allocation Dashboard", layout="wide")
 st.title("Portfolio Allocation Dashboard")
 
 # ----------------------------------------------------------
-# CHECK REQUIRED DATA
+# REQUIRED DATA
 # ----------------------------------------------------------
 
 required = [
-    "price_theme",
     "ticker_to_theme",
     "coin_volatility",
     "coin_btc_betas"
@@ -19,7 +18,7 @@ required = [
 
 for r in required:
     if r not in st.session_state:
-        st.warning(f"{r} not found. Please run the required pages first.")
+        st.warning(f"{r} not available. Run prerequisite pages.")
         st.stop()
 
 ticker_to_theme = st.session_state.ticker_to_theme
@@ -31,7 +30,7 @@ beta_df = st.session_state.coin_btc_betas.set_index("Coin")
 # ----------------------------------------------------------
 
 structure = {
-    "Spot": [
+    "Spot":[
         "Fundamental",
         "Thematic",
         "Momentum",
@@ -40,7 +39,7 @@ structure = {
         "Return to trend",
         "Value buys"
     ],
-    "Futures": [
+    "Futures":[
         "Momentum",
         "Volatility Breakout",
         "Trend Following",
@@ -48,102 +47,133 @@ structure = {
         "Value buys",
         "Long /short"
     ],
-    "Options": [
+    "Options":[
         "Tail risk",
         "Premia Income",
         "Term Structure"
     ],
-    "Cash": ["Cash"]
+    "Cash":["Cash"]
 }
 
 # ----------------------------------------------------------
-# CREATE EDITABLE INPUT TABLE
+# BUILD INPUT TABLE WITH HEADERS
 # ----------------------------------------------------------
 
-rows = []
+rows=[]
 
-for cat, subs in structure.items():
+for cat,subs in structure.items():
+
+    rows.append({
+        "Category":cat,
+        "SubCategory":"",
+        "Name":"",
+        "Weight %":"",
+        "Value":"",
+        "Leverage":""
+    })
 
     for sub in subs:
+
+        rows.append({
+            "Category":"",
+            "SubCategory":sub,
+            "Name":"",
+            "Weight %":"",
+            "Value":"",
+            "Leverage":""
+        })
 
         for i in range(5):
 
             rows.append({
-                "Category": cat,
-                "SubCategory": sub,
-                "Name": "",
-                "Theme": "",
-                "Weight": 0.0,
-                "Value": 0.0,
-                "Leverage": 1.0,
-                "Risk": np.nan,
-                "Beta": np.nan,
-                "CTR": np.nan,
-                "CTB": np.nan
+                "Category":"",
+                "SubCategory":"",
+                "Name":"",
+                "Weight %":0,
+                "Value":0,
+                "Leverage":1
             })
 
-portfolio_df = pd.DataFrame(rows)
+input_df=pd.DataFrame(rows)
 
 # ----------------------------------------------------------
-# INPUT TABLE
+# PORTFOLIO INPUT TABLE
 # ----------------------------------------------------------
 
 st.subheader("Portfolio Inputs")
 
-edited_df = st.data_editor(
-    portfolio_df,
-    use_container_width=True,
-    num_rows="dynamic",
-    column_config={
-        "Weight": st.column_config.NumberColumn(step=0.01),
-        "Value": st.column_config.NumberColumn(step=1000),
-        "Leverage": st.column_config.NumberColumn(step=0.1)
-    }
+edited = st.data_editor(
+    input_df,
+    use_container_width=True
 )
 
 # ----------------------------------------------------------
-# ENRICH DATA
+# CLEAN PORTFOLIO DATA
 # ----------------------------------------------------------
 
-for i, row in edited_df.iterrows():
+portfolio_rows=[]
 
-    coin = str(row["Name"]).upper()
+current_category=""
+current_sub=""
 
-    if coin == "":
+for _,row in edited.iterrows():
+
+    if row["Category"]!="":
+        current_category=row["Category"]
         continue
 
-    if coin in ticker_to_theme:
-        edited_df.loc[i, "Theme"] = ticker_to_theme[coin]
+    if row["SubCategory"]!="":
+        current_sub=row["SubCategory"]
+        continue
 
-    if coin in vol_df.index:
-        edited_df.loc[i, "Risk"] = vol_df.loc[coin, "Volatility"]
+    coin=str(row["Name"]).upper()
 
-    if coin in beta_df.index:
-        edited_df.loc[i, "Beta"] = beta_df.loc[coin, "BTC_Beta"]
+    if coin=="":
+        continue
+
+    weight=float(row["Weight %"])/100
+
+    portfolio_rows.append({
+        "Category":current_category,
+        "SubCategory":current_sub,
+        "Coin":coin,
+        "Weight":weight,
+        "Value":row["Value"],
+        "Leverage":row["Leverage"]
+    })
+
+portfolio=pd.DataFrame(portfolio_rows)
+
+if len(portfolio)==0:
+    st.stop()
 
 # ----------------------------------------------------------
-# CALCULATE CTR / CTB
+# ADD THEME RISK BETA
 # ----------------------------------------------------------
 
-edited_df["CTR"] = edited_df["Weight"] * edited_df["Risk"] * edited_df["Leverage"]
-edited_df["CTB"] = edited_df["Weight"] * edited_df["Beta"] * edited_df["Leverage"]
+portfolio["Theme"]=portfolio["Coin"].map(ticker_to_theme)
 
-total_ctr = edited_df["CTR"].sum()
-total_ctb = edited_df["CTB"].sum()
+portfolio["Risk"]=portfolio["Coin"].map(vol_df["Volatility"])
 
-if total_ctr != 0:
-    edited_df["CTR"] = edited_df["CTR"] / total_ctr
-
-if total_ctb != 0:
-    edited_df["CTB"] = edited_df["CTB"] / total_ctb
+portfolio["Beta"]=portfolio["Coin"].map(beta_df["BTC_Beta"])
 
 # ----------------------------------------------------------
-# CATEGORY TOTALS
+# CONTRIBUTIONS
 # ----------------------------------------------------------
 
-cat_totals = edited_df.groupby("Category")["Weight"].sum()
-sub_totals = edited_df.groupby(["Category", "SubCategory"])["Weight"].sum()
-theme_totals = edited_df.groupby("Theme")["Weight"].sum()
+portfolio["CTR"]=portfolio["Weight"]*portfolio["Risk"]*portfolio["Leverage"]
+portfolio["CTB"]=portfolio["Weight"]*portfolio["Beta"]*portfolio["Leverage"]
+
+portfolio["CTR"]=portfolio["CTR"]/portfolio["CTR"].sum()
+portfolio["CTB"]=portfolio["CTB"]/portfolio["CTB"].sum()
+
+# ----------------------------------------------------------
+# TOTALS
+# ----------------------------------------------------------
+
+cat_totals=portfolio.groupby("Category")["Weight"].sum()
+sub_totals=portfolio.groupby(["Category","SubCategory"])["Weight"].sum()
+theme_totals=portfolio.groupby("Theme")["Weight"].sum()
 
 # ----------------------------------------------------------
 # CONSTRAINT SETTINGS
@@ -151,165 +181,168 @@ theme_totals = edited_df.groupby("Theme")["Weight"].sum()
 
 st.sidebar.header("Constraints")
 
-spot_min, spot_max = st.sidebar.slider("Spot Range", 0.0, 1.0, (0.30, 0.70))
-fut_min, fut_max = st.sidebar.slider("Futures Range", 0.0, 1.0, (0.10, 0.40))
-opt_min, opt_max = st.sidebar.slider("Options Range", 0.0, 1.0, (0.00, 0.40))
-cash_min, cash_max = st.sidebar.slider("Cash Range", 0.0, 1.0, (0.00, 0.40))
+spot_min,spot_max=st.sidebar.slider("Spot",0.0,1.0,(0.30,0.70))
+fut_min,fut_max=st.sidebar.slider("Futures",0.0,1.0,(0.10,0.40))
+opt_min,opt_max=st.sidebar.slider("Options",0.0,1.0,(0.0,0.40))
+cash_min,cash_max=st.sidebar.slider("Cash",0.0,1.0,(0.0,0.40))
 
-sub_limit = st.sidebar.slider("Sub Category Limit", 0.0, 1.0, 0.25)
-theme_limit = st.sidebar.slider("Theme Limit", 0.0, 1.0, 0.25)
+sub_limit=st.sidebar.slider("Subcategory max",0.0,1.0,0.25)
+theme_limit=st.sidebar.slider("Theme max",0.0,1.0,0.25)
 
 # ----------------------------------------------------------
 # CONSTRAINT CHECK
 # ----------------------------------------------------------
 
-violations = []
+violations=[]
 
-if not (spot_min <= cat_totals.get("Spot", 0) <= spot_max):
-    violations.append("Spot allocation outside range")
+for cat,val in cat_totals.items():
 
-if not (fut_min <= cat_totals.get("Futures", 0) <= fut_max):
-    violations.append("Futures allocation outside range")
+    if cat=="Spot" and not(spot_min<=val<=spot_max):
+        violations.append(f"Category constraint violated: {cat}")
 
-if not (opt_min <= cat_totals.get("Options", 0) <= opt_max):
-    violations.append("Options allocation outside range")
+    if cat=="Futures" and not(fut_min<=val<=fut_max):
+        violations.append(f"Category constraint violated: {cat}")
 
-if not (cash_min <= cat_totals.get("Cash", 0) <= cash_max):
-    violations.append("Cash allocation outside range")
+    if cat=="Options" and not(opt_min<=val<=opt_max):
+        violations.append(f"Category constraint violated: {cat}")
 
-if any(sub_totals > sub_limit):
-    violations.append("Sub-category weight limit exceeded")
+    if cat=="Cash" and not(cash_min<=val<=cash_max):
+        violations.append(f"Category constraint violated: {cat}")
 
-theme_excess = theme_totals[(theme_totals > theme_limit) & (theme_totals.index != "L1")]
+for (cat,sub),val in sub_totals.items():
 
-if len(theme_excess) > 0:
-    violations.append("Theme exposure exceeded")
+    if val>sub_limit:
+        violations.append(f"Subcategory exceeded: {cat} / {sub}")
 
-# ----------------------------------------------------------
-# DASHBOARD LAYOUT
-# ----------------------------------------------------------
+for theme,val in theme_totals.items():
 
-col1, col2 = st.columns(2)
+    if theme!="L1" and val>theme_limit:
+        violations.append(f"Theme exceeded: {theme}")
 
 # ----------------------------------------------------------
-# PORTFOLIO ALLOCATION PIE
+# DASHBOARD
 # ----------------------------------------------------------
+
+col1,col2=st.columns(2)
 
 with col1:
 
     st.subheader("Portfolio Allocation")
 
-    fig = px.pie(
+    fig=px.pie(
         values=cat_totals.values,
         names=cat_totals.index
     )
 
-    st.plotly_chart(fig, use_container_width=True)
-
-# ----------------------------------------------------------
-# RISK CONTRIBUTION
-# ----------------------------------------------------------
+    st.plotly_chart(fig,use_container_width=True)
 
 with col2:
 
     st.subheader("Risk Contribution by Coin")
 
-    risk_df = edited_df.groupby("Name")["CTR"].sum()
-
-    risk_df = risk_df[risk_df.index != ""]
-
-    fig = px.bar(
-        risk_df,
-        labels={"value": "CTR", "index": "Coin"}
+    fig=px.bar(
+        portfolio,
+        x="Coin",
+        y="CTR",
+        color="Category"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig,use_container_width=True)
 
 # ----------------------------------------------------------
 # SECOND ROW
 # ----------------------------------------------------------
 
-col3, col4 = st.columns(2)
-
-# ----------------------------------------------------------
-# THEME EXPOSURE
-# ----------------------------------------------------------
+col3,col4=st.columns(2)
 
 with col3:
 
-    st.subheader("Theme Exposure")
+    st.subheader("Beta Contribution by Coin")
 
-    theme_df = theme_totals[theme_totals.index != ""]
-
-    fig = px.bar(
-        theme_df,
-        labels={"value": "Weight", "index": "Theme"}
+    fig=px.bar(
+        portfolio,
+        x="Coin",
+        y="CTB",
+        color="Category"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig,use_container_width=True)
+
+with col4:
+
+    st.subheader("Theme Exposure")
+
+    fig=px.bar(
+        portfolio,
+        x="Theme",
+        y="Weight",
+        color="Coin"
+    )
+
+    st.plotly_chart(fig,use_container_width=True)
 
 # ----------------------------------------------------------
 # CONSTRAINT MONITOR
 # ----------------------------------------------------------
 
-with col4:
+st.subheader("Constraint Monitor")
 
-    st.subheader("Constraint Monitor")
-
-    if len(violations) == 0:
-        st.success("All constraints satisfied")
-    else:
-        for v in violations:
-            st.error(v)
+if len(violations)==0:
+    st.success("All constraints satisfied")
+else:
+    for v in violations:
+        st.error(v)
 
 # ----------------------------------------------------------
 # PORTFOLIO METRICS
 # ----------------------------------------------------------
 
-col5, col6 = st.columns(2)
+col5,col6=st.columns(2)
 
-portfolio_vol = np.sqrt(
-    np.sum(
-        (edited_df["Weight"] *
-         edited_df["Risk"] *
-         edited_df["Leverage"]) ** 2
-    )
+portfolio_vol=np.sqrt(
+    np.sum((portfolio["Weight"]*portfolio["Risk"]*portfolio["Leverage"])**2)
 )
 
-portfolio_beta = (
-    edited_df["Weight"] *
-    edited_df["Beta"] *
-    edited_df["Leverage"]
-).sum()
+portfolio_beta=np.sum(
+    portfolio["Weight"]*portfolio["Beta"]*portfolio["Leverage"]
+)
 
-col5.metric("Portfolio Volatility", f"{portfolio_vol:.2%}")
-col6.metric("Portfolio BTC Beta", round(portfolio_beta, 2))
+col5.metric("Portfolio Volatility",f"{portfolio_vol:.2%}")
+col6.metric("Portfolio BTC Beta",round(portfolio_beta,2))
 
 # ----------------------------------------------------------
-# HIERARCHICAL TABLE DISPLAY
+# PORTFOLIO TABLE
 # ----------------------------------------------------------
 
 st.subheader("Portfolio Table")
 
 for cat in structure:
 
+    cat_df=portfolio[portfolio["Category"]==cat]
+
+    if len(cat_df)==0:
+        continue
+
     st.markdown(f"## {cat}")
 
-    subs = structure[cat]
+    cat_ctr=cat_df["CTR"].sum()
+    cat_ctb=cat_df["CTB"].sum()
 
-    for sub in subs:
+    st.write(f"Category CTR: {cat_ctr:.2%} | CTB: {cat_ctb:.2%}")
 
-        sub_df = edited_df[
-            (edited_df["Category"] == cat) &
-            (edited_df["SubCategory"] == sub)
-        ]
+    for sub in structure[cat]:
 
-        sub_df = sub_df[sub_df["Name"] != ""]
+        sub_df=cat_df[cat_df["SubCategory"]==sub]
 
-        if len(sub_df) == 0:
+        if len(sub_df)==0:
             continue
 
         st.markdown(f"### {sub}")
+
+        sub_ctr=sub_df["CTR"].sum()
+        sub_ctb=sub_df["CTB"].sum()
+
+        st.write(f"Subcategory CTR: {sub_ctr:.2%} | CTB: {sub_ctb:.2%}")
 
         st.dataframe(sub_df)
 
