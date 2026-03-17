@@ -56,7 +56,7 @@ structure = {
 }
 
 # ------------------------------------------------------------
-# BUILD CLEAN INPUT TABLE
+# BUILD EXCEL STYLE INPUT TABLE
 # ------------------------------------------------------------
 
 rows = []
@@ -69,7 +69,8 @@ for cat, subs in structure.items():
         "Coin":"",
         "Weight %":"",
         "Value":"",
-        "Leverage":""
+        "Leverage":"",
+        "RowType":"Category"
     })
 
     for sub in subs:
@@ -80,7 +81,8 @@ for cat, subs in structure.items():
             "Coin":"",
             "Weight %":"",
             "Value":"",
-            "Leverage":""
+            "Leverage":"",
+            "RowType":"SubCategory"
         })
 
         for i in range(5):
@@ -91,10 +93,25 @@ for cat, subs in structure.items():
                 "Coin":"",
                 "Weight %":0,
                 "Value":0,
-                "Leverage":1
+                "Leverage":1,
+                "RowType":"Coin"
             })
 
 input_df = pd.DataFrame(rows)
+
+# ------------------------------------------------------------
+# STYLE CATEGORY ROWS
+# ------------------------------------------------------------
+
+def highlight_rows(row):
+
+    if row["RowType"] == "Category":
+        return ["background-color:#e8edf5;font-weight:bold"] * len(row)
+
+    if row["RowType"] == "SubCategory":
+        return ["background-color:#f5f7fa;font-weight:bold"] * len(row)
+
+    return [""] * len(row)
 
 # ------------------------------------------------------------
 # PORTFOLIO INPUT TABLE
@@ -105,7 +122,7 @@ st.subheader("Portfolio Inputs")
 edited = st.data_editor(
     input_df,
     use_container_width=True,
-    disabled=["Category","SubCategory"]
+    disabled=["Category","SubCategory","RowType"]
 )
 
 # ------------------------------------------------------------
@@ -119,11 +136,11 @@ current_sub = ""
 
 for _, row in edited.iterrows():
 
-    if row["Category"] != "":
+    if row["RowType"] == "Category":
         current_category = row["Category"]
         continue
 
-    if row["SubCategory"] != "":
+    if row["RowType"] == "SubCategory":
         current_sub = row["SubCategory"]
         continue
 
@@ -150,7 +167,7 @@ for _, row in edited.iterrows():
 portfolio = pd.DataFrame(portfolio_rows)
 
 if len(portfolio) == 0:
-    st.info("Enter coins in the Portfolio Inputs table.")
+    st.info("Enter coins in Portfolio Inputs.")
     st.stop()
 
 # ------------------------------------------------------------
@@ -161,9 +178,8 @@ portfolio["Theme"] = portfolio["Coin"].map(ticker_to_theme)
 portfolio["Risk"] = portfolio["Coin"].map(vol_df["Volatility"])
 portfolio["Beta"] = portfolio["Coin"].map(beta_df["BTC_Beta"])
 
-# ensure numeric
-for col in ["Risk","Beta"]:
-    portfolio[col] = pd.to_numeric(portfolio[col], errors="coerce").fillna(0)
+portfolio["Risk"] = pd.to_numeric(portfolio["Risk"], errors="coerce").fillna(0)
+portfolio["Beta"] = pd.to_numeric(portfolio["Beta"], errors="coerce").fillna(0)
 
 # ------------------------------------------------------------
 # CONTRIBUTIONS
@@ -202,28 +218,42 @@ theme_limit = st.sidebar.slider("Theme max",0.0,1.0,0.25)
 # ------------------------------------------------------------
 
 violations = []
+total_weight = portfolio["Weight"].sum()
 
-for cat,val in cat_totals.items():
+if total_weight > 0:
 
-    if cat=="Spot" and not(spot_min<=val<=spot_max):
-        violations.append(f"Category constraint violated: {cat}")
+    for cat,val in cat_totals.items():
 
-    if cat=="Futures" and not(fut_min<=val<=fut_max):
-        violations.append(f"Category constraint violated: {cat}")
+        if val == 0:
+            continue
 
-    if cat=="Options" and not(opt_min<=val<=opt_max):
-        violations.append(f"Category constraint violated: {cat}")
+        if cat=="Spot" and not(spot_min<=val<=spot_max):
+            violations.append(f"Category constraint violated: {cat}")
 
-    if cat=="Cash" and not(cash_min<=val<=cash_max):
-        violations.append(f"Category constraint violated: {cat}")
+        if cat=="Futures" and not(fut_min<=val<=fut_max):
+            violations.append(f"Category constraint violated: {cat}")
 
-for (cat,sub),val in sub_totals.items():
-    if val > sub_limit:
-        violations.append(f"Subcategory exceeded: {cat} / {sub}")
+        if cat=="Options" and not(opt_min<=val<=opt_max):
+            violations.append(f"Category constraint violated: {cat}")
 
-for theme,val in theme_totals.items():
-    if theme!="L1" and val>theme_limit:
-        violations.append(f"Theme exceeded: {theme}")
+        if cat=="Cash" and not(cash_min<=val<=cash_max):
+            violations.append(f"Category constraint violated: {cat}")
+
+    for (cat,sub),val in sub_totals.items():
+
+        if val == 0:
+            continue
+
+        if val > sub_limit:
+            violations.append(f"Subcategory exceeded: {cat} / {sub}")
+
+    for theme,val in theme_totals.items():
+
+        if val == 0:
+            continue
+
+        if theme!="L1" and val>theme_limit:
+            violations.append(f"Theme exceeded: {theme}")
 
 # ------------------------------------------------------------
 # DASHBOARD
@@ -293,8 +323,12 @@ with col4:
 
 st.subheader("Constraint Monitor")
 
-if len(violations)==0:
+if total_weight == 0:
+    st.info("Enter portfolio weights to activate constraints.")
+
+elif len(violations)==0:
     st.success("All constraints satisfied")
+
 else:
     for v in violations:
         st.error(v)
