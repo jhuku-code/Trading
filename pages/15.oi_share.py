@@ -8,13 +8,13 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 # ---------------------------------------------------------
-# STREAMLIT PAGE CONFIG
+# PAGE CONFIG
 # ---------------------------------------------------------
 st.set_page_config(page_title="OI Market Share Dashboard", layout="wide")
 st.title("Open Interest Market Share Dashboard")
 
 # ---------------------------------------------------------
-# CONSTANTS / CONFIG
+# CONSTANTS
 # ---------------------------------------------------------
 API_KEY = st.secrets.get("API_KEY", "xxxxxx")
 BASE_URL = "https://api.coinalyze.net/v1"
@@ -29,81 +29,50 @@ GITHUB_EXCEL_URL = (
 )
 
 # ---------------------------------------------------------
-# SIDEBAR SETTINGS
+# SIDEBAR
 # ---------------------------------------------------------
 st.sidebar.header("Settings")
 
-st.sidebar.markdown("**Perps list file (on GitHub):**")
-st.sidebar.code("/Input-Files/perps_list.xlsx", language="text")
+months_back = st.sidebar.number_input("Lookback (months)", 1, 12, 3)
+top_bottom_n = st.sidebar.number_input("Top/Bottom N", 5, 100, 15)
 
-st.sidebar.markdown("**Repo:**")
-st.sidebar.write(f"{GITHUB_USER}/{GITHUB_REPO} ({BRANCH})")
-
-months_back = st.sidebar.number_input(
-    "Lookback window (months)",
-    min_value=1,
-    max_value=12,
-    value=3,
-    step=1,
-)
-
-top_bottom_n = st.sidebar.number_input(
-    "Number of symbols to show",
-    min_value=5,
-    max_value=100,
-    value=15,
-    step=5,
-)
-
-# ✅ Interval selector
 interval = st.sidebar.selectbox(
-    "Select interval granularity",
+    "Interval",
     ["1min", "1hour", "4hour", "6hour", "12hour", "daily"],
     index=2,
 )
 
-# Cache clear
-if st.sidebar.button("Clear cached API data"):
-    st.cache_data.clear()
-    st.sidebar.success("Cache cleared")
-
 # ---------------------------------------------------------
-# PAGE CONTROL
+# BUTTONS
 # ---------------------------------------------------------
-if "run_analysis" not in st.session_state:
-    st.session_state["run_analysis"] = False
-
 col1, col2 = st.columns(2)
+
+run_clicked = False
 
 with col1:
     if st.button("Run analysis"):
-        st.session_state["run_analysis"] = True
+        run_clicked = True
 
 with col2:
     if st.button("Force refresh"):
         st.cache_data.clear()
-        st.session_state["run_analysis"] = True
+        st.session_state.pop("oi_data", None)
+        run_clicked = True
 
-if st.button("Clear results"):
-    st.session_state["run_analysis"] = False
-
-st.info(f"Selected interval: {interval}")
+if st.sidebar.button("Clear cache"):
+    st.cache_data.clear()
 
 # ---------------------------------------------------------
 # LOAD SYMBOLS
 # ---------------------------------------------------------
-@st.cache_data(show_spinner=True)
+@st.cache_data
 def load_symbols(url):
     resp = requests.get(url)
     resp.raise_for_status()
     df = pd.read_excel(io.BytesIO(resp.content))
     return df["Symbol"].dropna().astype(str).tolist()
 
-try:
-    symbols = load_symbols(GITHUB_EXCEL_URL)
-except Exception as e:
-    st.error(f"Error loading symbols: {e}")
-    st.stop()
+symbols = load_symbols(GITHUB_EXCEL_URL)
 
 # ---------------------------------------------------------
 # HELPER
@@ -113,9 +82,9 @@ def chunked(lst, n):
         yield lst[i:i+n]
 
 # ---------------------------------------------------------
-# FETCH DATA
+# FETCH
 # ---------------------------------------------------------
-@st.cache_data(show_spinner=True)
+@st.cache_data
 def fetch_oi(symbols, months_back, interval, api_key):
 
     url = f"{BASE_URL}/open-interest-history"
@@ -138,7 +107,6 @@ def fetch_oi(symbols, months_back, interval, api_key):
         while True:
             resp = requests.get(url, params=params)
 
-            # ---------------- SUCCESS ----------------
             if resp.status_code == 200:
                 data = resp.json()
 
@@ -156,24 +124,18 @@ def fetch_oi(symbols, months_back, interval, api_key):
 
                     all_data.append(df[["time", "symbol", "oi"]])
 
-                time.sleep(1)  # polite pause
+                time.sleep(1)
                 break
 
-            # ---------------- RATE LIMIT FIX ----------------
             elif resp.status_code == 429:
                 retry_raw = resp.headers.get("Retry-After", 30)
-
                 try:
-                    retry = float(retry_raw)  # ✅ handles "55.496"
+                    retry = float(retry_raw)
                 except:
                     retry = 30
-
-                st.warning(f"Rate limited. Sleeping {retry:.2f}s")
                 time.sleep(retry)
 
-            # ---------------- ERROR ----------------
             else:
-                st.error(f"Error {resp.status_code}: {resp.text}")
                 break
 
     if not all_data:
@@ -181,78 +143,84 @@ def fetch_oi(symbols, months_back, interval, api_key):
 
     df = pd.concat(all_data)
 
-    df_wide = (
-        df.pivot(index="time", columns="symbol", values="oi")
-        .sort_index()
-    )
-
-    return df_wide
+    return df.pivot(index="time", columns="symbol", values="oi").sort_index()
 
 # ---------------------------------------------------------
-# RUN ANALYSIS
+# DATA LOAD LOGIC (KEY FIX)
 # ---------------------------------------------------------
-if st.session_state["run_analysis"]:
-
+if run_clicked:
     with st.spinner("Fetching data..."):
+        st.session_state["oi_data"] = fetch_oi(
+            symbols, months_back, interval, API_KEY
+        )
+        st.session_state["last_params"] = (months_back, interval)
 
-        try:
-            oi_data = fetch_oi(symbols, months_back, interval, API_KEY)
-        except Exception as e:
-            st.error(e)
-            st.stop()
+# ---------------------------------------------------------
+# USE EXISTING DATA IF AVAILABLE
+# ---------------------------------------------------------
+if "oi_data" not in st.session_state:
+    st.info("Click Run analysis to fetch data")
+    st.stop()
 
-    st.success("Data loaded")
+# OPTIONAL: detect parameter change
+if "last_params" in st.session_state:
+    if st.session_state["last_params"] != (months_back, interval):
+        st.warning("Settings changed — click Run to refresh data")
 
-    # ---------------- TOTAL OI ----------------
-    st.subheader("Total OI")
-    total_oi = oi_data.sum(axis=1)
-    st.line_chart(total_oi)
+oi_data = st.session_state["oi_data"]
 
-    # ---------------- MARKET SHARE ----------------
-    total = oi_data.sum(axis=1)
-    share = oi_data.div(total, axis=0) * 100
+# ---------------------------------------------------------
+# ANALYSIS
+# ---------------------------------------------------------
+st.success("Using cached data")
 
-    # ---------------- SINGLE SYMBOL ----------------
-    st.subheader("Single Symbol Market Share")
-    sym = st.selectbox("Select symbol", oi_data.columns)
+# TOTAL OI
+st.subheader("Total OI")
+total_oi = oi_data.sum(axis=1)
+st.line_chart(total_oi)
 
-    series = (oi_data[sym] / total) * 100
-    st.line_chart(series)
+# MARKET SHARE
+total = oi_data.sum(axis=1)
+share = oi_data.div(total, axis=0) * 100
 
-    # ---------------- AVERAGE ----------------
-    temp = share.copy()
-    temp["date"] = temp.index.date
-    last_day = temp["date"].max()
+# SINGLE SYMBOL
+st.subheader("Single Symbol Market Share")
+sym = st.selectbox("Select symbol", oi_data.columns)
 
-    avg = {
-        c: temp[temp["date"] != last_day][c].mean()
-        for c in share.columns
-    }
-    avg = pd.Series(avg)
+series = (oi_data[sym] / total) * 100
+st.line_chart(series)
 
-    # ---------------- DIFF ----------------
-    last = share.iloc[-1]
-    diff = last - avg
+# AVG
+temp = share.copy()
+temp["date"] = temp.index.date
+last_day = temp["date"].max()
 
-    df = pd.DataFrame({
-        "symbol": diff.index,
-        "diff": diff.values,
-        "last": last.values,
-        "avg": avg.values
-    }).sort_values("diff", ascending=False)
+avg = {
+    c: temp[temp["date"] != last_day][c].mean()
+    for c in share.columns
+}
+avg = pd.Series(avg)
 
-    # ---------------- TOP / BOTTOM ----------------
-    st.subheader("Top / Bottom Movers")
+# DIFF
+last = share.iloc[-1]
+diff = last - avg
 
-    col1, col2 = st.columns(2)
+df = pd.DataFrame({
+    "symbol": diff.index,
+    "diff": diff.values,
+    "last": last.values,
+    "avg": avg.values
+}).sort_values("diff", ascending=False)
 
-    with col1:
-        st.write("Top")
-        st.dataframe(df.head(top_bottom_n))
+# TOP / BOTTOM
+st.subheader("Top / Bottom Movers")
 
-    with col2:
-        st.write("Bottom")
-        st.dataframe(df.tail(top_bottom_n))
+col1, col2 = st.columns(2)
 
-else:
-    st.info("Click Run analysis to start")
+with col1:
+    st.write("Top")
+    st.dataframe(df.head(top_bottom_n))
+
+with col2:
+    st.write("Bottom")
+    st.dataframe(df.tail(top_bottom_n))
