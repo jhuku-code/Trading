@@ -48,24 +48,24 @@ months_back = st.sidebar.number_input(
 )
 
 top_bottom_n = st.sidebar.number_input(
-    "Number of symbols to show in Top/Bottom lists",
+    "Number of symbols to show",
     min_value=5,
     max_value=100,
     value=15,
     step=5,
 )
 
-# ✅ NEW: Interval Selectbox
+# ✅ Interval selector
 interval = st.sidebar.selectbox(
     "Select interval granularity",
-    options=["1min", "1hour", "4hour", "6hour", "12hour", "daily"],
+    ["1min", "1hour", "4hour", "6hour", "12hour", "daily"],
     index=2,
 )
 
 # Cache clear
 if st.sidebar.button("Clear cached API data"):
     st.cache_data.clear()
-    st.sidebar.success("Cache cleared. Click 'Run analysis' to fetch fresh data.")
+    st.sidebar.success("Cache cleared")
 
 # ---------------------------------------------------------
 # PAGE CONTROL
@@ -73,78 +73,72 @@ if st.sidebar.button("Clear cached API data"):
 if "run_analysis" not in st.session_state:
     st.session_state["run_analysis"] = False
 
-col_run, col_force = st.columns([1, 1])
+col1, col2 = st.columns(2)
 
-with col_run:
-    if st.button("Run analysis / Refresh calculations"):
+with col1:
+    if st.button("Run analysis"):
         st.session_state["run_analysis"] = True
 
-with col_force:
-    if st.button("Force refresh (clear cache & run)"):
+with col2:
+    if st.button("Force refresh"):
         st.cache_data.clear()
         st.session_state["run_analysis"] = True
 
-if st.button("Clear results (hide)"):
+if st.button("Clear results"):
     st.session_state["run_analysis"] = False
 
-st.write("Tip: The page won't fetch or compute OI until you click **Run analysis**.")
-st.info(f"Using interval: {interval}")
+st.info(f"Selected interval: {interval}")
 
 # ---------------------------------------------------------
 # LOAD SYMBOLS
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=True)
-def load_symbols_from_github(url: str):
+def load_symbols(url):
     resp = requests.get(url)
     resp.raise_for_status()
     df = pd.read_excel(io.BytesIO(resp.content))
-    if "Symbol" not in df.columns:
-        raise ValueError("Excel file must contain a 'Symbol' column.")
     return df["Symbol"].dropna().astype(str).tolist()
 
 try:
-    usdt_perp_symbols = load_symbols_from_github(GITHUB_EXCEL_URL)
+    symbols = load_symbols(GITHUB_EXCEL_URL)
 except Exception as e:
-    st.error(f"Error loading perps_list.xlsx from GitHub: {e}")
+    st.error(f"Error loading symbols: {e}")
     st.stop()
-
-if not usdt_perp_symbols:
-    st.error("No symbols found in perps_list.xlsx on GitHub.")
-    st.stop()
-
-st.info(f"Loaded {len(usdt_perp_symbols)} perp symbols.")
 
 # ---------------------------------------------------------
 # HELPER
 # ---------------------------------------------------------
-def chunked(iterable, n):
-    for i in range(0, len(iterable), n):
-        yield iterable[i : i + n]
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 # ---------------------------------------------------------
 # FETCH DATA
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=True)
-def fetch_oi_data(symbols, months_back, api_key, interval):
-    oi_url = f"{BASE_URL}/open-interest-history"
+def fetch_oi(symbols, months_back, interval, api_key):
 
-    from_timestamp = int((datetime.now() - relativedelta(months=int(months_back))).timestamp())
-    to_timestamp = int(datetime.now().timestamp())
+    url = f"{BASE_URL}/open-interest-history"
 
-    all_rows = []
+    from_ts = int((datetime.now() - relativedelta(months=months_back)).timestamp())
+    to_ts = int(datetime.now().timestamp())
+
+    all_data = []
 
     for batch in chunked(symbols, 20):
+
         params = {
             "symbols": ",".join(batch),
-            "interval": interval,  # ✅ dynamic
-            "from": from_timestamp,
-            "to": to_timestamp,
+            "interval": interval,
+            "from": from_ts,
+            "to": to_ts,
             "api_key": api_key,
         }
 
         while True:
-            resp = requests.get(oi_url, params=params)
+            resp = requests.get(url, params=params)
 
+            # ---------------- SUCCESS ----------------
             if resp.status_code == 200:
                 data = resp.json()
 
@@ -152,40 +146,45 @@ def fetch_oi_data(symbols, months_back, api_key, interval):
                     symbol = entry.get("symbol")
                     history = entry.get("history", [])
 
-                    if not symbol or not history:
+                    if not history:
                         continue
 
                     df = pd.DataFrame(history)
                     df["time"] = pd.to_datetime(df["t"], unit="s")
-                    df.rename(columns={"o": "open_interest"}, inplace=True)
-                    df = df[["time", "open_interest"]]
                     df["symbol"] = symbol
-                    all_rows.append(df)
+                    df.rename(columns={"o": "oi"}, inplace=True)
 
-                time.sleep(1)
+                    all_data.append(df[["time", "symbol", "oi"]])
+
+                time.sleep(1)  # polite pause
                 break
 
+            # ---------------- RATE LIMIT FIX ----------------
             elif resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 30))
-                st.warning(f"Rate limited. Sleeping {retry_after}s")
-                time.sleep(retry_after)
+                retry_raw = resp.headers.get("Retry-After", 30)
 
+                try:
+                    retry = float(retry_raw)  # ✅ handles "55.496"
+                except:
+                    retry = 30
+
+                st.warning(f"Rate limited. Sleeping {retry:.2f}s")
+                time.sleep(retry)
+
+            # ---------------- ERROR ----------------
             else:
-                st.error(f"Error: {resp.status_code}")
+                st.error(f"Error {resp.status_code}: {resp.text}")
                 break
 
-    if not all_rows:
-        raise Exception("No data received")
+    if not all_data:
+        raise Exception("No data fetched")
 
-    df_long = pd.concat(all_rows, ignore_index=True)
+    df = pd.concat(all_data)
 
     df_wide = (
-        df_long.pivot_table(index="time", columns="symbol", values="open_interest")
+        df.pivot(index="time", columns="symbol", values="oi")
         .sort_index()
     )
-
-    cols_intersect = [c for c in symbols if c in df_wide.columns]
-    df_wide = df_wide.loc[:, cols_intersect]
 
     return df_wide
 
@@ -193,77 +192,67 @@ def fetch_oi_data(symbols, months_back, api_key, interval):
 # RUN ANALYSIS
 # ---------------------------------------------------------
 if st.session_state["run_analysis"]:
+
     with st.spinner("Fetching data..."):
+
         try:
-            oi_data = fetch_oi_data(
-                usdt_perp_symbols,
-                months_back,
-                API_KEY,
-                interval,  # ✅ passed here
-            )
-
-            st.session_state["oi_data"] = oi_data
-            st.session_state["oi_last_update"] = datetime.now()
-
+            oi_data = fetch_oi(symbols, months_back, interval, API_KEY)
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(e)
             st.stop()
 
-    st.success("OI data loaded successfully.")
+    st.success("Data loaded")
 
-    # TOTAL OI
-    st.subheader("Total Open Interest Over Time")
+    # ---------------- TOTAL OI ----------------
+    st.subheader("Total OI")
     total_oi = oi_data.sum(axis=1)
     st.line_chart(total_oi)
 
-    # MARKET SHARE
-    oi_hist = oi_data.copy()
-    total_oi_hist = oi_hist.sum(axis=1)
+    # ---------------- MARKET SHARE ----------------
+    total = oi_data.sum(axis=1)
+    share = oi_data.div(total, axis=0) * 100
 
-    oi_share_df = oi_hist.div(total_oi_hist, axis=0) * 100
-    oi_share_df = oi_share_df.round(3)
-
-    # SINGLE SYMBOL VIEW
+    # ---------------- SINGLE SYMBOL ----------------
     st.subheader("Single Symbol Market Share")
-    selected_symbol = st.selectbox("Pick a symbol:", oi_hist.columns)
+    sym = st.selectbox("Select symbol", oi_data.columns)
 
-    symbol_series = (oi_hist[selected_symbol] / total_oi_hist) * 100
-    st.line_chart(symbol_series)
+    series = (oi_data[sym] / total) * 100
+    st.line_chart(series)
 
-    # AVG SHARE
-    temp = oi_share_df.copy()
+    # ---------------- AVERAGE ----------------
+    temp = share.copy()
     temp["date"] = temp.index.date
     last_day = temp["date"].max()
 
-    market_share_avg = {
-        s: temp[temp["date"] != last_day][s].mean()
-        for s in oi_share_df.columns
+    avg = {
+        c: temp[temp["date"] != last_day][c].mean()
+        for c in share.columns
     }
-    market_share_avg = pd.Series(market_share_avg)
+    avg = pd.Series(avg)
 
-    # DIFF
-    last_market_share = oi_share_df.iloc[-1]
-    oi_diff = last_market_share - market_share_avg
+    # ---------------- DIFF ----------------
+    last = share.iloc[-1]
+    diff = last - avg
 
-    oi_diff_df = pd.DataFrame({
-        "symbol": oi_diff.index,
-        "diff": oi_diff.values,
-        "last_market_share": last_market_share.values,
-        "avg_market_share": market_share_avg.values,
+    df = pd.DataFrame({
+        "symbol": diff.index,
+        "diff": diff.values,
+        "last": last.values,
+        "avg": avg.values
     }).sort_values("diff", ascending=False)
 
-    # TOP / BOTTOM
-    st.subheader(f"Top & Bottom {int(top_bottom_n)}")
+    # ---------------- TOP / BOTTOM ----------------
+    st.subheader("Top / Bottom Movers")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write("Top Gainers")
-        st.dataframe(oi_diff_df.head(int(top_bottom_n)))
+        st.write("Top")
+        st.dataframe(df.head(top_bottom_n))
 
     with col2:
-        st.write("Top Losers")
-        st.dataframe(oi_diff_df.tail(int(top_bottom_n)))
+        st.write("Bottom")
+        st.dataframe(df.tail(top_bottom_n))
 
 else:
-    st.info("Click 'Run analysis' to start.")
+    st.info("Click Run analysis to start")
