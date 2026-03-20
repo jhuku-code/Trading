@@ -1,228 +1,355 @@
 # pages/1_theme_cumperf.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 
 st.set_page_config(page_title="Themes TS Cum. Perf", layout="wide")
-st.title("Themes — Time Series Cumulative Performance")
+st.title("Themes — Time Series Cumulative Performance (Period-based view)")
 
 # -------------------------
 # Cached computation
 # -------------------------
 @st.cache_data(show_spinner=False)
-def compute_theme_cumulative(price_theme, theme_values, cache_token):
+def compute_theme_cumulative(price_theme: pd.DataFrame, theme_values_aligned, cache_token):
+    """
+    Returns:
+      cumulative: DataFrame indexed by theme, columns = timestamps (ascending)
+      medians: DataFrame indexed by theme, columns = timestamps (period medians in percent)
+    cache_token is used to invalidate when upstream changes.
+    """
+    df_prices = price_theme.copy()
+    if not isinstance(df_prices.index, pd.DatetimeIndex):
+        df_prices.index = pd.to_datetime(df_prices.index)
 
-    df = price_theme.copy()
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors="coerce")
-
-    returns = df.pct_change().dropna() * 100
+    # percent returns (period over period) in percent units
+    returns = df_prices.pct_change().dropna() * 100
     if returns.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     returns_T = returns.T
 
-    try:
-        theme_series = pd.Series(list(theme_values), index=returns_T.index)
-    except Exception:
+    # Align theme_values_aligned to returns_T.index
+    if isinstance(theme_values_aligned, (list, tuple, np.ndarray)):
+        theme_series = pd.Series(list(theme_values_aligned), index=returns_T.index)
+    elif isinstance(theme_values_aligned, pd.Series):
+        theme_series = theme_values_aligned.reindex(returns_T.index).fillna("Unknown")
+    else:
         theme_series = pd.Series(["Unknown"] * len(returns_T.index), index=returns_T.index)
 
+    returns_T = returns_T.copy()
     returns_T["Theme"] = theme_series
 
-    date_cols = [c for c in returns_T.columns if c != "Theme"]
-
+    # Determine date columns (exclude Theme) and keep them in ascending order
+    date_columns = [c for c in returns_T.columns if c != "Theme"]
     try:
-        date_cols = sorted(date_cols, key=lambda x: pd.to_datetime(x))
+        date_dt = pd.to_datetime(date_columns)
+        sorted_pairs = sorted(zip(date_dt, date_columns))
+        sorted_date_cols = [pair[1] for pair in sorted_pairs]
     except Exception:
-        pass
+        sorted_date_cols = date_columns
 
+    # Build median series per theme (one-row per theme)
+    themes = returns_T["Theme"].unique().tolist()
     theme_medians = {}
-
-    for theme in returns_T["Theme"].unique():
+    for theme in themes:
         rows = returns_T[returns_T["Theme"] == theme]
-        med = rows[date_cols].median(axis=0)
-        theme_medians[theme] = med
+        median_series = rows[sorted_date_cols].median(axis=0, skipna=True)
+        df_theme = pd.DataFrame([median_series.values], index=[theme], columns=sorted_date_cols)
+        theme_medians[theme] = df_theme
 
-    consolidated = pd.DataFrame(theme_medians).T
-    consolidated = consolidated.apply(pd.to_numeric, errors="coerce")
+    consolidated_medians = pd.concat(theme_medians.values(), axis=0)
+    consolidated_medians = consolidated_medians.apply(pd.to_numeric, errors="coerce")
 
-    cumulative = (1 + consolidated.fillna(0) / 100).cumprod(axis=1) * 100
+    # Cumulative returns from percent medians (base 100)
+    cumulative = pd.DataFrame(index=consolidated_medians.index, columns=consolidated_medians.columns)
+    for theme in consolidated_medians.index:
+        series = consolidated_medians.loc[theme].astype(float).fillna(0)  # treat NaN as 0%
+        cumulative.loc[theme] = (1 + series / 100).cumprod() * 100
 
+    # Attempt to convert columns to datetimes for plotting
     try:
         cumulative.columns = pd.to_datetime(cumulative.columns)
+        consolidated_medians.columns = pd.to_datetime(consolidated_medians.columns)
     except Exception:
         pass
 
-    return cumulative, consolidated
-
+    return cumulative, consolidated_medians
 
 # -------------------------
-# Inputs
+# Page inputs & state
 # -------------------------
-price_theme = st.session_state.get("price_theme")
-theme_values = st.session_state.get("theme_values")
-price_theme_version = st.session_state.get("price_theme_version")
+price_theme = st.session_state.get("price_theme", None)            # wide prices DF
+theme_values = st.session_state.get("theme_values", None)          # list aligned to columns
+price_timeframe = st.session_state.get("price_timeframe", None)    # 'daily' / '4hourly' / '1hourly'
+price_theme_version = st.session_state.get("price_theme_version", None)
 
-if price_theme is None or price_theme.empty:
-    st.warning("No price data found.")
+# Show source version if present
+if price_theme_version is not None:
+    st.caption(f"Source data version: {price_theme_version}")
+
+# local controls
+col_left, col_right = st.columns([1, 4])
+with col_left:
+    local_refresh = st.button("Refresh computations (no network fetch)")
+with col_right:
+    st.write("Use the Period controls below (Streamlit buttons/selectbox) to select the displayed window. The selected window is rebased to 100.")
+
+# Validate presence of data
+if price_theme is None or (isinstance(price_theme, pd.DataFrame) and price_theme.empty):
+    st.info("No `price_theme` found in session state. Go to the fetch page and click 'Refresh / Fetch Data' to populate data.")
     st.stop()
 
 if theme_values is None:
-    st.warning("No theme mapping found.")
+    st.warning("No `theme_values` mapping found in session state. Please ensure the fetch page stores it.")
     st.stop()
 
+# Describe period meaning based on timeframe
+tf_label = price_timeframe if price_timeframe is not None else "unknown"
+if tf_label == "daily":
+    period_desc = "1 period = 1 day"
+elif tf_label == "4hourly":
+    period_desc = "1 period = 4 hours"
+elif tf_label == "1hourly":
+    period_desc = "1 period = 1 hour"
+else:
+    period_desc = f"1 period = data timeframe ({tf_label})"
+st.markdown(f"**Timeframe:** `{tf_label}` — {period_desc}")
 
 # -------------------------
-# Compute
+# Compute cumulative + medians (cached)
 # -------------------------
-cumulative_returns, _ = compute_theme_cumulative(
-    price_theme,
-    theme_values,
-    price_theme_version
-)
+cache_token = (price_theme_version, bool(local_refresh))
+cumulative_returns, consolidated_medians = compute_theme_cumulative(price_theme, theme_values, cache_token)
 
 if cumulative_returns.empty:
-    st.warning("Not enough data.")
+    st.info("Not enough data to compute returns. Fetch more bars and try again.")
     st.stop()
 
-cum_df = cumulative_returns.T.copy()
-cum_df.index = pd.to_datetime(cum_df.index, errors="coerce")
-
+# transpose for plotting: rows = dates (ascending), columns = themes
+cum_T_full = cumulative_returns.T.copy()
+# ensure index is datetime if possible
+try:
+    cum_T_full.index = pd.to_datetime(cum_T_full.index)
+except Exception:
+    pass
 
 # -------------------------
-# View controls (WITH 90)
+# Streamlit-based view controls (only these control the view/range)
 # -------------------------
-period_options = [
-    "1 period",
-    "10 periods",
-    "30 periods",
-    "60 periods",
-    "90 periods",
-    "180 periods",
-    "All"
-]
+# Available options (period counts)
+period_options = ["1 period", "10 periods", "30 periods", "60 periods", "180 periods", "All"]
 
+# Use session_state to keep selection persistent and allow quick-button updates
 if "view_option" not in st.session_state:
     st.session_state.view_option = "30 periods"
 
-if st.session_state.view_option in period_options:
-    idx = period_options.index(st.session_state.view_option)
-else:
-    idx = 2
+# Quick buttons row: 1p, 30p, 60p, 180p, All
+btn_cols = st.columns([1, 1, 1, 1, 1])
+labels = ["1 period", "10 periods", "30 periods", "60 periods", "180 periods", "All"]
+for c, label in zip(btn_cols, labels):
+    if c.button(label.split()[0] + ("p" if "period" in label else ""), key=f"btn_{label}"):
+        st.session_state.view_option = label
+        # re-run so the selection takes effect immediately
+        st.experimental_rerun()
 
-view_option = st.selectbox("Display window", period_options, index=idx)
+# Primary selectbox (keeps selection and acts as canonical control)
+view_option = st.selectbox("Display window (this rebases selected window to start at 100)", options=period_options, index=period_options.index(st.session_state.view_option) if st.session_state.view_option in period_options else 1, key="select_view_option")
+# Keep session state aligned
 st.session_state.view_option = view_option
 
-
 # -------------------------
-# Slice + rebase
+# Slice by number of periods and rebase (server-side)
 # -------------------------
-def slice_rebase(df, view):
-
+def slice_and_rebase_by_periods(cum_df: pd.DataFrame, view: str):
+    """
+    cum_df: DataFrame indexed by datetime (ascending), columns = themes
+    view: 'N period(s)' or 'All'
+    Returns: rebased_df (index datetime asc), used_start_idx (int), used_count (int)
+    """
     if view == "All":
-        return df.copy()
+        return cum_df.copy(), 0, len(cum_df)
 
     try:
         n = int(view.split()[0])
     except Exception:
-        return df.copy()
+        n = None
 
-    if len(df) <= n:
-        return df.copy()
+    if n is None or n <= 0:
+        return cum_df.copy(), 0, len(cum_df)
 
-    df_slice = df.tail(n).copy()
+    total_rows = len(cum_df)
+    if total_rows == 0:
+        return cum_df.copy(), 0, 0
 
-    base = df_slice.iloc[0].replace(0, np.nan)
-    rebased = df_slice.divide(base) * 100
+    if total_rows <= n:
+        # not enough rows: return full df (no strict slice)
+        return cum_df.copy(), 0, total_rows
 
-    return rebased
+    df_slice = cum_df.tail(n).copy()
+    # Rebase: divide by first row value and multiply by 100
+    first_vals = df_slice.iloc[0]
+    safe_first = first_vals.replace({0: np.nan})
+    rebased = df_slice.divide(safe_first, axis=1) * 100
+    # fallback for invalid columns
+    for col in rebased.columns:
+        if not np.isfinite(rebased[col].iloc[0]):
+            rebased[col] = df_slice[col]
+    return rebased, total_rows - n, n
 
+view_df, start_idx, used_count = slice_and_rebase_by_periods(cum_T_full, view_option)
 
-view_df = slice_rebase(cum_df, view_option)
-
+# Inform user if requested more periods than available
+if view_option != "All":
+    requested = int(view_option.split()[0])
+    available = len(cum_T_full)
+    if available < requested:
+        st.warning(f"Requested {requested} periods but only {available} periods available — showing full history (no strict slice).")
 
 # -------------------------
-# Theme chart
+# Plotting (Plotly) — no builtin range selector or rangeslider
 # -------------------------
-plot_df = view_df.copy()
-plot_df["Date"] = plot_df.index
+plot_df = view_df.reset_index().melt(id_vars=view_df.index.name or "index", value_vars=view_df.columns, var_name="Theme", value_name="Cumulative")
+if (view_df.index.name is None) or (view_df.index.name == "index"):
+    plot_df = plot_df.rename(columns={"index": "Date"})
+else:
+    plot_df = plot_df.rename(columns={view_df.index.name: "Date"})
+try:
+    plot_df["Date"] = pd.to_datetime(plot_df["Date"])
+except Exception:
+    pass
 
-plot_df = plot_df.melt(id_vars="Date", var_name="Theme", value_name="Cumulative")
+fig = px.line(plot_df, x="Date", y="Cumulative", color="Theme",
+              title=f"Themes cumulative returns (rebased to 100 over selected periods) — {tf_label}",
+              labels={"Cumulative": "Cumulative (base 100)", "Date": "Date"})
 
-fig = px.line(plot_df, x="Date", y="Cumulative", color="Theme")
-fig.update_layout(hovermode="x unified")
+fig.update_layout(
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=60, b=40, l=40, r=20)
+)
 
+# display Plotly chart (no plotly-built range selector)
 st.plotly_chart(fig, use_container_width=True)
 
+# -------------------------
+# NEW SECTION: Theme-specific coin-level cumulative chart
+# -------------------------
+# This section adds a dropdown (type-to-filter) of available themes. When a theme is selected,
+# it finds all tickers mapped to that theme, computes each coin's cumulative performance over the
+# same display window (view_option) and plots them (rebased to 100 over the selected window).
 
-# -------------------------
-# Coin-level section
-# -------------------------
+# Build theme options from theme_values (aligned to price_theme.columns)
+try:
+    theme_series_full = pd.Series(list(theme_values), index=list(price_theme.columns))
+    available_themes = sorted(pd.Series(theme_series_full.values).dropna().astype(str).unique().tolist())
+except Exception:
+    available_themes = []
+
 st.markdown("---")
 st.subheader("Per-theme — coin-level cumulative performance")
 
-theme_series = pd.Series(theme_values, index=price_theme.columns)
-themes = sorted(theme_series.dropna().astype(str).unique())
+if available_themes:
+    selected_theme = st.selectbox("Select a theme (type to filter)", options=available_themes, index=0, key="select_theme_for_coins")
 
-selected_theme = st.selectbox("Select theme", themes)
+    # Find tickers for selected theme
+    try:
+        tickers_for_theme = [t for t, th in zip(price_theme.columns, theme_values) if str(th) == str(selected_theme)]
+    except Exception:
+        tickers_for_theme = []
 
-tickers = [
-    t for t, th in zip(price_theme.columns, theme_values)
-    if str(th) == str(selected_theme)
-]
-
-selected_tickers = st.multiselect(
-    "Select tickers",
-    options=tickers,
-    default=tickers
-)
-
-if selected_tickers:
-
-    price_sub = price_theme[selected_tickers].copy()
-    price_sub.index = pd.to_datetime(price_sub.index, errors="coerce")
-
-    returns = price_sub.pct_change().dropna()
-
-    if not returns.empty:
-
-        coin_cum = (1 + returns).cumprod() * 100
-
-        # ✅ ADD AVERAGE LINE
-        coin_cum["_average"] = coin_cum.mean(axis=1)
-
-        coin_view = slice_rebase(coin_cum, view_option)
-
-        coin_plot = coin_view.copy()
-        coin_plot["Date"] = coin_plot.index
-
-        coin_plot = coin_plot.melt(
-            id_vars="Date",
-            var_name="Ticker",
-            value_name="Cumulative"
-        )
-
-        fig2 = px.line(coin_plot, x="Date", y="Cumulative", color="Ticker")
-
-        # ✅ STYLE AVERAGE
-        for trace in fig2.data:
-            if trace.name == "_average":
-                trace.update(line=dict(width=3, dash="dash"))
-
-        # ✅ LEGEND FILTERING
-        fig2.update_layout(
-            hovermode="x unified",
-            legend=dict(
-                itemclick="toggle",
-                itemdoubleclick="toggleothers"
-            )
-        )
-
-        st.plotly_chart(fig2, use_container_width=True)
-
+    if not tickers_for_theme:
+        st.info("No tickers found for the selected theme.")
     else:
-        st.warning("Not enough data to compute returns.")
-```
+        # Allow user to pick a subset of tickers to display (multiselect). Default = all tickers for the theme.
+        selected_tickers = st.multiselect(
+            "Select tickers to show (type to filter)",
+            options=tickers_for_theme,
+            default=tickers_for_theme,
+            help="Type to filter tickers. Unselect some to hide them from the chart.",
+            key="multiselect_theme_tickers"
+        )
+
+        if not selected_tickers:
+            st.info("No tickers selected — select one or more tickers to display the chart.")
+        else:
+            st.write(f"Showing {len(selected_tickers)} tickers for theme: **{selected_theme}**")
+
+            # Extract price sub-DF for selected tickers
+            price_sub = price_theme[selected_tickers].copy()
+            # ensure datetime index
+            try:
+                price_sub.index = pd.to_datetime(price_sub.index)
+            except Exception:
+                pass
+
+            # Compute period returns (decimal) and cumulative series per coin (base 100)
+            coin_returns = price_sub.pct_change().dropna()
+            if coin_returns.empty:
+                st.info("Not enough price bars for selected tickers to compute returns. Fetch more data.")
+            else:
+                coin_cum = (1 + coin_returns).cumprod() * 100
+                # coin_cum: index = dates ascending, columns = tickers
+
+                # Slice & rebase coin-level cumulative using the same view window
+                coin_view_df, coin_start_idx, coin_used_count = slice_and_rebase_by_periods(coin_cum, view_option)
+
+                # Prepare plotting dataframe
+                coin_plot_df = coin_view_df.reset_index().melt(id_vars=coin_view_df.index.name or "index", value_vars=coin_view_df.columns, var_name="Ticker", value_name="Cumulative")
+                if (coin_view_df.index.name is None) or (coin_view_df.index.name == "index"):
+                    coin_plot_df = coin_plot_df.rename(columns={"index": "Date"})
+                else:
+                    coin_plot_df = coin_plot_df.rename(columns={coin_view_df.index.name: "Date"})
+                try:
+                    coin_plot_df["Date"] = pd.to_datetime(coin_plot_df["Date"])
+                except Exception:
+                    pass
+
+                fig2 = px.line(coin_plot_df, x="Date", y="Cumulative", color="Ticker",
+                               title=f"Coin-level cumulative returns for theme '{selected_theme}' (rebased over selected periods)",
+                               labels={"Cumulative": "Cumulative (base 100)", "Date": "Date"})
+                fig2.update_layout(
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(t=60, b=40, l=40, r=20)
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+            with st.expander("Show tickers in this theme"):
+                st.write(tickers_for_theme)
+else:
+    st.info("No theme mapping available to show per-theme coin-level chart.")
+
+# -------------------------
+# Extras: medians preview, CSV download, mapping preview
+# -------------------------
+with st.expander("Show per-period median returns used to compute cumulative series"):
+    df_preview = consolidated_medians.copy()
+    if df_preview.shape[1] > 30:
+        st.info("Large number of date columns — showing the most recent 30 columns.")
+        df_preview = df_preview.iloc[:, -30:]
+    st.dataframe(df_preview.style.format(precision=3), height=300)
+
+# CSV download of the displayed (sliced & rebased) cumulative returns
+export_df = view_df.reset_index().rename(columns={view_df.index.name or "index": "Date"})
+try:
+    export_df["Date"] = pd.to_datetime(export_df["Date"])
+except Exception:
+    pass
+csv_buf = export_df.to_csv(index=False)
+st.download_button("Download displayed cumulative returns CSV", csv_buf, file_name="themes_cumulative_returns_view.csv", mime="text/csv")
+
+with st.expander("Show underlying price_theme (wide) and theme mapping"):
+    st.markdown("**price_theme (wide)** — index = timestamps, columns = tickers")
+    st.dataframe(price_theme)
+    st.markdown("**Theme mapping (aligned to price_theme.columns)**")
+    try:
+        mapping_df = pd.DataFrame({
+            "Ticker": list(price_theme.columns),
+            "Theme": list(theme_values)
+        })
+        st.dataframe(mapping_df)
+    except Exception:
+        st.write("Could not display mapping cleanly (unexpected format).")
+
+st.success("Chart ready — use Streamlit controls above to change the view window (periods) and rebase.")
