@@ -104,7 +104,7 @@ cum_T_full = cumulative_returns.T.copy()
 cum_T_full.index = pd.to_datetime(cum_T_full.index)
 
 # -------------------------
-# Period controls (UPDATED)
+# Period controls
 # -------------------------
 period_options = ["1 period", "10 periods", "30 periods", "60 periods", "90 periods", "180 periods", "All"]
 
@@ -144,17 +144,25 @@ def slice_and_rebase_by_periods(cum_df, view):
 view_df, _, _ = slice_and_rebase_by_periods(cum_T_full, view_option)
 
 # -------------------------
-# Theme plot
+# Theme plot (FIXED melt)
 # -------------------------
-plot_df = view_df.reset_index().melt(id_vars="index", var_name="Theme", value_name="Cumulative")
-plot_df.rename(columns={"index": "Date"}, inplace=True)
+plot_df = view_df.reset_index()
+idx_col = view_df.index.name if view_df.index.name else "index"
+
+plot_df = plot_df.melt(
+    id_vars=idx_col,
+    var_name="Theme",
+    value_name="Cumulative"
+)
+
+plot_df = plot_df.rename(columns={idx_col: "Date"})
 
 fig = px.line(plot_df, x="Date", y="Cumulative", color="Theme")
 fig.update_layout(hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------
-# Coin-level chart (UPDATED)
+# Coin-level chart
 # -------------------------
 st.markdown("---")
 st.subheader("Per-theme — coin-level cumulative performance")
@@ -177,15 +185,23 @@ if selected_tickers:
 
     coin_view_df, _, _ = slice_and_rebase_by_periods(coin_cum, view_option)
 
-    # ✅ ADD AVERAGE LINE
+    # Add average line
     coin_view_df["_average"] = coin_view_df.mean(axis=1)
 
-    coin_plot_df = coin_view_df.reset_index().melt(id_vars="index", var_name="Ticker", value_name="Cumulative")
-    coin_plot_df.rename(columns={"index": "Date"}, inplace=True)
+    # FIXED melt
+    coin_plot_df = coin_view_df.reset_index()
+    idx_col = coin_view_df.index.name if coin_view_df.index.name else "index"
+
+    coin_plot_df = coin_plot_df.melt(
+        id_vars=idx_col,
+        var_name="Ticker",
+        value_name="Cumulative"
+    )
+
+    coin_plot_df = coin_plot_df.rename(columns={idx_col: "Date"})
 
     fig2 = px.line(coin_plot_df, x="Date", y="Cumulative", color="Ticker")
 
-    # ✅ IMPROVED LEGEND FILTERING
     fig2.update_layout(
         hovermode="x unified",
         legend=dict(
