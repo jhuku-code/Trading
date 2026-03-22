@@ -1,4 +1,4 @@
-# 3.long_short_ideas.py
+# 21.long_short_ideas.py
 
 import streamlit as st
 import pandas as pd
@@ -10,75 +10,75 @@ st.set_page_config(page_title="Long / Short Ideas", layout="wide")
 st.title("📊 Long / Short Idea Generator")
 
 # =========================
-# 🔁 LOAD SHARED DATA
+# 🔁 LOAD DATA FROM SESSION
 # =========================
-# Expecting these to be stored from previous pages
 
-if "price_df" not in st.session_state:
-    st.error("❌ price_df not found. Run 'Themes Tracker' page first.")
+if "price_theme" not in st.session_state:
+    st.error("❌ price_theme not found. Run Themes Tracker page first.")
     st.stop()
 
-if "theme_map_df" not in st.session_state:
-    st.error("❌ theme_map_df not found.")
+if "ticker_to_theme" not in st.session_state:
+    st.error("❌ ticker_to_theme not found.")
     st.stop()
 
 if "beta_df" not in st.session_state:
-    st.error("❌ beta_df not found. Run 'Clustering Vol' page first.")
+    st.error("❌ beta_df not found. Run Clustering Vol page first.")
     st.stop()
 
-price_df = st.session_state["price_df"]
-theme_map_df = st.session_state["theme_map_df"]
-beta_df = st.session_state["beta_df"]
+price_df = st.session_state["price_theme"].copy()
+ticker_to_theme = st.session_state["ticker_to_theme"]
+beta_df = st.session_state["beta_df"].copy()
 
-# Ensure uppercase consistency
+# Normalize
 price_df.columns = price_df.columns.str.upper()
-theme_map_df['coin'] = theme_map_df['coin'].str.upper()
 beta_df['coin'] = beta_df['coin'].str.upper()
 
 # =========================
-# 🎛️ SIDEBAR INPUTS
+# 🧠 BUILD THEME MAP DF
+# =========================
+
+theme_map_df = pd.DataFrame({
+    "coin": list(ticker_to_theme.keys()),
+    "theme": list(ticker_to_theme.values())
+})
+
+# =========================
+# 🎛️ SIDEBAR
 # =========================
 
 st.sidebar.header("⚙️ Trade Setup")
 
-# ✅ AUTOCOMPLETE (Dropdown instead of text input)
 all_coins = sorted(price_df.columns.tolist())
 
+# ✅ AUTOCOMPLETE
 long_coin = st.sidebar.selectbox(
     "Select Long Coin",
     all_coins
 )
 
 # Get theme
-try:
-    theme = theme_map_df.loc[
-        theme_map_df['coin'] == long_coin, 'theme'
-    ].values[0]
-except:
-    st.error(f"Theme not found for {long_coin}")
-    st.stop()
+theme = theme_map_df.loc[
+    theme_map_df['coin'] == long_coin, 'theme'
+].values[0]
 
-# Filter same-theme coins
+# Same theme coins
 same_theme_coins = theme_map_df[
     theme_map_df['theme'] == theme
 ]['coin'].tolist()
 
-same_theme_coins = [c for c in same_theme_coins if c in all_coins and c != long_coin]
+same_theme_coins = [c for c in same_theme_coins if c != long_coin and c in all_coins]
 
 if len(same_theme_coins) == 0:
-    st.warning("No alternative coins in same theme.")
+    st.warning("No same-theme coins available.")
     st.stop()
 
 short_coin = st.sidebar.selectbox(
-    "Select Short Coin (Same Theme)",
+    "Select Short Coin",
     sorted(same_theme_coins)
 )
 
-# Rolling window
-window = st.sidebar.slider("Rolling Window (days)", 30, 180, 90)
-
-# Capital
-capital = st.sidebar.number_input("Total Capital ($)", value=10000)
+window = st.sidebar.slider("Rolling Window", 30, 180, 90)
+capital = st.sidebar.number_input("Capital ($)", value=10000)
 
 # =========================
 # 📊 DATA PREP
@@ -86,132 +86,119 @@ capital = st.sidebar.number_input("Total Capital ($)", value=10000)
 
 df = price_df[[long_coin, short_coin]].dropna().copy()
 
-# Use log spread (more stable)
-df['ratio'] = np.log(df[long_coin]) - np.log(df[short_coin])
+# Log spread
+df['spread'] = np.log(df[long_coin]) - np.log(df[short_coin])
 
 # Rolling stats
-df['mean'] = df['ratio'].rolling(window).mean()
-df['std'] = df['ratio'].rolling(window).std()
+df['mean'] = df['spread'].rolling(window).mean()
+df['std'] = df['spread'].rolling(window).std()
 
 df['upper'] = df['mean'] + 2 * df['std']
 df['lower'] = df['mean'] - 2 * df['std']
 
 # Z-score
-df['zscore'] = (df['ratio'] - df['mean']) / df['std']
+df['zscore'] = (df['spread'] - df['mean']) / df['std']
 
 df = df.dropna()
 
 if df.empty:
-    st.warning("Not enough data after rolling window.")
+    st.warning("Not enough data.")
     st.stop()
 
 # =========================
 # 📈 CHART
 # =========================
 
-st.subheader(f"📉 Spread: {long_coin} / {short_coin}")
+st.subheader(f"{long_coin} vs {short_coin} (Spread)")
 
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(
-    x=df.index, y=df['ratio'],
-    name='Spread',
-    line=dict(width=2)
+    x=df.index, y=df['spread'],
+    name="Spread"
 ))
 
 fig.add_trace(go.Scatter(
     x=df.index, y=df['mean'],
-    name='Mean',
-    line=dict(dash='dash')
+    name="Mean",
+    line=dict(dash="dash")
 ))
 
 fig.add_trace(go.Scatter(
     x=df.index, y=df['upper'],
-    name='+2 STD',
-    line=dict(dash='dash')
+    name="+2 STD",
+    line=dict(dash="dash")
 ))
 
 fig.add_trace(go.Scatter(
     x=df.index, y=df['lower'],
-    name='-2 STD',
-    line=dict(dash='dash')
+    name="-2 STD",
+    line=dict(dash="dash")
 ))
-
-fig.update_layout(
-    height=500,
-    margin=dict(l=10, r=10, t=40, b=10)
-)
 
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# 📊 Z-SCORE SIGNAL
+# 📊 Z-SCORE
 # =========================
 
 current_z = df['zscore'].iloc[-1]
 
-st.subheader("📊 Z-Score Signal")
+st.subheader("Z-Score Signal")
 
 col1, col2 = st.columns(2)
 
-col1.metric("Current Z-Score", round(current_z, 2))
-col2.metric("Rolling Window", f"{window} days")
+col1.metric("Z-Score", round(current_z, 2))
+col2.metric("Window", window)
 
 if current_z > 2:
-    st.error("⚠️ Overbought Spread → SHORT Long Coin / LONG Short Coin")
+    st.error("Overbought → SHORT spread")
 
 elif current_z < -2:
-    st.success("✅ Oversold Spread → LONG Long Coin / SHORT Short Coin")
+    st.success("Oversold → LONG spread")
 
 else:
-    st.info("Neutral Zone")
+    st.info("Neutral")
 
 # =========================
-# ⚖️ BETA + POSITION SIZING
+# ⚖️ BETA HEDGE
 # =========================
 
 try:
     beta_long = beta_df.loc[beta_df['coin'] == long_coin, 'beta'].values[0]
     beta_short = beta_df.loc[beta_df['coin'] == short_coin, 'beta'].values[0]
 except:
-    st.error("Beta not found for one of the coins.")
+    st.error("Missing beta data")
     st.stop()
 
 hedge_ratio = beta_long / beta_short if beta_short != 0 else np.nan
 
-short_position = capital / (1 + hedge_ratio)
-long_position = capital - short_position
+short_pos = capital / (1 + hedge_ratio)
+long_pos = capital - short_pos
 
 # =========================
 # 📌 OUTPUT
 # =========================
 
-st.subheader("📌 Trade Setup")
+st.subheader("Trade Setup")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.write(f"**Theme:** {theme}")
-    st.write("### Betas")
-    st.write(f"{long_coin}: {beta_long:.2f}")
-    st.write(f"{short_coin}: {beta_short:.2f}")
+    st.write(f"Theme: **{theme}**")
+    st.write(f"{long_coin} Beta: {beta_long:.2f}")
+    st.write(f"{short_coin} Beta: {beta_short:.2f}")
 
 with col2:
-    st.write("### Position Sizing (Delta Neutral)")
-    st.write(f"Long {long_coin}: ${long_position:.2f}")
-    st.write(f"Short {short_coin}: ${short_position:.2f}")
-    st.write(f"Hedge Ratio (L/S): {hedge_ratio:.2f}")
+    st.write(f"Long {long_coin}: ${long_pos:.2f}")
+    st.write(f"Short {short_coin}: ${short_pos:.2f}")
+    st.write(f"Hedge Ratio: {hedge_ratio:.2f}")
 
-# =========================
-# 🧠 EXTRA INSIGHT
-# =========================
-
-st.subheader("🧠 Interpretation")
+st.markdown("---")
 
 st.write("""
-- Z-score measures how stretched the spread is relative to history  
-- +2 → statistically expensive → mean reversion expected  
-- -2 → statistically cheap → bounce expected  
-
-This is a **market-neutral relative value trade**, not a directional bet.
+### 🧠 Interpretation
+- Z > 2 → spread expensive → short long coin  
+- Z < -2 → spread cheap → long long coin  
+- Beta neutral sizing removes market direction risk  
 """)
