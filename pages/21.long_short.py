@@ -50,15 +50,12 @@ st.sidebar.header("⚙️ Trade Setup")
 
 all_coins = sorted(price_df.columns.tolist())
 
-# ✅ AUTOCOMPLETE
 long_coin = st.sidebar.selectbox("Select Long Coin", all_coins)
 
-# Theme
 theme = theme_map_df.loc[
     theme_map_df['coin'] == long_coin, 'theme'
 ].values[0]
 
-# Same-theme coins
 same_theme = theme_map_df[
     theme_map_df['theme'] == theme
 ]['coin'].tolist()
@@ -71,7 +68,6 @@ if not same_theme:
 
 short_coin = st.sidebar.selectbox("Select Short Coin", sorted(same_theme))
 
-window = st.sidebar.slider("Rolling Window", 30, 180, 90)
 capital = st.sidebar.number_input("Capital ($)", value=10000)
 
 # =========================
@@ -80,24 +76,19 @@ capital = st.sidebar.number_input("Capital ($)", value=10000)
 
 df = price_df[[long_coin, short_coin]].dropna().copy()
 
-# Log spread (stable)
+# Log spread
 df['spread'] = np.log(df[long_coin]) - np.log(df[short_coin])
 
-# Rolling stats
-df['mean'] = df['spread'].rolling(window).mean()
-df['std'] = df['spread'].rolling(window).std()
+# ✅ STATIC MEAN + STD
+mean = df['spread'].mean()
+std = df['spread'].std()
 
-df['upper'] = df['mean'] + 2 * df['std']
-df['lower'] = df['mean'] - 2 * df['std']
+df['mean'] = mean
+df['upper'] = mean + 2 * std
+df['lower'] = mean - 2 * std
 
-# Z-score
-df['zscore'] = (df['spread'] - df['mean']) / df['std']
-
-df = df.dropna()
-
-if df.empty:
-    st.warning("Not enough data.")
-    st.stop()
+# Z-score (static)
+df['zscore'] = (df['spread'] - mean) / std
 
 # =========================
 # 📈 CHART
@@ -107,7 +98,10 @@ st.subheader(f"{long_coin} vs {short_coin} (Spread)")
 
 fig = go.Figure()
 
-fig.add_trace(go.Scatter(x=df.index, y=df['spread'], name="Spread"))
+fig.add_trace(go.Scatter(
+    x=df.index, y=df['spread'],
+    name="Spread"
+))
 
 fig.add_trace(go.Scatter(
     x=df.index, y=df['mean'],
@@ -140,7 +134,7 @@ st.subheader("📊 Z-Score Signal")
 col1, col2 = st.columns(2)
 
 col1.metric("Z-Score", round(current_z, 2))
-col2.metric("Window", window)
+col2.metric("Mean", round(mean, 4))
 
 if current_z > 2:
     st.error("⚠️ Overbought → SHORT spread")
@@ -194,8 +188,10 @@ with col2:
 st.markdown("---")
 
 st.write("""
-### 🧠 Interpretation
-- Z > 2 → spread expensive → short long coin  
-- Z < -2 → spread cheap → long long coin  
-- Beta-neutral sizing removes market direction risk  
+### 🧠 Interpretation (Static Mean Model)
+- Mean = long-term equilibrium level  
+- +2σ → statistically expensive → short spread  
+- -2σ → statistically cheap → long spread  
+
+This assumes **mean reversion to a fixed anchor**, not a drifting regime.
 """)
