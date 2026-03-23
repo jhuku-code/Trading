@@ -79,7 +79,7 @@ df = price_df[[long_coin, short_coin]].dropna().copy()
 # Log spread
 df['spread'] = np.log(df[long_coin]) - np.log(df[short_coin])
 
-# ✅ STATIC MEAN + STD
+# Static mean & std
 mean = df['spread'].mean()
 std = df['spread'].std()
 
@@ -87,14 +87,14 @@ df['mean'] = mean
 df['upper'] = mean + 2 * std
 df['lower'] = mean - 2 * std
 
-# Z-score (static)
+# Z-score
 df['zscore'] = (df['spread'] - mean) / std
 
 # =========================
-# 📈 CHART
+# 📈 SPREAD CHART
 # =========================
 
-st.subheader(f"{long_coin} vs {short_coin} (Spread)")
+st.subheader(f"📉 Spread: {long_coin} vs {short_coin}")
 
 fig = go.Figure()
 
@@ -121,7 +121,39 @@ fig.add_trace(go.Scatter(
     line=dict(dash="dash")
 ))
 
+fig.update_layout(height=450)
+
 st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# 📈 NORMALIZED PRICE CHART
+# =========================
+
+st.subheader(f"📊 Normalized Price (Base = 100)")
+
+norm_df = df[[long_coin, short_coin]].copy()
+
+# Normalize both to 100
+norm_df[long_coin] = norm_df[long_coin] / norm_df[long_coin].iloc[0] * 100
+norm_df[short_coin] = norm_df[short_coin] / norm_df[short_coin].iloc[0] * 100
+
+fig_norm = go.Figure()
+
+fig_norm.add_trace(go.Scatter(
+    x=norm_df.index,
+    y=norm_df[long_coin],
+    name=f"{long_coin} (Long)"
+))
+
+fig_norm.add_trace(go.Scatter(
+    x=norm_df.index,
+    y=norm_df[short_coin],
+    name=f"{short_coin} (Short)"
+))
+
+fig_norm.update_layout(height=400)
+
+st.plotly_chart(fig_norm, use_container_width=True)
 
 # =========================
 # 📊 Z-SCORE SIGNAL
