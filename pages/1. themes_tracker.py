@@ -80,11 +80,14 @@ def style_excess(df, top_n, bottom_n):
 def apply_gradient(df):
     excess_cols = [c for c in df.columns if c.endswith("_Excess")]
 
+    # ✅ Identify numeric columns only
+    numeric_cols = df.select_dtypes(include="number").columns
+
     return (
         df.style
         .background_gradient(cmap="RdYlGn", subset=excess_cols)
-        .set_properties(**{"color": "black"})  # force black text everywhere
-        .format("{:.2f}")  # enforce 2 decimal places
+        .set_properties(**{"color": "black"})
+        .format({col: "{:.2f}" for col in numeric_cols})  # ✅ FIXED
     )
 
 # ---------------- Fetch ----------------
@@ -128,8 +131,9 @@ if st.sidebar.button("🔄 Fetch Data"):
     # Convert to %
     final = final * 100
 
-    # Round to 2 decimals (IMPORTANT)
-    final = final.round(2)
+    # Round numeric columns safely
+    numeric_cols = final.select_dtypes(include="number").columns
+    final[numeric_cols] = final[numeric_cols].round(2)
 
     st.session_state.final_df = final
     st.session_state.last_fetch = datetime.utcnow()
@@ -148,7 +152,6 @@ else:
     styled_avg = apply_gradient(avg).apply(
         style_excess, top_n=3, bottom_n=3, axis=None
     )
-
     st.dataframe(styled_avg, use_container_width=True)
 
     st.subheader("Coins")
@@ -156,7 +159,6 @@ else:
     styled_coins = apply_gradient(coins).apply(
         style_excess, top_n=15, bottom_n=15, axis=None
     )
-
     st.dataframe(styled_coins, use_container_width=True)
 
 st.success("Ready.")
