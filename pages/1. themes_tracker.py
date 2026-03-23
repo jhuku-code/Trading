@@ -71,9 +71,9 @@ def style_excess(df, top_n, bottom_n):
         bot_idx = s.nsmallest(bottom_n).index
 
         for i in top_idx:
-            styled.loc[i, col] = "font-weight: bold; color: white;"
+            styled.loc[i, col] = "font-weight: bold; color: black;"
         for i in bot_idx:
-            styled.loc[i, col] = "font-weight: bold; color: white;"
+            styled.loc[i, col] = "font-weight: bold; color: black;"
 
     return styled
 
@@ -81,12 +81,21 @@ def apply_gradient(df):
     excess_cols = [c for c in df.columns if c.endswith("_Excess")]
     numeric_cols = df.select_dtypes(include="number").columns
 
-    return (
+    # Base style: everything white text
+    styler = (
         df.style
         .background_gradient(cmap="RdYlGn", subset=excess_cols)
-        .set_properties(**{"color": "white"})  # ✅ WHITE TEXT
+        .set_properties(**{"color": "white"})
         .format({col: "{:.2f}" for col in numeric_cols})
     )
+
+    # Override ONLY _Excess columns to black text
+    styler = styler.set_properties(
+        subset=excess_cols,
+        **{"color": "black"}
+    )
+
+    return styler
 
 # ---------------- Fetch ----------------
 if st.sidebar.button("🔄 Fetch Data"):
