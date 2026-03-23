@@ -14,9 +14,6 @@ st.title("Theme Returns Dashboard")
 # ---------------- Sidebar ----------------
 st.sidebar.header("Settings")
 
-start_dt = st.sidebar.date_input("Start date", value=pd.to_datetime("2024-12-31"))
-end_dt = st.sidebar.date_input("End date", value=pd.to_datetime("2025-11-10"))
-
 default_excel_relpath = Path("Input-Files") / "Themes_mapping.xlsx"
 st.sidebar.write(f"Using: `{default_excel_relpath}`")
 
@@ -25,7 +22,7 @@ limit = st.sidebar.number_input("OHLCV limit", value=90, min_value=2, max_value=
 sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.2)
 
 # ---------------- Session ----------------
-for key in ["price_theme", "final_df", "last_fetch"]:
+for key in ["final_df", "last_fetch"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -74,15 +71,21 @@ def style_excess(df, top_n, bottom_n):
         bot_idx = s.nsmallest(bottom_n).index
 
         for i in top_idx:
-            styled.loc[i, col] = "color: green; font-weight: bold;"
+            styled.loc[i, col] = "font-weight: bold; color: black;"
         for i in bot_idx:
-            styled.loc[i, col] = "color: red; font-weight: bold;"
+            styled.loc[i, col] = "font-weight: bold; color: black;"
 
     return styled
 
 def apply_gradient(df):
     excess_cols = [c for c in df.columns if c.endswith("_Excess")]
-    return df.style.background_gradient(cmap="RdYlGn", subset=excess_cols)
+
+    return (
+        df.style
+        .background_gradient(cmap="RdYlGn", subset=excess_cols)
+        .set_properties(**{"color": "black"})  # force black text everywhere
+        .format("{:.2f}")  # enforce 2 decimal places
+    )
 
 # ---------------- Fetch ----------------
 if st.sidebar.button("🔄 Fetch Data"):
@@ -102,15 +105,18 @@ if st.sidebar.button("🔄 Fetch Data"):
     # Theme avg
     theme_avg = returns.groupby("Theme").mean()
 
-    # Excess
-    excess = returns.drop(columns="Theme") - returns.groupby("Theme").transform("median").drop(columns="Theme")
+    # Excess vs theme median
+    theme_median = returns.groupby("Theme").transform("median")
+    excess = returns.drop(columns="Theme") - theme_median.drop(columns="Theme")
     excess.columns = [c + "_Excess" for c in excess.columns]
 
     final = pd.concat([returns.drop(columns="Theme"), excess], axis=1)
     final["Theme"] = returns["Theme"]
     final["Coin"] = final.index
 
-    theme_excess = theme_avg - returns.drop(columns="Theme").mean()
+    # Theme-level excess vs global
+    global_avg = returns.drop(columns="Theme").mean()
+    theme_excess = theme_avg - global_avg
     theme_excess.columns = [c + "_Excess" for c in theme_excess.columns]
 
     theme_final = pd.concat([theme_avg, theme_excess], axis=1)
@@ -118,9 +124,14 @@ if st.sidebar.button("🔄 Fetch Data"):
     theme_final["Theme"] = theme_final.index
 
     final = pd.concat([final, theme_final], ignore_index=True)
-    final = final.reset_index(drop=True)
 
-    st.session_state.final_df = final * 100
+    # Convert to %
+    final = final * 100
+
+    # Round to 2 decimals (IMPORTANT)
+    final = final.round(2)
+
+    st.session_state.final_df = final
     st.session_state.last_fetch = datetime.utcnow()
 
 # ---------------- Display ----------------
@@ -133,11 +144,19 @@ else:
     coins = df[~df["Coin"].str.endswith("_average")]
 
     st.subheader("Theme Averages")
-    styled_avg = apply_gradient(avg).apply(style_excess, top_n=3, bottom_n=3, axis=None)
+
+    styled_avg = apply_gradient(avg).apply(
+        style_excess, top_n=3, bottom_n=3, axis=None
+    )
+
     st.dataframe(styled_avg, use_container_width=True)
 
     st.subheader("Coins")
-    styled_coins = apply_gradient(coins).apply(style_excess, top_n=15, bottom_n=15, axis=None)
+
+    styled_coins = apply_gradient(coins).apply(
+        style_excess, top_n=15, bottom_n=15, axis=None
+    )
+
     st.dataframe(styled_coins, use_container_width=True)
 
 st.success("Ready.")
