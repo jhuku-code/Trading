@@ -79,15 +79,16 @@ def style_excess(df, top_n, bottom_n):
 
 def apply_gradient(df):
     excess_cols = [c for c in df.columns if c.endswith("_Excess")]
-
-    # ✅ Identify numeric columns only
     numeric_cols = df.select_dtypes(include="number").columns
 
     return (
         df.style
         .background_gradient(cmap="RdYlGn", subset=excess_cols)
-        .set_properties(**{"color": "black"})
-        .format({col: "{:.2f}" for col in numeric_cols})  # ✅ FIXED
+        .set_properties(**{
+            "color": "black",
+            "background-color": "white"   # ✅ FORCE WHITE BACKGROUND
+        })
+        .format({col: "{:.2f}" for col in numeric_cols})
     )
 
 # ---------------- Fetch ----------------
@@ -131,7 +132,7 @@ if st.sidebar.button("🔄 Fetch Data"):
     # Convert to %
     final = final * 100
 
-    # Round numeric columns safely
+    # Round numeric columns
     numeric_cols = final.select_dtypes(include="number").columns
     final[numeric_cols] = final[numeric_cols].round(2)
 
