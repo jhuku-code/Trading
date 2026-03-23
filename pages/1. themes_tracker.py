@@ -103,7 +103,7 @@ def apply_gradient(df):
         .format({col: "{:.2f}" for col in numeric_cols})
     )
 
-    # Override excess columns text color
+    # Force black text for excess columns
     styler = styler.set_properties(
         subset=excess_cols,
         **{"color": "black"}
@@ -125,16 +125,25 @@ if st.sidebar.button("🔄 Fetch Data"):
     with st.spinner("Fetching prices..."):
         prices = fetch_prices(ex, symbols, timeframe, limit)
 
+    # ---------------- STORE FOR OTHER PAGES ----------------
+    st.session_state["price_theme"] = prices.copy()
+
+    st.session_state["theme_values"] = [
+        mapping.get(col, "UNKNOWN") for col in prices.columns
+    ]
+
+    st.session_state["ticker_to_theme"] = mapping.copy()
+    st.session_state["price_timeframe"] = timeframe
+    st.session_state["price_theme_version"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
     # ---------------- Returns ----------------
     returns = compute_returns(prices)
     returns["Theme"] = returns.index.map(mapping)
 
-    # Separate numeric
     numeric_returns = returns.select_dtypes(include="number")
 
     # ---------------- Theme Aggregations ----------------
     theme_avg = numeric_returns.groupby(returns["Theme"]).mean()
-
     theme_median = numeric_returns.groupby(returns["Theme"]).transform("median")
 
     # ---------------- Excess ----------------
@@ -195,5 +204,8 @@ else:
 
     # -------- Footer --------
     st.caption(f"Last updated: {st.session_state.last_fetch}")
+
+# Optional debug (very useful)
+# st.write("Session keys:", list(st.session_state.keys()))
 
 st.success("Ready.")
