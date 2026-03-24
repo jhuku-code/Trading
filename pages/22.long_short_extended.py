@@ -38,13 +38,13 @@ themes = sorted(theme_map_df["theme"].unique())
 # =========================
 # ⚙️ PARAMETERS
 # =========================
-lookback = st.sidebar.slider("Lookback (for stats)", 30, 200, 90)
+lookback = st.sidebar.slider("Lookback", 30, 200, 90)
 ma_window = st.sidebar.slider("MA Window", 10, 100, 30)
 
 # =========================
-# 🔍 PAIR SCANNER FUNCTION
+# 🔍 CORE FUNCTION
 # =========================
-def analyze_pair(df, c1, c2):
+def analyze_pair(df, c1, c2, lookback, ma_window):
     sub = df[[c1, c2]].dropna()
 
     if len(sub) < lookback:
@@ -57,81 +57,95 @@ def analyze_pair(df, c1, c2):
     mean = spread.mean()
     std = spread.std()
 
-    z = (spread.iloc[-1] - mean) / std if std != 0 else 0
+    if std == 0:
+        return None
+
+    current = spread.iloc[-1]
+    z = (current - mean) / std
 
     ma = spread.rolling(ma_window).mean().iloc[-1]
 
-    return {
-        "z": z,
-        "spread": spread.iloc[-1],
-        "mean": mean,
-        "ma": ma
-    }
+    return current, mean, std, z, ma
 
 # =========================
-# 🧮 SCAN ALL THEMES
+# 🚀 CACHED SCANNER
 # =========================
-mr_results = []
-trend_results = []
+@st.cache_data
+def run_scanner(price_df, theme_map_df, lookback, ma_window):
 
-for theme in themes:
+    mr_dict = {}
+    trend_dict = {}
 
-    coins = theme_map_df[theme_map_df["theme"] == theme]["coin"].tolist()
-    coins = [c for c in coins if c in price_df.columns]
+    for theme in sorted(theme_map_df["theme"].unique()):
 
-    for c1, c2 in combinations(coins, 2):
+        coins = theme_map_df[theme_map_df["theme"] == theme]["coin"].tolist()
+        coins = [c for c in coins if c in price_df.columns]
 
-        res = analyze_pair(price_df, c1, c2)
-        if res is None:
-            continue
+        mr_pairs = []
+        trend_pairs = []
 
-        z = res["z"]
-        spread = res["spread"]
-        mean = res["mean"]
-        ma = res["ma"]
+        for c1, c2 in combinations(coins, 2):
 
-        # =====================
-        # 1️⃣ MEAN REVERSION
-        # =====================
-        if 1 < abs(z) < 2:
-            if z > 0:
-                pair = f"{c2}/{c1}"   # short c1, long c2
-            else:
+            res = analyze_pair(price_df, c1, c2, lookback, ma_window)
+            if res is None:
+                continue
+
+            current, mean, std, z, ma = res
+
+            # =====================
+            # 1️⃣ MEAN REVERSION
+            # =====================
+            if 1 < abs(z) < 2:
+                if z > 0:
+                    pair = f"{c2}/{c1}"
+                else:
+                    pair = f"{c1}/{c2}"
+
+                mr_pairs.append(pair)
+
+            # =====================
+            # 2️⃣ TREND (FIXED)
+            # =====================
+            if current > mean and current > ma:
                 pair = f"{c1}/{c2}"
+                trend_pairs.append(pair)
 
-            mr_results.append({
-                "Theme": theme,
-                "Pair": pair
-            })
+        # Join into single row
+        if mr_pairs:
+            mr_dict[theme] = "; ".join(sorted(set(mr_pairs)))
 
-        # =====================
-        # 2️⃣ TREND
-        # =====================
-        if spread > mean and spread > ma:
-            pair = f"{c1}/{c2}"
-            trend_results.append({
-                "Theme": theme,
-                "Pair": pair
-            })
+        if trend_pairs:
+            trend_dict[theme] = "; ".join(sorted(set(trend_pairs)))
+
+    mr_df = pd.DataFrame.from_dict(mr_dict, orient="index", columns=["Pairs"])
+    trend_df = pd.DataFrame.from_dict(trend_dict, orient="index", columns=["Pairs"])
+
+    mr_df.index.name = "Theme"
+    trend_df.index.name = "Theme"
+
+    return mr_df, trend_df
 
 # =========================
-# 📊 OUTPUT TABLES
+# 🧮 RUN SCAN
 # =========================
-st.subheader("📉 Mean Reversion Opportunities (1σ–2σ)")
+mr_df, trend_df = run_scanner(price_df, theme_map_df, lookback, ma_window)
 
-if mr_results:
-    mr_df = pd.DataFrame(mr_results)
+# =========================
+# 📊 TABLE OUTPUT
+# =========================
+st.subheader("📉 Mean Reversion (1σ–2σ)")
+
+if not mr_df.empty:
     st.dataframe(mr_df, use_container_width=True)
 else:
-    st.info("No signals found")
+    st.info("No signals")
 
-st.subheader("📈 Trend Opportunities (Above Mean & MA)")
+st.subheader("📈 Trend (Above Mean & MA)")
 
-if trend_results:
-    trend_df = pd.DataFrame(trend_results)
+if not trend_df.empty:
     st.dataframe(trend_df, use_container_width=True)
 else:
-    st.info("No signals found")
+    st.info("No signals")
 
 # =========================
 # 📊 INTERACTIVE CHART
@@ -141,8 +155,11 @@ st.subheader("📊 Pair Explorer")
 
 all_coins = sorted(price_df.columns.tolist())
 
-long_coin = st.selectbox("Long Coin", all_coins)
-short_coin = st.selectbox("Short Coin", all_coins, index=1)
+col1, col2 = st.columns(2)
+with col1:
+    long_coin = st.selectbox("Long Coin", all_coins)
+with col2:
+    short_coin = st.selectbox("Short Coin", all_coins, index=1)
 
 df = price_df[[long_coin, short_coin]].dropna().copy()
 
@@ -173,7 +190,7 @@ fig.add_trace(go.Scatter(x=df.index, y=df['lower1'], name="-1σ", line=dict(dash
 fig.add_trace(go.Scatter(x=df.index, y=df['upper2'], name="+2σ", line=dict(dash="dash")))
 fig.add_trace(go.Scatter(x=df.index, y=df['lower2'], name="-2σ", line=dict(dash="dash")))
 
-fig.add_trace(go.Scatter(x=df.index, y=df['ma'], name="MA", line=dict(color="white")))
+fig.add_trace(go.Scatter(x=df.index, y=df['ma'], name="MA"))
 
 fig.update_layout(height=500, hovermode="x unified")
 
