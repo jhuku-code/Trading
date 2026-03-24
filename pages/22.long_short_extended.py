@@ -57,15 +57,13 @@ def analyze_pair(df, c1, c2, lookback, ma_window):
     mean = spread.mean()
     std = spread.std()
 
-    if std == 0:
+    if std == 0 or np.isnan(std):
         return None
 
     current = spread.iloc[-1]
-    z = (current - mean) / std
-
     ma = spread.rolling(ma_window).mean().iloc[-1]
 
-    return current, mean, std, z, ma
+    return current, mean, std, ma
 
 # =========================
 # 🚀 CACHED SCANNER
@@ -90,27 +88,26 @@ def run_scanner(price_df, theme_map_df, lookback, ma_window):
             if res is None:
                 continue
 
-            current, mean, std, z, ma = res
+            current, mean, std, ma = res
 
             # =====================
-            # 1️⃣ MEAN REVERSION
+            # 1️⃣ MEAN REVERSION (FIXED)
             # =====================
-            if 1 < abs(z) < 2:
-                if z > 0:
-                    pair = f"{c2}/{c1}"
-                else:
-                    pair = f"{c1}/{c2}"
-
+            if mean < current < (mean + std):
+                # Long first / short second (consistent directional logic)
+                pair = f"{c1}/{c2}"
                 mr_pairs.append(pair)
 
             # =====================
-            # 2️⃣ TREND (FIXED)
+            # 2️⃣ TREND (STRICT FIX)
             # =====================
-            if current > mean and current > ma:
-                pair = f"{c1}/{c2}"
-                trend_pairs.append(pair)
+            if (current > mean) and (current > ma):
+                # Double safeguard against NaN
+                if not (np.isnan(current) or np.isnan(mean) or np.isnan(ma)):
+                    pair = f"{c1}/{c2}"
+                    trend_pairs.append(pair)
 
-        # Join into single row
+        # Convert to single row per theme
         if mr_pairs:
             mr_dict[theme] = "; ".join(sorted(set(mr_pairs)))
 
@@ -133,14 +130,14 @@ mr_df, trend_df = run_scanner(price_df, theme_map_df, lookback, ma_window)
 # =========================
 # 📊 TABLE OUTPUT
 # =========================
-st.subheader("📉 Mean Reversion (1σ–2σ)")
+st.subheader("📉 Mean Reversion (Mean → +1σ only)")
 
 if not mr_df.empty:
     st.dataframe(mr_df, use_container_width=True)
 else:
     st.info("No signals")
 
-st.subheader("📈 Trend (Above Mean & MA)")
+st.subheader("📈 Trend (Spread > Mean AND > MA)")
 
 if not trend_df.empty:
     st.dataframe(trend_df, use_container_width=True)
