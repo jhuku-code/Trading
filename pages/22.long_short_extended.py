@@ -38,22 +38,20 @@ themes = sorted(theme_map_df["theme"].unique())
 # =========================
 # ⚙️ PARAMETERS
 # =========================
-lookback = st.sidebar.slider("Lookback", 30, 200, 90)
 ma_window = st.sidebar.slider("MA Window", 10, 100, 30)
 
 # =========================
-# 🔍 CORE FUNCTION
+# 🔍 CORE FUNCTION (FULL HISTORY)
 # =========================
-def analyze_pair(df, c1, c2, lookback, ma_window):
+def analyze_pair(df, c1, c2, ma_window):
     sub = df[[c1, c2]].dropna()
 
-    if len(sub) < lookback:
+    if len(sub) < ma_window + 5:
         return None
-
-    sub = sub.tail(lookback)
 
     spread = np.log(sub[c1]) - np.log(sub[c2])
 
+    # ✅ FULL HISTORY MEAN & STD
     mean = spread.mean()
     std = spread.std()
 
@@ -61,7 +59,12 @@ def analyze_pair(df, c1, c2, lookback, ma_window):
         return None
 
     current = spread.iloc[-1]
-    ma = spread.rolling(ma_window).mean().iloc[-1]
+
+    ma_series = spread.rolling(ma_window).mean()
+    ma = ma_series.iloc[-1]
+
+    if np.isnan(ma):
+        return None
 
     return current, mean, std, ma
 
@@ -69,7 +72,7 @@ def analyze_pair(df, c1, c2, lookback, ma_window):
 # 🚀 CACHED SCANNER
 # =========================
 @st.cache_data
-def run_scanner(price_df, theme_map_df, lookback, ma_window):
+def run_scanner(price_df, theme_map_df, ma_window):
 
     mr_dict = {}
     trend_dict = {}
@@ -84,30 +87,28 @@ def run_scanner(price_df, theme_map_df, lookback, ma_window):
 
         for c1, c2 in combinations(coins, 2):
 
-            res = analyze_pair(price_df, c1, c2, lookback, ma_window)
+            res = analyze_pair(price_df, c1, c2, ma_window)
             if res is None:
                 continue
 
             current, mean, std, ma = res
 
             # =====================
-            # 1️⃣ MEAN REVERSION (FIXED)
+            # 1️⃣ MEAN REVERSION
+            # mean < spread < mean + 1σ
             # =====================
-            if mean < current < (mean + std):
-                # Long first / short second (consistent directional logic)
+            if (current > mean) and (current < mean + std):
                 pair = f"{c1}/{c2}"
                 mr_pairs.append(pair)
 
             # =====================
-            # 2️⃣ TREND (STRICT FIX)
+            # 2️⃣ TREND (STRICT)
+            # spread > mean AND spread > MA
             # =====================
             if (current > mean) and (current > ma):
-                # Double safeguard against NaN
-                if not (np.isnan(current) or np.isnan(mean) or np.isnan(ma)):
-                    pair = f"{c1}/{c2}"
-                    trend_pairs.append(pair)
+                pair = f"{c1}/{c2}"
+                trend_pairs.append(pair)
 
-        # Convert to single row per theme
         if mr_pairs:
             mr_dict[theme] = "; ".join(sorted(set(mr_pairs)))
 
@@ -125,12 +126,12 @@ def run_scanner(price_df, theme_map_df, lookback, ma_window):
 # =========================
 # 🧮 RUN SCAN
 # =========================
-mr_df, trend_df = run_scanner(price_df, theme_map_df, lookback, ma_window)
+mr_df, trend_df = run_scanner(price_df, theme_map_df, ma_window)
 
 # =========================
 # 📊 TABLE OUTPUT
 # =========================
-st.subheader("📉 Mean Reversion (Mean → +1σ only)")
+st.subheader("📉 Mean Reversion (Mean → +1σ)")
 
 if not mr_df.empty:
     st.dataframe(mr_df, use_container_width=True)
@@ -162,6 +163,7 @@ df = price_df[[long_coin, short_coin]].dropna().copy()
 
 df['spread'] = np.log(df[long_coin]) - np.log(df[short_coin])
 
+# ✅ FULL HISTORY MEAN & STD
 mean = df['spread'].mean()
 std = df['spread'].std()
 
@@ -170,6 +172,7 @@ df['upper1'] = mean + std
 df['lower1'] = mean - std
 df['upper2'] = mean + 2 * std
 df['lower2'] = mean - 2 * std
+
 df['ma'] = df['spread'].rolling(ma_window).mean()
 
 # =========================
