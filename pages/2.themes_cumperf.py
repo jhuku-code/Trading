@@ -144,7 +144,7 @@ def slice_and_rebase_by_periods(cum_df, view):
 view_df, _, _ = slice_and_rebase_by_periods(cum_T_full, view_option)
 
 # -------------------------
-# Theme plot (FIXED melt)
+# Theme plot
 # -------------------------
 plot_df = view_df.reset_index()
 idx_col = view_df.index.name if view_df.index.name else "index"
@@ -160,6 +160,56 @@ plot_df = plot_df.rename(columns={idx_col: "Date"})
 fig = px.line(plot_df, x="Date", y="Cumulative", color="Theme")
 fig.update_layout(hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# NEW: Rolling Returns Chart
+# =========================
+st.markdown("---")
+st.subheader("Theme Rolling Returns (Full History)")
+
+rolling_window = st.number_input(
+    "Rolling window (periods)",
+    min_value=1,
+    max_value=200,
+    value=30,
+    step=1
+)
+
+rolling_source = consolidated_medians.copy()
+rolling_source.columns = pd.to_datetime(rolling_source.columns)
+
+rolling_T = rolling_source.T.sort_index()
+rolling_T = rolling_T / 100  # convert to decimal
+
+rolling_returns = (1 + rolling_T).rolling(rolling_window).apply(
+    lambda x: np.prod(x) - 1,
+    raw=True
+)
+
+rolling_returns = rolling_returns * 100
+rolling_returns = rolling_returns.dropna()
+
+rolling_plot_df = rolling_returns.reset_index()
+idx_col = rolling_returns.index.name if rolling_returns.index.name else "index"
+
+rolling_plot_df = rolling_plot_df.melt(
+    id_vars=idx_col,
+    var_name="Theme",
+    value_name="Rolling Return"
+)
+
+rolling_plot_df = rolling_plot_df.rename(columns={idx_col: "Date"})
+
+fig_roll = px.line(
+    rolling_plot_df,
+    x="Date",
+    y="Rolling Return",
+    color="Theme"
+)
+
+fig_roll.update_layout(hovermode="x unified")
+
+st.plotly_chart(fig_roll, use_container_width=True)
 
 # -------------------------
 # Coin-level chart
@@ -185,10 +235,8 @@ if selected_tickers:
 
     coin_view_df, _, _ = slice_and_rebase_by_periods(coin_cum, view_option)
 
-    # Add average line
     coin_view_df["_average"] = coin_view_df.mean(axis=1)
 
-    # FIXED melt
     coin_plot_df = coin_view_df.reset_index()
     idx_col = coin_view_df.index.name if coin_view_df.index.name else "index"
 
