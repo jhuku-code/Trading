@@ -1,20 +1,51 @@
+"""
+Volatility Breakout Signals — v2
+=================================
+Key improvements over v1
+--------------------------
+1.  Breakout metric split into two components:
+        • total_vol_zscore  — confirms a genuine vol-regime shift
+        • vol_skew          — ranks breakout quality (upside vs downside proportion)
+    Ranking uses vol_skew only among confirmed breakout candidates.
+
+2.  Price momentum gate — coin must be trading above its rolling MA
+    over the same historical window before it can appear in results.
+
+3.  Signal persistence filter — signal must be active for at least
+    `min_signal_bars` consecutive bars to filter single-bar noise.
+
+4.  Minimum non-zero return guard — upside/downside std is computed only
+    when enough non-zero observations exist; otherwise returns NaN.
+
+5.  Volatility window raised (default 14) so clipped-return std is stable.
+
+6.  Rank-start / rank-end are sidebar parameters (replaces hard-coded 11–20).
+
+7.  Both-signal gate replaced: only `total_vol_zscore > historical_threshold`
+    is required (strict gate). Cross-sectional z-score is used as a secondary
+    ranking boost, not a hard gate — fixes altcoin bias.
+
+8.  Diagnostic panel expanded with distribution plots.
+"""
+
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 # ---------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------
-st.set_page_config(page_title="Volatility Breakout", layout="wide")
-st.title("Volatility Breakout Signals")
+st.set_page_config(page_title="Volatility Breakout v2", layout="wide")
+st.title("Volatility Breakout Signals · v2")
 
 
 # ---------------------------------------------------------
 # INPUT DATA FROM SESSION STATE
 # ---------------------------------------------------------
-df_h = st.session_state.get("price_theme", None)
+df_h: Optional[pd.DataFrame] = st.session_state.get("price_theme", None)
 
 if df_h is None or df_h.empty:
     st.error(
@@ -28,402 +59,509 @@ if df_h is None or df_h.empty:
 # ---------------------------------------------------------
 # SIDEBAR PARAMETERS
 # ---------------------------------------------------------
-st.sidebar.header("Volatility Breakout Parameters")
+st.sidebar.header("Parameters")
 
-historical_window = st.sidebar.number_input(
-    "Historical window (bars)",
-    min_value=10,
-    max_value=365,
-    value=90,
-    step=5,
-    help="Lookback for historical baseline of directional volatility.",
-)
+with st.sidebar.expander("Lookback Windows", expanded=True):
+    historical_window = st.number_input(
+        "Historical window (bars)",
+        min_value=10, max_value=365, value=90, step=5,
+        help="Lookback for historical vol baseline and price MA.",
+        key="hw",
+    )
+    volatility_window = st.number_input(
+        "Volatility window (bars)",
+        min_value=5, max_value=96, value=14, step=1,
+        help="Rolling window for current vol. Min 5 recommended for stable std.",
+        key="vw",
+    )
+    min_nonzero_returns = st.number_input(
+        "Min non-zero returns (in vol window)",
+        min_value=2, max_value=20, value=5, step=1,
+        help="Upside/downside std is set to NaN if fewer non-zero bars exist.",
+        key="mnr",
+    )
+    min_signal_bars = st.number_input(
+        "Signal persistence (bars)",
+        min_value=1, max_value=20, value=2, step=1,
+        help="Signal must be active for this many consecutive bars.",
+        key="msb",
+    )
 
-volatility_window = st.sidebar.number_input(
-    "Volatility window (bars)",
-    min_value=2,
-    max_value=48,
-    value=6,
-    step=1,
-    help="Rolling window for current directional volatility.",
-)
+with st.sidebar.expander("Thresholds", expanded=True):
+    historical_threshold = st.number_input(
+        "Historical vol z-score threshold",
+        min_value=0.1, max_value=5.0, value=1.5, step=0.1,
+        help="Hard gate: coin must exceed this threshold to be a candidate.",
+        key="ht",
+    )
+    cs_boost_weight = st.number_input(
+        "Cross-sectional boost weight",
+        min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+        help=(
+            "Weight applied to cross-sectional z-score when computing the "
+            "composite ranking score. 0 = ignore cross-sectional signal entirely."
+        ),
+        key="csbw",
+    )
 
-historical_threshold = st.sidebar.number_input(
-    "Historical z-score threshold",
-    min_value=0.1,
-    max_value=5.0,
-    value=1.5,
-    step=0.1,
-)
+with st.sidebar.expander("Ranking & Display", expanded=True):
+    top_n_total = st.number_input(
+        "Compute top N candidates",
+        min_value=5, max_value=100, value=20, step=5,
+        key="tnt",
+    )
+    rank_start = st.number_input(
+        "Display rank start (1-indexed)",
+        min_value=1, max_value=int(top_n_total), value=1, step=1,
+        key="rs",
+    )
+    rank_end = st.number_input(
+        "Display rank end (1-indexed)",
+        min_value=int(rank_start), max_value=int(top_n_total),
+        value=min(10, int(top_n_total)), step=1,
+        key="re",
+    )
+    require_price_above_ma = st.checkbox(
+        "Require price above MA (momentum gate)",
+        value=True,
+        help="Only coins trading above their rolling MA are eligible.",
+        key="rpam",
+    )
 
-cross_sectional_threshold = st.sidebar.number_input(
-    "Cross-sectional z-score threshold",
-    min_value=0.1,
-    max_value=5.0,
-    value=1.0,
-    step=0.1,
-)
+st.sidebar.markdown("---")
+refresh = st.sidebar.button("🔄 Refresh / Recompute", use_container_width=True)
 
-# Downside penalty: this is what makes downside vol worse, upside preferred
-downside_penalty = st.sidebar.number_input(
-    "Downside volatility penalty",
-    min_value=0.5,
-    max_value=5.0,
-    value=1.5,
-    step=0.1,
-    help=">1 means downside volatility reduces the breakout score more than upside.",
-)
-
-top_n_total = st.sidebar.number_input(
-    "Base Top N (for ranking)",
-    min_value=5,
-    max_value=100,
-    value=20,
-    step=5,
-    help="We rank the top N and then show rows 11–20 as top_signals (like your original).",
-)
+if "vol_brkout_v2_results" not in st.session_state:
+    st.session_state["vol_brkout_v2_results"] = None
 
 
 # ---------------------------------------------------------
-# REFRESH BUTTON
+# HELPER: robust clipped-return std
 # ---------------------------------------------------------
-refresh = st.button("Refresh data")
-
-if "vol_brkout_results" not in st.session_state:
-    st.session_state["vol_brkout_results"] = None
+def _robust_clip_std(series: pd.Series, min_nonzero: int) -> float:
+    """
+    Std of a clipped return series, requiring at least `min_nonzero`
+    non-zero observations. Returns NaN otherwise.
+    """
+    nonzero = series[series != 0]
+    if len(nonzero) < min_nonzero:
+        return np.nan
+    return float(nonzero.std())
 
 
 # ---------------------------------------------------------
-# CLASS DEFINITION (DIRECTIONAL VOL + ROBUST get_top_signals)
+# CLASS DEFINITION
 # ---------------------------------------------------------
 class VolatilityBreakoutSignal:
     """
-    Volatility breakout signal generator that considers both historical 
-    and cross-sectional volatility patterns.
+    Volatility breakout signal generator — v2.
 
-    Modified so that upside volatility is preferred and downside volatility
-    is penalised via downside_penalty.
+    Separates the breakout confirmation (total vol z-score) from
+    the breakout quality ranking (vol skew = upside proportion).
     """
-    
-    def __init__(self, 
-                 historical_window: int = 30,
-                 volatility_window: int = 6,
-                 cross_sectional_window: int = 20,
-                 historical_threshold: float = 2.0,
-                 cross_sectional_threshold: float = 1.5,
-                 downside_penalty: float = 1.5):
-        """
-        Parameters:
-        -----------
-        historical_window : int
-            Lookback period for calculating historical volatility baseline
-        volatility_window : int  
-            Rolling window for current volatility calculation
-        cross_sectional_window : int
-            Reserved for future use (cross-sectional smoothing, not used directly)
-        historical_threshold : float
-            Z-score threshold for historical volatility breakout
-        cross_sectional_threshold : float
-            Z-score threshold for cross-sectional volatility breakout
-        downside_penalty : float
-            Penalty factor for downside volatility.
-            >1 penalises downside more, <1 softens the penalty.
-        """
+
+    def __init__(
+        self,
+        historical_window: int = 90,
+        volatility_window: int = 14,
+        historical_threshold: float = 1.5,
+        cs_boost_weight: float = 0.3,
+        min_nonzero_returns: int = 5,
+        min_signal_bars: int = 2,
+    ):
         self.historical_window = historical_window
         self.volatility_window = volatility_window
-        self.cross_sectional_window = cross_sectional_window
         self.historical_threshold = historical_threshold
-        self.cross_sectional_threshold = cross_sectional_threshold
-        self.downside_penalty = downside_penalty
-    
-    def calculate_returns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate log returns from price data."""
+        self.cs_boost_weight = cs_boost_weight
+        self.min_nonzero_returns = min_nonzero_returns
+        self.min_signal_bars = min_signal_bars
+
+    # ------------------------------------------------------------------
+    # STEP 1 — Returns
+    # ------------------------------------------------------------------
+    def _calculate_returns(self, df: pd.DataFrame) -> pd.DataFrame:
         return np.log(df / df.shift(1)).dropna()
-    
-    def calculate_rolling_volatility(self, returns: pd.DataFrame) -> pd.DataFrame:
+
+    # ------------------------------------------------------------------
+    # STEP 2 — Total rolling vol (symmetric — for breakout detection)
+    # ------------------------------------------------------------------
+    def _calculate_total_vol(self, returns: pd.DataFrame) -> pd.DataFrame:
+        return returns.rolling(window=self.volatility_window).std()
+
+    # ------------------------------------------------------------------
+    # STEP 3 — Vol skew (upside proportion — for breakout quality ranking)
+    # ------------------------------------------------------------------
+    def _calculate_vol_skew(self, returns: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate rolling 'directional' volatility.
-
-        Upside volatility is rewarded, downside volatility is penalised:
-
-            combined_vol = std(positive returns) - downside_penalty * std(negative returns)
+        vol_skew = upside_std / (upside_std + downside_std + ε)
+        Range [0, 1].  → 1 = all upside vol, 0.5 = balanced, 0 = all downside.
+        Computed with the robust clipped-std helper.
         """
-        pos_returns = returns.clip(lower=0)
-        neg_returns = returns.clip(upper=0)  # <= 0
+        vw = self.volatility_window
+        mn = self.min_nonzero_returns
+        eps = 1e-8
 
-        upside_vol = pos_returns.rolling(window=self.volatility_window).std()
-        downside_vol = neg_returns.rolling(window=self.volatility_window).std().abs()
+        pos = returns.clip(lower=0)
+        neg = returns.clip(upper=0).abs()
 
-        combined_vol = upside_vol - self.downside_penalty * downside_vol
-        return combined_vol
-    
-    def calculate_historical_volatility_zscore(self, volatility: pd.DataFrame) -> pd.DataFrame:
-        """Z-score of current volatility vs its own historical volatility."""
-        historical_mean = volatility.rolling(window=self.historical_window).mean()
-        historical_std = volatility.rolling(window=self.historical_window).std()
-        historical_std = historical_std.replace(0, np.nan)
-        z_scores = (volatility - historical_mean) / historical_std
-        return z_scores
-    
-    def calculate_cross_sectional_zscore(self, volatility: pd.DataFrame) -> pd.DataFrame:
-        """
-        Z-score of each coin's volatility vs cross-sectional average at each timestamp.
-        """
-        cross_sectional_mean = volatility.mean(axis=1)
-        cross_sectional_std = volatility.std(axis=1)
-
-        cs_mean_matrix = np.broadcast_to(
-            cross_sectional_mean.values.reshape(-1, 1),
-            volatility.shape,
+        upside_vol = pos.rolling(window=vw).apply(
+            lambda s: _robust_clip_std(s, mn), raw=False
         )
-        cs_std_matrix = np.broadcast_to(
-            cross_sectional_std.values.reshape(-1, 1),
-            volatility.shape,
+        downside_vol = neg.rolling(window=vw).apply(
+            lambda s: _robust_clip_std(s, mn), raw=False
         )
 
-        cs_mean_df = pd.DataFrame(cs_mean_matrix, index=volatility.index, columns=volatility.columns)
-        cs_std_df = pd.DataFrame(cs_std_matrix, index=volatility.index, columns=volatility.columns)
-        cs_std_df = cs_std_df.replace(0, np.nan)
+        vol_skew = upside_vol / (upside_vol + downside_vol + eps)
+        return vol_skew
 
-        z_scores = (volatility - cs_mean_df) / cs_std_df
-        return z_scores
-    
-    def calculate_excess_volatility_score(
+    # ------------------------------------------------------------------
+    # STEP 4 — Historical z-score of total vol
+    # ------------------------------------------------------------------
+    def _historical_zscore(self, total_vol: pd.DataFrame) -> pd.DataFrame:
+        roll_mean = total_vol.rolling(window=self.historical_window).mean()
+        roll_std = total_vol.rolling(window=self.historical_window).std().replace(0, np.nan)
+        return (total_vol - roll_mean) / roll_std
+
+    # ------------------------------------------------------------------
+    # STEP 5 — Cross-sectional z-score of total vol (secondary boost only)
+    # ------------------------------------------------------------------
+    def _cross_sectional_zscore(self, total_vol: pd.DataFrame) -> pd.DataFrame:
+        cs_mean = total_vol.mean(axis=1)
+        cs_std = total_vol.std(axis=1).replace(0, np.nan)
+        return total_vol.sub(cs_mean, axis=0).div(cs_std, axis=0)
+
+    # ------------------------------------------------------------------
+    # STEP 6 — Price above MA gate
+    # ------------------------------------------------------------------
+    def _price_above_ma(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Returns a boolean Series (per coin) indicating whether the latest
+        closing price is above the rolling MA over the historical window.
+        """
+        ma = df.rolling(window=self.historical_window).mean()
+        latest_price = df.iloc[-1]
+        latest_ma = ma.iloc[-1]
+        return latest_price > latest_ma
+
+    # ------------------------------------------------------------------
+    # STEP 7 — Composite ranking score
+    # ------------------------------------------------------------------
+    def _composite_score(
         self,
-        historical_zscore: pd.DataFrame,
-        cross_sectional_zscore: pd.DataFrame,
-        historical_weight: float = 0.6,
-        cross_sectional_weight: float = 0.4,
+        hist_z: pd.DataFrame,
+        cs_z: pd.DataFrame,
+        vol_skew: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Combine historical and cross-sectional z-scores into an excess volatility score."""
-        excess_score = (
-            historical_weight * historical_zscore
-            + cross_sectional_weight * cross_sectional_zscore
-        )
-        return excess_score
-    
+        """
+        composite = (1 − cs_boost_weight) × vol_skew_zscore
+                    + cs_boost_weight × cs_z_norm
+
+        vol_skew is z-scored historically so it's on a comparable scale.
+        cs_z is kept raw (already cross-sectional).
+        """
+        vskew_mean = vol_skew.rolling(window=self.historical_window).mean()
+        vskew_std = vol_skew.rolling(window=self.historical_window).std().replace(0, np.nan)
+        vol_skew_z = (vol_skew - vskew_mean) / vskew_std
+
+        w_cs = self.cs_boost_weight
+        w_vs = 1.0 - w_cs
+        composite = w_vs * vol_skew_z + w_cs * cs_z
+        return composite
+
+    # ------------------------------------------------------------------
+    # PUBLIC: generate_signals
+    # ------------------------------------------------------------------
     def generate_signals(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """
-        Generate volatility breakout signals and metrics.
-        """
-        # 1. Returns
-        returns = self.calculate_returns(df)
+        returns = self._calculate_returns(df)
+        total_vol = self._calculate_total_vol(returns)
+        vol_skew = self._calculate_vol_skew(returns)
 
-        # 2. Directional volatility
-        volatility = self.calculate_rolling_volatility(returns)
+        hist_z = self._historical_zscore(total_vol)
+        cs_z = self._cross_sectional_zscore(total_vol)
+        composite = self._composite_score(hist_z, cs_z, vol_skew)
 
-        # 3. Historical z-scores
-        historical_zscore = self.calculate_historical_volatility_zscore(volatility)
+        # Hard gate: vol breakout confirmed
+        raw_signal = (hist_z > self.historical_threshold).astype(int)
 
-        # 4. Cross-sectional z-scores
-        cross_sectional_zscore = self.calculate_cross_sectional_zscore(volatility)
-
-        # 5. Combined score
-        excess_volatility = self.calculate_excess_volatility_score(
-            historical_zscore, cross_sectional_zscore
+        # Persistence filter: must be active for min_signal_bars consecutive bars
+        persistent_signal = (
+            raw_signal
+            .rolling(window=self.min_signal_bars)
+            .min()
+            .fillna(0)
+            .astype(int)
         )
-
-        # 6. Signals from thresholds
-        historical_signals = (historical_zscore > self.historical_threshold).astype(int)
-        cross_sectional_signals = (cross_sectional_zscore > self.cross_sectional_threshold).astype(int)
-
-        combined_signals = (historical_signals | cross_sectional_signals).astype(int)
-
-        # 7. Percentile rankings
-        rankings = excess_volatility.rank(axis=1, pct=True) * 100
-
-        # 8. Strength-based rankings (0–100)
-        strength_rankings = pd.DataFrame(index=excess_volatility.index, columns=excess_volatility.columns)
-        for ts in excess_volatility.index:
-            row = excess_volatility.loc[ts].dropna()
-            if len(row) > 0:
-                ranked = row.rank(ascending=False)
-                max_rank = len(row)
-                strength_scores = ((max_rank - ranked + 1) / max_rank) * 100
-                strength_rankings.loc[ts, strength_scores.index] = strength_scores
 
         return {
-            "signals": combined_signals,
-            "rankings": rankings,
-            "strength_rankings": strength_rankings,
-            "excess_volatility": excess_volatility,
-            "historical_zscore": historical_zscore,
-            "cross_sectional_zscore": cross_sectional_zscore,
-            "volatility": volatility,
-            "historical_signals": historical_signals,
-            "cross_sectional_signals": cross_sectional_signals,
+            "returns": returns,
+            "total_vol": total_vol,
+            "vol_skew": vol_skew,
+            "hist_z": hist_z,
+            "cs_z": cs_z,
+            "composite": composite,
+            "raw_signal": raw_signal,
+            "persistent_signal": persistent_signal,
+            "price_above_ma": self._price_above_ma(df),
         }
-    
+
+    # ------------------------------------------------------------------
+    # PUBLIC: get_top_signals
+    # ------------------------------------------------------------------
     def get_top_signals(
         self,
-        signals_dict: Dict[str, pd.DataFrame],
-        timestamp: Optional[str] = None,
-        top_n: int = 10,
-        require_both_signals: bool = True,
+        signals_dict: Dict,
+        top_n: int = 20,
+        require_price_above_ma: bool = True,
     ) -> pd.DataFrame:
         """
-        Get top N coins with strongest volatility breakout signals.
-        Robust to NaNs in excess_volatility.
+        Returns a ranked DataFrame of breakout candidates.
+
+        Eligibility:
+          • persistent_signal == 1  (vol breakout confirmed + persistence)
+          • price_above_ma == True  (optional momentum gate)
+
+        Ranked by: composite score (descending).
         """
-        if signals_dict["signals"].empty:
+        ts = signals_dict["persistent_signal"].index[-1]
+
+        persistent = signals_dict["persistent_signal"].loc[ts]
+        composite = signals_dict["composite"].loc[ts].dropna()
+        hist_z = signals_dict["hist_z"].loc[ts]
+        cs_z = signals_dict["cs_z"].loc[ts]
+        vol_skew = signals_dict["vol_skew"].loc[ts]
+        price_above_ma = signals_dict["price_above_ma"]
+
+        # Eligible coins: signal active
+        eligible = persistent[persistent == 1].index.tolist()
+
+        # Momentum gate
+        if require_price_above_ma:
+            eligible = [c for c in eligible if price_above_ma.get(c, False)]
+
+        # Must have composite score
+        eligible = [c for c in eligible if c in composite.index]
+
+        if not eligible:
             return pd.DataFrame()
 
-        if timestamp is None:
-            timestamp = signals_dict["signals"].index[-1]
+        df_out = pd.DataFrame({
+            "coin": eligible,
+            "composite_score": composite.reindex(eligible).values,
+            "hist_vol_zscore": hist_z.reindex(eligible).values,
+            "cs_vol_zscore": cs_z.reindex(eligible).values,
+            "vol_skew": vol_skew.reindex(eligible).values,
+            "price_above_ma": price_above_ma.reindex(eligible).values
+                              if hasattr(price_above_ma, "reindex")
+                              else [price_above_ma.get(c, np.nan) for c in eligible],
+        })
 
-        signals = signals_dict["signals"].loc[timestamp]
-        excess_vol = signals_dict["excess_volatility"].loc[timestamp]
-        strength_rank = signals_dict["strength_rankings"].loc[timestamp]
-        hist_z = signals_dict["historical_zscore"].loc[timestamp]
-        cs_z = signals_dict["cross_sectional_zscore"].loc[timestamp]
+        df_out = df_out.sort_values("composite_score", ascending=False)
+        return df_out.head(top_n).reset_index(drop=True)
 
-        # Use only coins where excess_vol is not NaN
-        excess_vol = excess_vol.dropna()
+    # ------------------------------------------------------------------
+    # PUBLIC: diagnose_signals
+    # ------------------------------------------------------------------
+    def diagnose_signals(self, signals_dict: Dict) -> Dict:
+        ts = signals_dict["persistent_signal"].index[-1]
 
-        if require_both_signals:
-            signal_coins = signals[signals == 1].index
-            # Keep only coins that also have a valid excess_vol
-            valid_coins = [c for c in signal_coins if c in excess_vol.index]
-            if len(valid_coins) == 0:
-                return pd.DataFrame()
-        else:
-            valid_coins = list(excess_vol.index)
-            if len(valid_coins) == 0:
-                return pd.DataFrame()
+        hist_z = signals_dict["hist_z"].loc[ts].dropna()
+        cs_z = signals_dict["cs_z"].loc[ts].dropna()
+        vol_skew = signals_dict["vol_skew"].loc[ts].dropna()
+        raw = signals_dict["raw_signal"].loc[ts]
+        persistent = signals_dict["persistent_signal"].loc[ts]
+        price_above_ma = signals_dict["price_above_ma"]
 
-        # Align all series to valid_coins to avoid KeyError
-        excess_vol_aligned = excess_vol.reindex(valid_coins)
-        strength_aligned = strength_rank.reindex(valid_coins)
-        hist_z_aligned = hist_z.reindex(valid_coins)
-        cs_z_aligned = cs_z.reindex(valid_coins)
-        signals_aligned = signals.reindex(valid_coins)
+        n_raw = int((raw == 1).sum())
+        n_persistent = int((persistent == 1).sum())
+        n_ma_pass = int(price_above_ma.sum()) if hasattr(price_above_ma, "sum") else "N/A"
 
-        summary = pd.DataFrame(
-            {
-                "coin": valid_coins,
-                "excess_volatility_score": excess_vol_aligned.values,
-                "strength_ranking": strength_aligned.values,
-                "historical_zscore": hist_z_aligned.values,
-                "cross_sectional_zscore": cs_z_aligned.values,
-                "has_signal": signals_aligned.values if require_both_signals else "N/A",
-            }
-        )
-
-        hist_signals_full = (hist_z > self.historical_threshold).astype(int)
-        cs_signals_full = (cs_z > self.cross_sectional_threshold).astype(int)
-        hist_signals = hist_signals_full.reindex(valid_coins)
-        cs_signals = cs_signals_full.reindex(valid_coins)
-
-        summary["historical_signal"] = hist_signals.values
-        summary["cross_sectional_signal"] = cs_signals.values
-
-        summary = summary.sort_values("excess_volatility_score", ascending=False)
-        return summary.head(top_n).reset_index(drop=True)
-
-    def diagnose_signals(
-        self,
-        signals_dict: Dict[str, pd.DataFrame],
-        timestamp: Optional[str] = None,
-    ) -> Dict:
-        """
-        Diagnose why you might be getting few signals.
-        """
-        if signals_dict["signals"].empty:
-            return {}
-
-        if timestamp is None:
-            timestamp = signals_dict["signals"].index[-1]
-
-        hist_z = signals_dict["historical_zscore"].loc[timestamp].dropna()
-        cs_z = signals_dict["cross_sectional_zscore"].loc[timestamp].dropna()
-
-        hist_signals = (hist_z > self.historical_threshold).sum()
-        cs_signals = (cs_z > self.cross_sectional_threshold).sum()
-        both_signals = ((hist_z > self.historical_threshold) & (cs_z > self.cross_sectional_threshold)).sum()
-
-        diagnostics = {
-            "timestamp": str(timestamp),
+        return {
+            "timestamp": str(ts),
             "total_coins": int(len(hist_z)),
+            "coins_raw_signal": n_raw,
+            "coins_persistent_signal": n_persistent,
+            "coins_price_above_ma": n_ma_pass,
             "historical_threshold": float(self.historical_threshold),
-            "cross_sectional_threshold": float(self.cross_sectional_threshold),
-            "coins_above_historical_threshold": int(hist_signals),
-            "coins_above_cross_sectional_threshold": int(cs_signals),
-            "coins_above_both_thresholds": int(both_signals),
-            "max_historical_zscore": float(hist_z.max()) if len(hist_z) else np.nan,
-            "max_cross_sectional_zscore": float(cs_z.max()) if len(cs_z) else np.nan,
-            "mean_historical_zscore": float(hist_z.mean()) if len(hist_z) else np.nan,
-            "mean_cross_sectional_zscore": float(cs_z.mean()) if len(cs_z) else np.nan,
-            "std_historical_zscore": float(hist_z.std()) if len(hist_z) else np.nan,
-            "std_cross_sectional_zscore": float(cs_z.std()) if len(cs_z) else np.nan,
+            "min_signal_bars": int(self.min_signal_bars),
+            "hist_z_max": float(hist_z.max()) if len(hist_z) else np.nan,
+            "hist_z_mean": float(hist_z.mean()) if len(hist_z) else np.nan,
+            "hist_z_std": float(hist_z.std()) if len(hist_z) else np.nan,
+            "cs_z_max": float(cs_z.max()) if len(cs_z) else np.nan,
+            "cs_z_mean": float(cs_z.mean()) if len(cs_z) else np.nan,
+            "vol_skew_mean": float(vol_skew.mean()) if len(vol_skew) else np.nan,
+            "vol_skew_median": float(vol_skew.median()) if len(vol_skew) else np.nan,
         }
 
-        return diagnostics
-
 
 # ---------------------------------------------------------
-# MAIN CALCULATION (RUN ON REFRESH OR FIRST TIME)
+# MAIN COMPUTATION
 # ---------------------------------------------------------
-if refresh or st.session_state["vol_brkout_results"] is None:
-    vb_signal = VolatilityBreakoutSignal(
-        historical_window=historical_window,
-        volatility_window=volatility_window,
-        historical_threshold=historical_threshold,
-        cross_sectional_threshold=cross_sectional_threshold,
-        downside_penalty=downside_penalty,
-    )
+if refresh or st.session_state["vol_brkout_v2_results"] is None:
+    with st.spinner("Computing signals…"):
+        vb = VolatilityBreakoutSignal(
+            historical_window=int(historical_window),
+            volatility_window=int(volatility_window),
+            historical_threshold=float(historical_threshold),
+            cs_boost_weight=float(cs_boost_weight),
+            min_nonzero_returns=int(min_nonzero_returns),
+            min_signal_bars=int(min_signal_bars),
+        )
 
-    signals_dict = vb_signal.generate_signals(df_h)
+        signals_dict = vb.generate_signals(df_h)
 
-    # Base top-N ranking
-    base_top = vb_signal.get_top_signals(
-        signals_dict,
-        top_n=int(top_n_total),
-        require_both_signals=True,
-    )
+        base_top = vb.get_top_signals(
+            signals_dict,
+            top_n=int(top_n_total),
+            require_price_above_ma=bool(require_price_above_ma),
+        )
 
-    if base_top is not None and not base_top.empty:
-        # Your original behaviour: take rows 11–20 (0-based: 10:20)
-        top_signals = base_top.iloc[10:20].reset_index(drop=True)
-    else:
-        top_signals = pd.DataFrame()
+        diagnostics = vb.diagnose_signals(signals_dict)
 
-    diagnostics = vb_signal.diagnose_signals(signals_dict)
+        st.session_state["vol_brkout_v2_results"] = {
+            "signals_dict": signals_dict,
+            "base_top": base_top,
+            "diagnostics": diagnostics,
+            "vb": vb,
+        }
 
-    st.session_state["vol_brkout_results"] = {
-        "signals_dict": signals_dict,
-        "base_top": base_top,
-        "top_signals": top_signals,
-        "diagnostics": diagnostics,
-    }
-
-
-# ---------------------------------------------------------
-# DISPLAY RESULTS
-# ---------------------------------------------------------
-results = st.session_state["vol_brkout_results"]
+results = st.session_state["vol_brkout_v2_results"]
 
 if results is None:
-    st.info("Click **Refresh data** to compute volatility breakout signals.")
+    st.info("Click **Refresh / Recompute** in the sidebar to compute signals.")
     st.stop()
 
-base_top = results["base_top"]
-top_signals = results["top_signals"]
-diagnostics = results["diagnostics"]
+base_top: pd.DataFrame = results["base_top"]
+diagnostics: Dict = results["diagnostics"]
+signals_dict: Dict = results["signals_dict"]
 
-st.subheader("Top Signals (Rows 11–20 from base ranking)")
-if top_signals is None or top_signals.empty:
-    st.warning("No breakout signals under current parameters. Try lowering thresholds.")
+
+# ---------------------------------------------------------
+# DISPLAY — SELECTED RANK SLICE
+# ---------------------------------------------------------
+st.subheader(f"Breakout Candidates — Rank {int(rank_start)}–{int(rank_end)}")
+
+if base_top is None or base_top.empty:
+    st.warning(
+        "No breakout signals under current parameters. "
+        "Try lowering the historical z-score threshold or the signal persistence bars."
+    )
 else:
-    st.dataframe(top_signals, width="stretch")
+    # Rank is 1-indexed in the DataFrame; iloc uses 0-based
+    display_df = base_top.iloc[int(rank_start) - 1 : int(rank_end)].copy()
+    display_df.insert(0, "rank", range(int(rank_start), int(rank_start) + len(display_df)))
 
-with st.expander("Show Base Top Ranking (Top N)", expanded=False):
+    # Colour-code vol_skew: green when skewed upward, red when balanced/downward
+    def _color_skew(val):
+        try:
+            v = float(val)
+            if v >= 0.65:
+                return "background-color: #1a5c2a; color: white"
+            elif v >= 0.55:
+                return "background-color: #2e7d32; color: white"
+            elif v >= 0.45:
+                return ""
+            else:
+                return "background-color: #7b1a1a; color: white"
+        except Exception:
+            return ""
+
+    styled = display_df.style.applymap(_color_skew, subset=["vol_skew"])
+    st.dataframe(styled, use_container_width=True)
+
+    # ---------------------------------------------------------
+    # CHART — Composite score bar chart for displayed coins
+    # ---------------------------------------------------------
+    if not display_df.empty:
+        fig = go.Figure(
+            go.Bar(
+                x=display_df["coin"],
+                y=display_df["composite_score"],
+                marker_color=[
+                    "#2e7d32" if v >= 0.55 else "#c62828"
+                    for v in display_df["vol_skew"].fillna(0.5)
+                ],
+                text=display_df["composite_score"].round(2),
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            title="Composite Breakout Score (selected rank slice)",
+            xaxis_title="Coin",
+            yaxis_title="Composite Score",
+            height=350,
+            margin=dict(t=50, b=40),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ---------------------------------------------------------
+# DISPLAY — Full base ranking table
+# ---------------------------------------------------------
+with st.expander("Full base ranking (all computed candidates)", expanded=False):
     if base_top is not None and not base_top.empty:
-        st.dataframe(base_top, width="stretch")
+        full = base_top.copy()
+        full.insert(0, "rank", range(1, len(full) + 1))
+        st.dataframe(full, use_container_width=True)
     else:
-        st.write("No base top ranking available (no signals).")
+        st.write("No candidates to show.")
 
+
+# ---------------------------------------------------------
+# DISPLAY — Distribution plots (diagnostic)
+# ---------------------------------------------------------
+with st.expander("Signal distribution charts", expanded=False):
+    ts_last = signals_dict["hist_z"].index[-1]
+    hist_z_row = signals_dict["hist_z"].loc[ts_last].dropna()
+    cs_z_row = signals_dict["cs_z"].loc[ts_last].dropna()
+    vol_skew_row = signals_dict["vol_skew"].loc[ts_last].dropna()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        fig_hz = go.Figure()
+        fig_hz.add_trace(go.Histogram(x=hist_z_row.values, nbinsx=20, name="Hist Z"))
+        fig_hz.add_vline(
+            x=float(historical_threshold),
+            line_dash="dash", line_color="red",
+            annotation_text=f"threshold={historical_threshold}",
+            annotation_position="top right",
+        )
+        fig_hz.update_layout(
+            title="Historical Vol Z-score",
+            height=280, margin=dict(t=40, b=30, l=20, r=20),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_hz, use_container_width=True)
+
+    with col2:
+        fig_cs = go.Figure()
+        fig_cs.add_trace(go.Histogram(x=cs_z_row.values, nbinsx=20, name="CS Z"))
+        fig_cs.update_layout(
+            title="Cross-Sectional Vol Z-score",
+            height=280, margin=dict(t=40, b=30, l=20, r=20),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_cs, use_container_width=True)
+
+    with col3:
+        fig_sk = go.Figure()
+        fig_sk.add_trace(go.Histogram(x=vol_skew_row.values, nbinsx=20, name="Vol Skew"))
+        fig_sk.add_vline(
+            x=0.5, line_dash="dash", line_color="gray",
+            annotation_text="balanced=0.5",
+        )
+        fig_sk.update_layout(
+            title="Vol Skew (upside proportion)",
+            height=280, margin=dict(t=40, b=30, l=20, r=20),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_sk, use_container_width=True)
+
+
+# ---------------------------------------------------------
+# DISPLAY — Diagnostics JSON
+# ---------------------------------------------------------
 with st.expander("Diagnostics", expanded=False):
-    if diagnostics:
-        st.json(diagnostics)
-    else:
-        st.write("No diagnostics available (no signals).")
+    st.json(diagnostics)
