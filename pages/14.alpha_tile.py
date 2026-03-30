@@ -13,19 +13,16 @@ st.set_page_config(page_title="Alpha Percentile vs BTC", layout="wide")
 
 st.markdown("""
 <style>
-    /* Tighten metric cards */
     [data-testid="metric-container"] { background:#1e1e2e; border-radius:8px; padding:12px; }
-    /* Make expanders cleaner */
     details summary { font-weight:600; }
-    /* Diagnostic badge */
-    .diag-ok   { color:#4ade80; font-weight:700; }
-    .diag-warn { color:#facc15; font-weight:700; }
-    .diag-fail { color:#f87171; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📐 Alpha Percentile vs BTC")
-st.caption("Rolling OLS alpha (idiosyncratic) with quality filters, percentile signals, and persistence scoring.")
+st.caption(
+    "Combined signal: percentile momentum (L1) + confirmed divergence (L2) + price gate (L3). "
+    "All three layers must pass for a coin to be flagged."
+)
 
 if st.button("🔄 Refresh data"):
     st.cache_data.clear()
@@ -52,66 +49,64 @@ if "BTC" not in df_price_alpha.columns:
 with st.sidebar:
     st.header("⚙️ Parameters")
 
+    # ── OLS window ──────────────────────────────────────────────────────────
     st.subheader("Rolling Window")
     window = st.select_slider(
         "Alpha estimation window (days)",
-        options=[30, 60, 90, 180],
-        value=90,
-        help="Number of days used in each rolling OLS regression. Shorter = faster but noisier."
+        options=[30, 60, 90, 180], value=90,
+        help="Days used in each rolling OLS regression."
     )
 
+    # ── QC filters ──────────────────────────────────────────────────────────
     st.subheader("Quality Filters")
-    min_r2 = st.slider(
-        "Min R² to include regression",
-        min_value=0.0, max_value=0.5, value=0.10, step=0.01,
-        help="Discard windows where BTC explains less than this fraction of coin variance."
-    )
-    min_beta_tstat = st.slider(
-        "Min |beta t-stat| for significance",
-        min_value=0.0, max_value=4.0, value=1.5, step=0.1,
-        help="Discard windows where the BTC beta is not statistically meaningful."
-    )
+    min_r2 = st.slider("Min R²", 0.0, 0.5, 0.10, 0.01,
+        help="Discard windows where BTC explains less than this fraction of coin variance.")
+    min_beta_tstat = st.slider("Min |beta t-stat|", 0.0, 4.0, 1.5, 0.1,
+        help="Discard windows where the BTC beta is not statistically meaningful.")
     min_obs = st.slider(
         "Min valid observations in window",
-        min_value=10, max_value=window, value=max(10, int(window * 0.7)), step=5,
+        10, window, max(10, int(window * 0.7)), 5,
         help="Minimum non-NaN days required inside the rolling window."
     )
 
-    st.subheader("Signal 1 — Percentile Momentum")
-    momentum_lookback = st.slider(
-        "Momentum lookback (days)",
-        min_value=5, max_value=30, value=14, step=1,
-        help="Period over which to measure change in cross-sec percentile."
-    )
-    pct_lo = st.slider("Current percentile — lower bound", 0.0, 1.0, 0.35, 0.01)
-    pct_hi = st.slider("Current percentile — upper bound", 0.0, 1.0, 0.75, 0.01)
-    min_delta = st.slider(
-        "Min percentile rise over lookback",
-        min_value=0.0, max_value=0.5, value=0.10, step=0.01
-    )
-    peak_margin_s1 = st.slider(
-        "Max distance from 30-day peak (Signal 1)",
-        min_value=0.0, max_value=0.5, value=0.10, step=0.01,
-        help="Exclude coins within this many pct-points of their 30-day high percentile."
+    # ── L1: Percentile momentum ──────────────────────────────────────────────
+    st.subheader("Layer 1 — Percentile Momentum")
+    momentum_lookback = st.slider("Momentum lookback (days)", 5, 30, 14, 1,
+        help="Period over which to measure change in cross-sec percentile.")
+    pct_lo = st.slider("Current percentile — lower bound", 0.0, 1.0, 0.35, 0.01,
+        help="Coin must be above this percentile today.")
+    pct_hi = st.slider("Current percentile — upper bound", 0.0, 1.0, 0.75, 0.01,
+        help="Coin must be below this percentile today (not exhausted).")
+    min_delta = st.slider("Min percentile rise over lookback", 0.0, 0.5, 0.10, 0.01,
+        help="Minimum improvement in cross-sec percentile over the momentum lookback.")
+    peak_margin = st.slider(
+        "Min distance from 30-day peak",
+        0.0, 0.5, 0.10, 0.01,
+        help="Coin must be at least this far below its 30-day cross-sec high. Shared by L1 and L2."
     )
 
-    st.subheader("Signal 2 — Hist vs X-sec Divergence")
-    min_divergence = st.slider(
-        "Min divergence (x-sec − hist)",
-        min_value=-0.5, max_value=0.5, value=0.10, step=0.01,
-        help="Coin's cross-sec pct must exceed its hist pct by at least this amount."
-    )
-    peak_margin_s2 = st.slider(
-        "Max distance from 30-day peak (Signal 2)",
-        min_value=0.0, max_value=0.5, value=0.10, step=0.01
-    )
+    # ── L2: Confirmed divergence ─────────────────────────────────────────────
+    st.subheader("Layer 2 — Confirmed Divergence")
+    min_divergence = st.slider("Min divergence level (x-sec − hist)", -0.5, 0.5, 0.10, 0.01,
+        help="Cross-sec percentile must exceed historical percentile by at least this amount.")
+    div_widening_lookback = st.slider("Divergence widening lookback (days)", 3, 21, 7, 1,
+        help="Divergence must have grown over this many days.")
+    min_div_widening = st.slider("Min divergence widening", 0.0, 0.3, 0.05, 0.01,
+        help="Minimum increase in divergence over the widening lookback.")
+    div_persistence_days = st.slider("Min days divergence held positive", 3, 21, 5, 1,
+        help="Divergence must have been above the min level for at least this many consecutive days.")
 
-    st.subheader("Autocorrelation (Persistence)")
-    autocorr_lag = st.slider(
-        "Autocorrelation lag (days)",
-        min_value=3, max_value=21, value=7, step=1,
-        help="Lag in days for rank autocorrelation of alpha percentile."
-    )
+    # ── L3: Price gate ───────────────────────────────────────────────────────
+    st.subheader("Layer 3 — Price Confirmation")
+    price_ret_window = st.slider("Price return window (days)", 3, 14, 5, 1,
+        help="N-day raw return window for price confirmation.")
+    min_price_ret = st.slider("Min price return (%)", -10.0, 20.0, 0.0, 0.5,
+        help="Coin must have returned at least this much. Set 0 to just require positive price action.")
+
+    # ── Autocorrelation ──────────────────────────────────────────────────────
+    st.subheader("Persistence (Autocorrelation)")
+    autocorr_lag = st.slider("Autocorrelation lag (days)", 3, 21, 7, 1,
+        help="Lag in days for Spearman rank autocorrelation of alpha percentile.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RETURNS
@@ -122,33 +117,24 @@ if "BTC" not in df_ret.columns:
     st.error("BTC column missing after return calculation.")
     st.stop()
 
-btc_ret = df_ret["BTC"]
+btc_ret   = df_ret["BTC"]
 all_coins = [c for c in df_ret.columns if c != "BTC"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ALPHA ESTIMATION — WITH QUALITY GATING
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Computing rolling alpha...")
+@st.cache_data(show_spinner="Computing rolling alpha (OLS with QC filters)...")
 def compute_rolling_alpha(df_ret_json, btc_ret_json, window, min_r2, min_beta_tstat, min_obs_):
-    """
-    For each coin and each day, run OLS(coin ~ BTC) on the rolling window.
-    Returns:
-        df_alpha      — raw alpha (intercept), NaN where quality filters fail
-        df_beta       — OLS beta
-        df_r2         — R²
-        df_beta_tstat — t-statistic of beta coefficient
-        df_pass_rate  — fraction of windows passing QC per coin
-    """
-    df_ret_ = pd.read_json(df_ret_json)
+    df_ret_  = pd.read_json(df_ret_json)
     btc_ret_ = pd.read_json(btc_ret_json, typ="series")
 
     coins = [c for c in df_ret_.columns if c != "BTC"]
-    n = len(df_ret_)
+    n     = len(df_ret_)
 
-    alpha_dict     = {c: [np.nan] * n for c in coins}
-    beta_dict      = {c: [np.nan] * n for c in coins}
-    r2_dict        = {c: [np.nan] * n for c in coins}
-    tstat_dict     = {c: [np.nan] * n for c in coins}
+    alpha_dict = {c: [np.nan] * n for c in coins}
+    beta_dict  = {c: [np.nan] * n for c in coins}
+    r2_dict    = {c: [np.nan] * n for c in coins}
+    tstat_dict = {c: [np.nan] * n for c in coins}
 
     for i in range(n):
         if i < window - 1:
@@ -156,92 +142,104 @@ def compute_rolling_alpha(df_ret_json, btc_ret_json, window, min_r2, min_beta_ts
         btc_w = btc_ret_.iloc[i - window + 1: i + 1].values
         for coin in coins:
             coin_w = df_ret_[coin].iloc[i - window + 1: i + 1].values
-            mask = (~np.isnan(coin_w)) & (~np.isnan(btc_w))
+            mask   = (~np.isnan(coin_w)) & (~np.isnan(btc_w))
             if mask.sum() < min_obs_:
                 continue
 
-            X = btc_w[mask].reshape(-1, 1)
-            y = coin_w[mask]
-            n_obs = mask.sum()
+            X      = btc_w[mask].reshape(-1, 1)
+            y      = coin_w[mask]
+            n_obs  = mask.sum()
 
-            model = LinearRegression().fit(X, y)
-            y_pred = model.predict(X)
+            model     = LinearRegression().fit(X, y)
+            y_pred    = model.predict(X)
             residuals = y - y_pred
 
             ss_res = np.sum(residuals ** 2)
             ss_tot = np.sum((y - y.mean()) ** 2)
-            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-            # Beta t-stat
-            se2 = ss_res / max(n_obs - 2, 1)
-            x_var = np.sum((X.flatten() - X.mean()) ** 2)
-            beta_se = np.sqrt(se2 / x_var) if x_var > 0 else np.inf
-            beta_val = model.coef_[0]
+            se2       = ss_res / max(n_obs - 2, 1)
+            x_var     = np.sum((X.flatten() - X.mean()) ** 2)
+            beta_se   = np.sqrt(se2 / x_var) if x_var > 0 else np.inf
+            beta_val  = model.coef_[0]
             beta_tstat = beta_val / beta_se if beta_se > 0 else 0.0
 
-            # Quality gate
             if r2 < min_r2 or abs(beta_tstat) < min_beta_tstat:
-                continue  # leave as NaN
+                continue
 
-            alpha_dict[coin][i]  = model.intercept_ * 100   # annualise feel: ×100
+            alpha_dict[coin][i]  = model.intercept_ * 100
             beta_dict[coin][i]   = beta_val
             r2_dict[coin][i]     = r2
             tstat_dict[coin][i]  = beta_tstat
 
-    idx = df_ret_.index
-    df_alpha     = pd.DataFrame(alpha_dict, index=idx).round(4)
-    df_beta      = pd.DataFrame(beta_dict,  index=idx).round(4)
-    df_r2        = pd.DataFrame(r2_dict,    index=idx).round(4)
-    df_tstat     = pd.DataFrame(tstat_dict, index=idx).round(4)
+    idx       = df_ret_.index
+    df_alpha  = pd.DataFrame(alpha_dict, index=idx).round(4)
+    df_beta   = pd.DataFrame(beta_dict,  index=idx).round(4)
+    df_r2     = pd.DataFrame(r2_dict,    index=idx).round(4)
+    df_tstat  = pd.DataFrame(tstat_dict, index=idx).round(4)
 
-    # Pass rate: fraction of windows that passed QC
-    valid_counts = df_alpha.notna().sum()
     total_windows = max(n - window + 1, 1)
-    df_pass_rate = (valid_counts / total_windows).round(3)
+    pass_rate     = (df_alpha.notna().sum() / total_windows).round(3)
 
     return (
-        df_alpha.to_json(),
-        df_beta.to_json(),
-        df_r2.to_json(),
-        df_tstat.to_json(),
-        df_pass_rate.to_json()
+        df_alpha.to_json(), df_beta.to_json(),
+        df_r2.to_json(),    df_tstat.to_json(),
+        pass_rate.to_json()
     )
 
 
 alpha_json, beta_json, r2_json, tstat_json, pass_rate_json = compute_rolling_alpha(
-    df_ret.to_json(),
-    btc_ret.to_json(),
+    df_ret.to_json(), btc_ret.to_json(),
     window, min_r2, min_beta_tstat, min_obs
 )
 
-df_alpha   = pd.read_json(alpha_json)
-df_beta    = pd.read_json(beta_json)
-df_r2      = pd.read_json(r2_json)
-df_tstat   = pd.read_json(tstat_json)
-pass_rate  = pd.read_json(pass_rate_json, typ="series")
+df_alpha  = pd.read_json(alpha_json)
+df_beta   = pd.read_json(beta_json)
+df_r2     = pd.read_json(r2_json)
+df_tstat  = pd.read_json(tstat_json)
+pass_rate = pd.read_json(pass_rate_json, typ="series")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PERCENTILES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Historical: expanding window rank — NO lookahead bias
+# Expanding window — no lookahead bias
 df_alpha_hist_pct = df_alpha.apply(lambda x: x.expanding().rank(pct=True))
 
-# Cross-sectional: within-day rank across coins
+# Cross-sectional rank within each day
 df_alpha_xsec_pct = df_alpha.rank(axis=1, pct=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUTOCORRELATION — RANK PERSISTENCE
+# DERIVED SERIES FOR COMBINED SIGNAL
 # ─────────────────────────────────────────────────────────────────────────────
-def rolling_rank_autocorr(series, lag, min_periods=20):
-    """Compute expanding-window Spearman autocorrelation of a percentile series."""
+
+# L1: momentum
+xsec_delta = df_alpha_xsec_pct - df_alpha_xsec_pct.shift(momentum_lookback)
+
+# L2: divergence (level, widening over N days, persistence)
+divergence   = df_alpha_xsec_pct - df_alpha_hist_pct
+div_widening = divergence - divergence.shift(div_widening_lookback)
+# Count of days in rolling window where divergence was above threshold
+# equals div_persistence_days only when ALL days passed
+div_pers_count = (divergence >= min_divergence).rolling(div_persistence_days).sum()
+
+# Shared: 30-day rolling peak of cross-sec percentile
+rolling_peak_30 = df_alpha_xsec_pct.rolling(30).max()
+
+# L3: price confirmation
+price_ret_Nd = df_price_alpha.pct_change(price_ret_window) * 100   # in %
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOCORRELATION
+# ─────────────────────────────────────────────────────────────────────────────
+def _rolling_rank_autocorr(series, lag, min_periods=20):
     result = []
     for i in range(len(series)):
         if i < lag + min_periods:
             result.append(np.nan)
         else:
-            s_now  = series.iloc[lag:i+1].values
-            s_lag  = series.iloc[:i+1-lag].values
+            s_now = series.iloc[lag: i + 1].values
+            s_lag = series.iloc[: i + 1 - lag].values
             if len(s_now) < min_periods:
                 result.append(np.nan)
             else:
@@ -249,267 +247,298 @@ def rolling_rank_autocorr(series, lag, min_periods=20):
                 result.append(round(rho, 3))
     return pd.Series(result, index=series.index)
 
+
 @st.cache_data(show_spinner="Computing rank autocorrelation...")
 def compute_autocorr(xsec_json, lag):
     df_x = pd.read_json(xsec_json)
-    autocorr_dict = {}
+    out  = {}
     for coin in df_x.columns:
         s = df_x[coin].dropna()
-        if len(s) < lag + 20:
-            autocorr_dict[coin] = np.nan
-        else:
-            rho_series = rolling_rank_autocorr(s, lag)
-            autocorr_dict[coin] = rho_series.iloc[-1]  # latest value
-    return pd.Series(autocorr_dict).round(3)
+        out[coin] = _rolling_rank_autocorr(s, lag).iloc[-1] if len(s) >= lag + 20 else np.nan
+    return pd.Series(out).round(3)
+
 
 autocorr_series = compute_autocorr(df_alpha_xsec_pct.to_json(), autocorr_lag)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIAGNOSTICS SECTION
+# DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("🔬 Diagnostics")
 
-n_total_coins  = len(all_coins)
-n_valid_today  = df_alpha.iloc[-1].notna().sum()
-avg_pass_rate  = pass_rate.mean()
-n_low_pass     = (pass_rate < 0.3).sum()
+n_total     = len(all_coins)
+n_valid_now = df_alpha.iloc[-1].notna().sum()
+avg_pass    = pass_rate.mean()
+n_low_pass  = (pass_rate < 0.3).sum()
 
-diag_col1, diag_col2, diag_col3, diag_col4 = st.columns(4)
-
-with diag_col1:
-    st.metric("Total coins", n_total_coins)
-with diag_col2:
-    colour = "normal" if n_valid_today > n_total_coins * 0.5 else "inverse"
-    st.metric("Coins with valid alpha today", n_valid_today,
-              delta=f"{n_valid_today/n_total_coins:.0%} pass rate", delta_color=colour)
-with diag_col3:
-    st.metric("Avg QC pass rate (all history)", f"{avg_pass_rate:.1%}")
-with diag_col4:
-    st.metric("Coins with <30% pass rate", n_low_pass,
+dc1, dc2, dc3, dc4 = st.columns(4)
+with dc1:
+    st.metric("Total coins", n_total)
+with dc2:
+    st.metric("Valid alpha today", n_valid_now,
+              delta=f"{n_valid_now / n_total:.0%} pass QC",
+              delta_color="normal" if n_valid_now > n_total * 0.5 else "inverse")
+with dc3:
+    st.metric("Avg QC pass rate", f"{avg_pass:.1%}")
+with dc4:
+    st.metric("Coins <30% pass rate", n_low_pass,
               delta="⚠️ low signal quality" if n_low_pass > 0 else "✅ all ok",
               delta_color="inverse" if n_low_pass > 0 else "normal")
 
-with st.expander("📋 Per-coin QC pass rate & autocorrelation table"):
+with st.expander("📋 Per-coin QC table"):
     diag_df = pd.DataFrame({
-        "Pass Rate (QC)": pass_rate,
-        f"Alpha (last, ×100)": df_alpha.iloc[-1],
-        "R² (last)": df_r2.iloc[-1],
-        f"Beta t-stat (last)": df_tstat.iloc[-1],
-        f"Rank Autocorr (lag={autocorr_lag}d)": autocorr_series,
+        "Pass Rate (QC)":                        pass_rate,
+        "Alpha today (×100)":                    df_alpha.iloc[-1],
+        "R² today":                              df_r2.iloc[-1],
+        "Beta t-stat today":                     df_tstat.iloc[-1],
+        f"Rank Autocorr (lag={autocorr_lag}d)":  autocorr_series,
     }).sort_values("Pass Rate (QC)", ascending=False)
 
-    def colour_pass(val):
-        if pd.isna(val): return "color: grey"
-        if val >= 0.6:   return "color: #4ade80"
-        if val >= 0.3:   return "color: #facc15"
-        return "color: #f87171"
+    def _col_pass(v):
+        if pd.isna(v): return "color:grey"
+        if v >= 0.6:   return "color:#4ade80"
+        if v >= 0.3:   return "color:#facc15"
+        return "color:#f87171"
 
-    def colour_autocorr(val):
-        if pd.isna(val): return "color: grey"
-        if val >= 0.4:   return "color: #4ade80"
-        if val >= 0.2:   return "color: #facc15"
-        return "color: #f87171"
+    def _col_ac(v):
+        if pd.isna(v): return "color:grey"
+        if v >= 0.4:   return "color:#4ade80"
+        if v >= 0.2:   return "color:#facc15"
+        return "color:#f87171"
 
-    styled = (
+    st.dataframe(
         diag_df.style
-        .applymap(colour_pass, subset=["Pass Rate (QC)"])
-        .applymap(colour_autocorr, subset=[f"Rank Autocorr (lag={autocorr_lag}d)"])
-        .format({
-            "Pass Rate (QC)": "{:.1%}",
-            f"Alpha (last, ×100)": "{:.4f}",
-            "R² (last)": "{:.3f}",
-            f"Beta t-stat (last)": "{:.2f}",
-            f"Rank Autocorr (lag={autocorr_lag}d)": "{:.3f}",
-        }, na_rep="—")
+            .applymap(_col_pass, subset=["Pass Rate (QC)"])
+            .applymap(_col_ac,   subset=[f"Rank Autocorr (lag={autocorr_lag}d)"])
+            .format({
+                "Pass Rate (QC)":                       "{:.1%}",
+                "Alpha today (×100)":                   "{:.4f}",
+                "R² today":                             "{:.3f}",
+                "Beta t-stat today":                    "{:.2f}",
+                f"Rank Autocorr (lag={autocorr_lag}d)": "{:.3f}",
+            }, na_rep="—"),
+        use_container_width=True, height=350
     )
-    st.dataframe(styled, use_container_width=True, height=350)
 
-with st.expander("📊 QC pass rate distribution"):
-    fig_diag = go.Figure()
-    fig_diag.add_trace(go.Histogram(
-        x=pass_rate.values,
-        nbinsx=20,
-        marker_color="#6366f1",
-        opacity=0.8,
-        name="Coins"
+with st.expander("📊 QC pass-rate distribution"):
+    fig_diag = go.Figure(go.Histogram(
+        x=pass_rate.values, nbinsx=20,
+        marker_color="#6366f1", opacity=0.8
     ))
     fig_diag.add_vline(x=0.3, line_dash="dash", line_color="#f87171",
-                       annotation_text="30% threshold", annotation_position="top right")
+                       annotation_text="30%", annotation_position="top right")
     fig_diag.add_vline(x=0.6, line_dash="dash", line_color="#4ade80",
-                       annotation_text="60% threshold", annotation_position="top right")
-    fig_diag.update_layout(
-        title="Distribution of QC Pass Rates Across Coins",
-        xaxis_title="Pass Rate", yaxis_title="# Coins",
-        height=300, template="plotly_dark"
-    )
+                       annotation_text="60%", annotation_position="top right")
+    fig_diag.update_layout(title="QC Pass Rate Distribution",
+                           xaxis_title="Pass Rate", yaxis_title="# Coins",
+                           height=280, template="plotly_dark")
     st.plotly_chart(fig_diag, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL CONSTRUCTION
+# COMBINED SIGNAL CONSTRUCTION
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader("📡 Signal Lists")
+st.subheader("📡 Combined Signal")
 
-# Shared: last-day snapshots
-last_xsec = df_alpha_xsec_pct.iloc[-1].dropna()
-last_hist  = df_alpha_hist_pct.iloc[-1].dropna()
+st.markdown(f"""
+**Three layers must ALL pass** for a coin to be flagged:
 
-# 30-day rolling peak of cross-sec percentile
-rolling_peak_30 = df_alpha_xsec_pct.rolling(30).max()
-last_peak_30    = rolling_peak_30.iloc[-1].dropna()
+| Layer | Sub-conditions |
+|---|---|
+| **L1 — Momentum** | X-sec pct in **{pct_lo:.0%}–{pct_hi:.0%}** · rose ≥ **{min_delta:.0%}** over {momentum_lookback}d · ≥ **{peak_margin:.0%}** below 30d peak |
+| **L2 — Confirmed Divergence** | x-sec−hist ≥ **{min_divergence:.0%}** · widened ≥ **{min_div_widening:.0%}** over {div_widening_lookback}d · held for ≥ **{div_persistence_days}** consecutive days |
+| **L3 — Price Gate** | {price_ret_window}d return ≥ **{min_price_ret:.1f}%** |
+""")
 
-# ── Signal 1: Alpha Percentile Momentum ──────────────────────────────────────
-xsec_delta = df_alpha_xsec_pct - df_alpha_xsec_pct.shift(momentum_lookback)
-last_delta  = xsec_delta.iloc[-1].dropna()
+# ── Today snapshots ──────────────────────────────────────────────────────────
+last_xsec       = df_alpha_xsec_pct.iloc[-1]
+last_hist       = df_alpha_hist_pct.iloc[-1]
+last_peak_30    = rolling_peak_30.iloc[-1]
+last_delta      = xsec_delta.iloc[-1]
+last_div        = divergence.iloc[-1]
+last_div_wide   = div_widening.iloc[-1]
+last_div_pers   = div_pers_count.iloc[-1]
+last_price_ret  = price_ret_Nd.iloc[-1]
 
-coins_s1 = []
-for coin in last_xsec.index:
-    cur_pct  = last_xsec.get(coin, np.nan)
-    delta    = last_delta.get(coin, np.nan)
+rows = []
+for coin in all_coins:
+    xsec     = last_xsec.get(coin, np.nan)
+    hist     = last_hist.get(coin, np.nan)
     peak     = last_peak_30.get(coin, np.nan)
+    delta    = last_delta.get(coin, np.nan)
+    div_lvl  = last_div.get(coin, np.nan)
+    div_wide = last_div_wide.get(coin, np.nan)
+    div_pers = last_div_pers.get(coin, np.nan)
+    pret     = last_price_ret.get(coin, np.nan)
     autocorr = autocorr_series.get(coin, np.nan)
 
-    if any(pd.isna(v) for v in [cur_pct, delta, peak]):
+    if any(pd.isna(v) for v in [xsec, hist, peak, delta, div_lvl, div_wide, pret]):
         continue
 
-    dist_from_peak = peak - cur_pct   # > 0 means currently below peak
+    dist_peak = peak - xsec   # positive = below peak (good)
 
-    cond_range    = pct_lo <= cur_pct <= pct_hi
-    cond_rising   = delta >= min_delta
-    cond_not_peak = dist_from_peak >= peak_margin_s1
+    # Layer 1 sub-conditions
+    l1a = pct_lo <= xsec <= pct_hi
+    l1b = delta  >= min_delta
+    l1c = dist_peak >= peak_margin
 
-    coins_s1.append({
-        "Coin": coin,
-        "X-sec Pct": round(cur_pct, 3),
-        f"Δ Pct ({momentum_lookback}d)": round(delta, 3),
-        "30d Peak": round(peak, 3),
-        "Dist from Peak": round(dist_from_peak, 3),
-        f"Rank Autocorr": round(autocorr, 3) if not pd.isna(autocorr) else np.nan,
-        "✅ In Range": cond_range,
-        "✅ Rising": cond_rising,
-        "✅ Not Exhausted": cond_not_peak,
-        "Signal": cond_range and cond_rising and cond_not_peak,
+    # Layer 2 sub-conditions
+    l2a = div_lvl  >= min_divergence
+    l2b = div_wide >= min_div_widening
+    l2c = (not pd.isna(div_pers)) and (div_pers >= div_persistence_days)
+
+    # Layer 3
+    l3  = pret >= min_price_ret
+
+    l1_pass = l1a and l1b and l1c
+    l2_pass = l2a and l2b and l2c
+    l3_pass = l3
+    signal  = l1_pass and l2_pass and l3_pass
+
+    sub_score = sum([l1a, l1b, l1c, l2a, l2b, l2c, l3])
+
+    rows.append({
+        "Coin":                                  coin,
+        # L1 values
+        "X-sec Pct":                             round(xsec,      3),
+        f"Δ Pct ({momentum_lookback}d)":         round(delta,     3),
+        "Dist from 30d Peak":                    round(dist_peak, 3),
+        # L2 values
+        "Divergence":                            round(div_lvl,   3),
+        f"Div Widening ({div_widening_lookback}d)": round(div_wide, 3),
+        "Div Pers Days":                         int(div_pers) if not pd.isna(div_pers) else np.nan,
+        # L3 value
+        f"Price Ret ({price_ret_window}d) %":    round(pret,      2),
+        # Meta
+        f"Autocorr (lag={autocorr_lag}d)":       round(autocorr, 3) if not pd.isna(autocorr) else np.nan,
+        "Sub-conds (/ 7)":                       sub_score,
+        # Layer flags
+        "✅ L1":    l1_pass,
+        "✅ L2":    l2_pass,
+        "✅ L3":    l3_pass,
+        "🎯 Signal": signal,
     })
 
-df_s1 = pd.DataFrame(coins_s1).sort_values(f"Δ Pct ({momentum_lookback}d)", ascending=False)
-
-# ── Signal 2: Historical vs Cross-sectional Divergence ───────────────────────
-divergence  = df_alpha_xsec_pct - df_alpha_hist_pct
-last_div    = divergence.iloc[-1].dropna()
-
-coins_s2 = []
-for coin in last_xsec.index:
-    cur_xsec = last_xsec.get(coin, np.nan)
-    cur_hist  = last_hist.get(coin, np.nan)
-    div_val   = last_div.get(coin, np.nan)
-    peak      = last_peak_30.get(coin, np.nan)
-    autocorr  = autocorr_series.get(coin, np.nan)
-
-    if any(pd.isna(v) for v in [cur_xsec, cur_hist, div_val, peak]):
-        continue
-
-    dist_from_peak = peak - cur_xsec
-
-    cond_div      = div_val >= min_divergence
-    cond_not_peak = dist_from_peak >= peak_margin_s2
-
-    coins_s2.append({
-        "Coin": coin,
-        "X-sec Pct": round(cur_xsec, 3),
-        "Hist Pct": round(cur_hist, 3),
-        "Divergence (X−H)": round(div_val, 3),
-        "30d Peak": round(peak, 3),
-        "Dist from Peak": round(dist_from_peak, 3),
-        f"Rank Autocorr": round(autocorr, 3) if not pd.isna(autocorr) else np.nan,
-        "✅ Diverging": cond_div,
-        "✅ Not Exhausted": cond_not_peak,
-        "Signal": cond_div and cond_not_peak,
-    })
-
-df_s2 = pd.DataFrame(coins_s2).sort_values("Divergence (X−H)", ascending=False)
-
-# ── Display Signal Tables ─────────────────────────────────────────────────────
-def style_signal_table(df, signal_col="Signal"):
-    def highlight_signal(row):
-        if row.get(signal_col, False):
-            return ["background-color: #14532d"] * len(row)
-        return [""] * len(row)
-
-    bool_cols = [c for c in df.columns if str(c).startswith("✅")]
-
-    def colour_bool(val):
-        if val is True:  return "color: #4ade80; font-weight:700"
-        if val is False: return "color: #f87171"
-        return ""
-
-    styled = df.style.apply(highlight_signal, axis=1)
-    if bool_cols:
-        styled = styled.applymap(colour_bool, subset=bool_cols)
-    return styled
-
-sig_tab1, sig_tab2 = st.tabs([
-    "📈 Signal 1 — Alpha Percentile Momentum",
-    "🔀 Signal 2 — Hist vs X-sec Divergence"
-])
-
-with sig_tab1:
-    st.markdown(f"""
-    **Logic:** Coins whose cross-sectional alpha percentile is:
-    - Currently between **{pct_lo:.0%} – {pct_hi:.0%}** (not exhausted, not bottom half)
-    - Rose by ≥ **{min_delta:.0%}** over the last **{momentum_lookback} days**
-    - At least **{peak_margin_s1:.0%}** below their 30-day peak (not near recent top)
-    
-    Rows highlighted **green** pass all three conditions.
-    """)
-    n_signal_s1 = df_s1["Signal"].sum()
-    st.metric("Coins passing Signal 1", int(n_signal_s1))
-    st.dataframe(
-        style_signal_table(df_s1),
-        use_container_width=True, height=420
-    )
-
-with sig_tab2:
-    st.markdown(f"""
-    **Logic:** Coins that are outperforming their own history but not yet re-rated by the cross-section:
-    - Cross-sec percentile exceeds historical percentile by ≥ **{min_divergence:.0%}** (early recovery signal)
-    - At least **{peak_margin_s2:.0%}** below their 30-day cross-sec peak (not exhausted)
-    
-    Rows highlighted **green** pass both conditions.
-    """)
-    n_signal_s2 = df_s2["Signal"].sum()
-    st.metric("Coins passing Signal 2", int(n_signal_s2))
-    st.dataframe(
-        style_signal_table(df_s2),
-        use_container_width=True, height=420
-    )
-
-# Overlap between signals
-s1_set = set(df_s1[df_s1["Signal"]]["Coin"].tolist())
-s2_set = set(df_s2[df_s2["Signal"]]["Coin"].tolist())
-overlap = s1_set & s2_set
-if overlap:
-    st.success(f"🎯 **High-conviction overlap** (pass both signals): {', '.join(sorted(overlap))}")
+df_signal = (
+    pd.DataFrame(rows)
+    .sort_values(["🎯 Signal", "Sub-conds (/ 7)"], ascending=[False, False])
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHART SECTION
+# SUMMARY METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+n_signal  = int(df_signal["🎯 Signal"].sum())
+n_l1l2    = int((df_signal["✅ L1"] & df_signal["✅ L2"] & ~df_signal["✅ L3"]).sum())
+n_l1_only = int((df_signal["✅ L1"] & ~df_signal["✅ L2"] & ~df_signal["✅ L3"]).sum())
+n_l2_only = int((~df_signal["✅ L1"] & df_signal["✅ L2"] & ~df_signal["✅ L3"]).sum())
+
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    st.metric("🎯 Full signal (L1+L2+L3)", n_signal)
+with m2:
+    st.metric("L1+L2 — awaiting price confirm", n_l1l2)
+with m3:
+    st.metric("L1 only", n_l1_only)
+with m4:
+    st.metric("L2 only", n_l2_only)
+
+# Callouts
+passing = df_signal[df_signal["🎯 Signal"]]["Coin"].tolist()
+if passing:
+    st.success(f"🎯 **Full signal coins:** {', '.join(sorted(passing))}")
+
+near_miss = df_signal[
+    df_signal["✅ L1"] & df_signal["✅ L2"] & ~df_signal["✅ L3"]
+]["Coin"].tolist()
+if near_miss:
+    st.warning(f"⏳ **Near-miss (L1+L2 pass, awaiting price confirmation):** {', '.join(sorted(near_miss))}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL TABLE + BREAKDOWN
+# ─────────────────────────────────────────────────────────────────────────────
+bool_cols = ["✅ L1", "✅ L2", "✅ L3", "🎯 Signal"]
+
+def _bool_colour(val):
+    if val is True:  return "color:#4ade80;font-weight:700"
+    if val is False: return "color:#f87171"
+    return ""
+
+def _score_colour(val):
+    if pd.isna(val): return ""
+    if val == 7:     return "color:#4ade80;font-weight:700"
+    if val >= 5:     return "color:#facc15"
+    return "color:#f87171"
+
+def _style_main(df):
+    def _row(row):
+        if row.get("🎯 Signal", False):
+            return ["background-color:#14532d"] * len(row)
+        if row.get("✅ L1", False) and row.get("✅ L2", False):
+            return ["background-color:#1e3a5f"] * len(row)
+        return [""] * len(row)
+    return (
+        df.style
+          .apply(_row, axis=1)
+          .applymap(_bool_colour, subset=bool_cols)
+    )
+
+tab_main, tab_breakdown = st.tabs(["📋 Signal table", "🔍 Sub-condition breakdown"])
+
+with tab_main:
+    st.dataframe(_style_main(df_signal), use_container_width=True, height=500)
+
+with tab_breakdown:
+    st.markdown(
+        "Each row shows which of the 7 sub-conditions a coin passes individually. "
+        "Use this to diagnose why a coin is one condition away from a full signal."
+    )
+
+    sub_cond_cols = {
+        f"L1a: {pct_lo:.0%}≤pct≤{pct_hi:.0%}": df_signal.apply(
+            lambda r: pct_lo <= r["X-sec Pct"] <= pct_hi, axis=1),
+        f"L1b: Δ≥{min_delta:.2f}":              df_signal[f"Δ Pct ({momentum_lookback}d)"] >= min_delta,
+        f"L1c: Peak margin≥{peak_margin:.2f}":   df_signal["Dist from 30d Peak"] >= peak_margin,
+        f"L2a: Div≥{min_divergence:.2f}":        df_signal["Divergence"] >= min_divergence,
+        f"L2b: Widen≥{min_div_widening:.2f}":    df_signal[f"Div Widening ({div_widening_lookback}d)"] >= min_div_widening,
+        f"L2c: Persist {div_persistence_days}d": df_signal["Div Pers Days"] >= div_persistence_days,
+        f"L3: Ret≥{min_price_ret:.1f}%":         df_signal[f"Price Ret ({price_ret_window}d) %"] >= min_price_ret,
+    }
+
+    df_bd = df_signal[["Coin", "Sub-conds (/ 7)"]].copy()
+    for name, series in sub_cond_cols.items():
+        df_bd[name] = series.values
+
+    all_sub = list(sub_cond_cols.keys())
+
+    st.dataframe(
+        df_bd.sort_values("Sub-conds (/ 7)", ascending=False)
+             .style
+             .applymap(_bool_colour, subset=all_sub)
+             .applymap(_score_colour, subset=["Sub-conds (/ 7)"]),
+        use_container_width=True, height=500
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COIN INSPECTOR CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader(f"📉 Rolling {window}-Day Alpha & Percentile Charts")
+st.subheader("📉 Coin Inspector")
 
 available_coins = list(df_alpha.columns)
-default_coin = (
-    list(s1_set)[0] if s1_set else
-    ("BNB" if "BNB" in available_coins else (available_coins[0] if available_coins else None))
+default_coins = (
+    df_signal[df_signal["🎯 Signal"]]["Coin"].tolist()[:2]
+    or df_signal[df_signal["✅ L1"] & df_signal["✅ L2"]]["Coin"].tolist()[:1]
+    or (["BNB"] if "BNB" in available_coins else available_coins[:1])
 )
 
 coins_to_plot = st.multiselect(
     "Select coin(s) to inspect",
     options=available_coins,
-    default=[default_coin] if default_coin else [],
+    default=default_coins,
 )
 
 if coins_to_plot:
+
     # ── Chart 1: Raw alpha ────────────────────────────────────────────────────
     fig1 = go.Figure()
     for coin in coins_to_plot:
@@ -517,103 +546,159 @@ if coins_to_plot:
             s = df_alpha[coin].dropna()
             fig1.add_trace(go.Scatter(
                 x=s.index, y=s.values, mode="lines", name=coin,
-                hovertemplate=f"<b>{coin}</b><br>Date: %{{x}}<br>Alpha: %{{y:.4f}}<extra></extra>"
+                hovertemplate=f"<b>{coin}</b> Alpha: %{{y:.4f}}<extra></extra>"
             ))
     fig1.add_hline(y=0, line_dash="dot", line_color="white", opacity=0.3)
     fig1.update_layout(
         title=f"Rolling {window}-Day Alpha vs BTC (×100, QC-filtered)",
         xaxis_title="Date", yaxis_title="Alpha (×100)",
-        height=380, template="plotly_dark", legend=dict(orientation="h", y=-0.2)
+        height=340, template="plotly_dark",
+        legend=dict(orientation="h", y=-0.28)
     )
     st.plotly_chart(fig1, use_container_width=True)
 
-    # ── Chart 2: Cross-sectional percentile + momentum delta ─────────────────
-    fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                         subplot_titles=["Cross-sec Alpha Percentile", f"Δ Percentile ({momentum_lookback}d)"],
-                         vertical_spacing=0.12)
+    # ── Chart 2: X-sec pct + 30d peak + delta (L1) ───────────────────────────
+    fig2 = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=[
+            "Cross-sec Alpha Percentile + 30d Peak",
+            f"Δ Percentile ({momentum_lookback}d) — L1 momentum"
+        ],
+        vertical_spacing=0.12
+    )
     for coin in coins_to_plot:
-        if coin in df_alpha_xsec_pct.columns:
-            s = df_alpha_xsec_pct[coin].dropna()
-            fig2.add_trace(go.Scatter(
-                x=s.index, y=s.values, mode="lines", name=coin,
-                hovertemplate=f"<b>{coin}</b> X-sec pct: %{{y:.3f}}<extra></extra>"
-            ), row=1, col=1)
-            d = xsec_delta[coin].dropna()
-            fig2.add_trace(go.Scatter(
-                x=d.index, y=d.values, mode="lines", name=f"{coin} Δ",
-                showlegend=False,
-                hovertemplate=f"<b>{coin}</b> Δ pct: %{{y:.3f}}<extra></extra>"
-            ), row=2, col=1)
+        if coin not in df_alpha_xsec_pct.columns:
+            continue
+        s  = df_alpha_xsec_pct[coin].dropna()
+        pk = rolling_peak_30[coin].dropna()
+        d  = xsec_delta[coin].dropna()
 
-    # Shading for valid percentile range (Signal 1)
-    fig2.add_hrect(y0=pct_lo, y1=pct_hi, fillcolor="rgba(99,102,241,0.12)",
-                   line_width=0, row=1, col=1,
-                   annotation_text="S1 target range", annotation_position="top left")
-    fig2.add_hline(y=0, line_dash="dot", line_color="white", opacity=0.3, row=2, col=1)
-    fig2.add_hline(y=min_delta, line_dash="dash", line_color="#6366f1",
-                   opacity=0.6, row=2, col=1,
+        fig2.add_trace(go.Scatter(
+            x=s.index, y=s.values, mode="lines", name=coin,
+            hovertemplate=f"<b>{coin}</b> X-sec pct: %{{y:.3f}}<extra></extra>"
+        ), row=1, col=1)
+        fig2.add_trace(go.Scatter(
+            x=pk.index, y=pk.values, mode="lines",
+            name=f"{coin} 30d peak", line=dict(dash="dot", width=1),
+            showlegend=False, opacity=0.45,
+            hovertemplate=f"<b>{coin}</b> 30d peak: %{{y:.3f}}<extra></extra>"
+        ), row=1, col=1)
+        fig2.add_trace(go.Scatter(
+            x=d.index, y=d.values, mode="lines",
+            name=f"{coin} Δ pct", showlegend=False,
+            hovertemplate=f"<b>{coin}</b> Δ pct: %{{y:.3f}}<extra></extra>"
+        ), row=2, col=1)
+
+    fig2.add_hrect(y0=pct_lo, y1=pct_hi,
+                   fillcolor="rgba(99,102,241,0.10)", line_width=0, row=1, col=1,
+                   annotation_text="L1 range", annotation_position="top left")
+    fig2.add_hline(y=0,         line_dash="dot",  line_color="white",   opacity=0.3, row=2, col=1)
+    fig2.add_hline(y=min_delta, line_dash="dash", line_color="#6366f1", opacity=0.6, row=2, col=1,
                    annotation_text=f"min Δ={min_delta:.2f}", annotation_position="top right")
-    fig2.update_layout(height=550, template="plotly_dark",
+    fig2.update_layout(height=520, template="plotly_dark",
                        legend=dict(orientation="h", y=-0.12))
     st.plotly_chart(fig2, use_container_width=True)
 
-    # ── Chart 3: Historical percentile vs cross-sectional (divergence) ────────
-    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                         subplot_titles=["Hist vs X-sec Percentile", "Divergence (X-sec − Hist)"],
-                         vertical_spacing=0.12)
+    # ── Chart 3: Divergence — level, widening, persistence (L2) ──────────────
+    fig3 = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        subplot_titles=[
+            "Hist vs X-sec Percentile",
+            "Divergence level (X-sec − Hist) — L2a",
+            f"Divergence widening over {div_widening_lookback}d — L2b confirmation"
+        ],
+        vertical_spacing=0.10
+    )
     for coin in coins_to_plot:
-        if coin in df_alpha_hist_pct.columns:
-            h = df_alpha_hist_pct[coin].dropna()
-            x = df_alpha_xsec_pct[coin].dropna()
-            fig3.add_trace(go.Scatter(
-                x=h.index, y=h.values, mode="lines", name=f"{coin} Hist",
-                line=dict(dash="dot"),
-                hovertemplate=f"<b>{coin}</b> Hist pct: %{{y:.3f}}<extra></extra>"
-            ), row=1, col=1)
-            fig3.add_trace(go.Scatter(
-                x=x.index, y=x.values, mode="lines", name=f"{coin} X-sec",
-                hovertemplate=f"<b>{coin}</b> X-sec pct: %{{y:.3f}}<extra></extra>"
-            ), row=1, col=1)
-            div = (divergence[coin]).dropna()
-            fig3.add_trace(go.Scatter(
-                x=div.index, y=div.values, mode="lines",
-                name=f"{coin} Divergence", showlegend=False,
-                fill="tozeroy",
-                fillcolor="rgba(99,102,241,0.15)",
-                hovertemplate=f"<b>{coin}</b> Div: %{{y:.3f}}<extra></extra>"
-            ), row=2, col=1)
+        if coin not in df_alpha_hist_pct.columns:
+            continue
+        h   = df_alpha_hist_pct[coin].dropna()
+        x   = df_alpha_xsec_pct[coin].dropna()
+        div = divergence[coin].dropna()
+        dw  = div_widening[coin].dropna()
 
-    fig3.add_hline(y=0, line_dash="dot", line_color="white", opacity=0.3, row=2, col=1)
-    fig3.add_hline(y=min_divergence, line_dash="dash", line_color="#6366f1",
-                   opacity=0.6, row=2, col=1,
-                   annotation_text=f"min div={min_divergence:.2f}", annotation_position="top right")
-    fig3.update_layout(height=550, template="plotly_dark",
-                       legend=dict(orientation="h", y=-0.12))
+        fig3.add_trace(go.Scatter(
+            x=h.index, y=h.values, mode="lines",
+            name=f"{coin} Hist", line=dict(dash="dot"),
+            hovertemplate=f"<b>{coin}</b> Hist: %{{y:.3f}}<extra></extra>"
+        ), row=1, col=1)
+        fig3.add_trace(go.Scatter(
+            x=x.index, y=x.values, mode="lines", name=f"{coin} X-sec",
+            hovertemplate=f"<b>{coin}</b> X-sec: %{{y:.3f}}<extra></extra>"
+        ), row=1, col=1)
+        fig3.add_trace(go.Scatter(
+            x=div.index, y=div.values, mode="lines",
+            name=f"{coin} Div", showlegend=False,
+            fill="tozeroy", fillcolor="rgba(99,102,241,0.12)",
+            hovertemplate=f"<b>{coin}</b> Div: %{{y:.3f}}<extra></extra>"
+        ), row=2, col=1)
+        fig3.add_trace(go.Scatter(
+            x=dw.index, y=dw.values, mode="lines",
+            name=f"{coin} Div widening", showlegend=False,
+            hovertemplate=f"<b>{coin}</b> Widening: %{{y:.3f}}<extra></extra>"
+        ), row=3, col=1)
+
+    for row_, thresh_, label_ in [
+        (2, min_divergence,   f"min div={min_divergence:.2f}"),
+        (3, min_div_widening, f"min widening={min_div_widening:.2f}"),
+    ]:
+        fig3.add_hline(y=0,       line_dash="dot",  line_color="white",   opacity=0.3,
+                       row=row_, col=1)
+        fig3.add_hline(y=thresh_, line_dash="dash", line_color="#6366f1", opacity=0.6,
+                       row=row_, col=1,
+                       annotation_text=label_, annotation_position="top right")
+
+    fig3.update_layout(height=640, template="plotly_dark",
+                       legend=dict(orientation="h", y=-0.07))
     st.plotly_chart(fig3, use_container_width=True)
 
-    # ── Chart 4: R² and beta t-stat over time ─────────────────────────────────
+    # ── Chart 4: Price return gate (L3) ──────────────────────────────────────
+    fig4 = go.Figure()
+    for coin in coins_to_plot:
+        if coin in price_ret_Nd.columns:
+            pr = price_ret_Nd[coin].dropna()
+            fig4.add_trace(go.Scatter(
+                x=pr.index, y=pr.values, mode="lines", name=coin,
+                hovertemplate=f"<b>{coin}</b> {price_ret_window}d ret: %{{y:.2f}}%<extra></extra>"
+            ))
+    fig4.add_hline(y=min_price_ret, line_dash="dash", line_color="#6366f1", opacity=0.7,
+                   annotation_text=f"gate={min_price_ret:.1f}%", annotation_position="top right")
+    fig4.add_hline(y=0, line_dash="dot", line_color="white", opacity=0.3)
+    fig4.update_layout(
+        title=f"Rolling {price_ret_window}-Day Price Return % (L3 price gate)",
+        xaxis_title="Date", yaxis_title="Return (%)",
+        height=320, template="plotly_dark",
+        legend=dict(orientation="h", y=-0.32)
+    )
+    st.plotly_chart(fig4, use_container_width=True)
+
+    # ── Chart 5: R² + beta t-stat (QC view) ──────────────────────────────────
     with st.expander("🔍 Regression quality over time (R² & beta t-stat)"):
-        fig4 = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                             subplot_titles=["R² (rolling window)", "Beta t-stat (rolling window)"],
+        fig5 = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                             subplot_titles=["R²", "Beta t-stat"],
                              vertical_spacing=0.12)
         for coin in coins_to_plot:
-            if coin in df_r2.columns:
-                r2s = df_r2[coin].dropna()
-                fig4.add_trace(go.Scatter(
-                    x=r2s.index, y=r2s.values, mode="lines", name=f"{coin} R²"
-                ), row=1, col=1)
-                ts = df_tstat[coin].dropna()
-                fig4.add_trace(go.Scatter(
-                    x=ts.index, y=ts.values, mode="lines", name=f"{coin} t-stat", showlegend=False
-                ), row=2, col=1)
-
-        fig4.add_hline(y=min_r2, line_dash="dash", line_color="#f87171",
-                       row=1, col=1, annotation_text=f"min R²={min_r2}", annotation_position="top right")
-        fig4.add_hline(y=min_beta_tstat, line_dash="dash", line_color="#f87171",
-                       row=2, col=1, annotation_text=f"min |t|={min_beta_tstat}", annotation_position="top right")
-        fig4.update_layout(height=480, template="plotly_dark",
+            if coin not in df_r2.columns:
+                continue
+            fig5.add_trace(go.Scatter(
+                x=df_r2[coin].dropna().index,
+                y=df_r2[coin].dropna().values,
+                mode="lines", name=f"{coin} R²"
+            ), row=1, col=1)
+            fig5.add_trace(go.Scatter(
+                x=df_tstat[coin].dropna().index,
+                y=df_tstat[coin].dropna().values,
+                mode="lines", name=f"{coin} t-stat", showlegend=False
+            ), row=2, col=1)
+        fig5.add_hline(y=min_r2, line_dash="dash", line_color="#f87171",
+                       row=1, col=1, annotation_text=f"min R²={min_r2}",
+                       annotation_position="top right")
+        fig5.add_hline(y=min_beta_tstat, line_dash="dash", line_color="#f87171",
+                       row=2, col=1, annotation_text=f"min |t|={min_beta_tstat}",
+                       annotation_position="top right")
+        fig5.update_layout(height=440, template="plotly_dark",
                            legend=dict(orientation="h", y=-0.12))
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig5, use_container_width=True)
 
 else:
     st.info("Select at least one coin above to view charts.")
@@ -625,5 +710,6 @@ st.markdown("---")
 st.caption(
     f"Window: **{window}d** | Min R²: **{min_r2}** | Min |β t-stat|: **{min_beta_tstat}** | "
     f"Min obs: **{min_obs}** | Autocorr lag: **{autocorr_lag}d** | "
-    f"Hist pct uses expanding window (no lookahead)."
+    f"Hist pct: expanding window (no lookahead) | "
+    f"Price gate: {price_ret_window}d return ≥ {min_price_ret:.1f}%"
 )
