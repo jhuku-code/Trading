@@ -15,14 +15,9 @@ st.title("Excess Return Scanner")
 @st.cache_data(show_spinner=False)
 def compute_excess_cumreturns(price_theme: pd.DataFrame, theme_values_aligned, cache_token):
     """
-    For each coin compute:
-        excess_return[t] = coin_return[t] - theme_median_return[t]
-    Then cumsum the excess returns (additive, in %-pts).
-
-    Returns
-    -------
-    excess_cum  : pd.DataFrame  (n_dates × n_coins)
-    coin_themes : pd.Series     coin -> theme
+    For each coin:
+        excess_return[t] = coin_return[t] − theme_median_return[t]
+    Cumsum → additive excess cumulative return in %-pts.
     """
     df_prices = price_theme.copy()
     if not isinstance(df_prices.index, pd.DatetimeIndex):
@@ -49,14 +44,28 @@ def compute_excess_cumreturns(price_theme: pd.DataFrame, theme_values_aligned, c
         index=returns.index,
     )
 
-    excess_returns = returns - theme_median_per_coin
-    excess_cum     = excess_returns.cumsum()
+    excess_cum = (returns - theme_median_per_coin).cumsum()
     return excess_cum, coin_themes
 
 
 # ─────────────────────────────────────────────
-# Weighted scoring classifier
+# Improved weighted scoring classifier
 # ─────────────────────────────────────────────
+
+def _linear_r2(y: np.ndarray) -> float:
+    """R² of a simple linear fit — measures how clean/sustained the trend is."""
+    if len(y) < 3:
+        return 0.0
+    x = np.arange(len(y), dtype=float)
+    try:
+        p       = np.polyfit(x, y, 1)
+        y_hat   = np.polyval(p, x)
+        ss_res  = np.sum((y - y_hat) ** 2)
+        ss_tot  = np.sum((y - y.mean()) ** 2)
+        return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    except Exception:
+        return 0.0
+
 
 def classify_curvature(
     series: pd.Series,
@@ -65,99 +74,130 @@ def classify_curvature(
     min_score: int = 3,
 ):
     """
-    Weighted scoring classifier — returns 'convex', 'concave', or 'flat'.
+    Five-criterion weighted scoring classifier.
 
-    Four criteria are evaluated; each contributes a signed score toward
-    Buy (+) or Sell (-).  A coin is labelled Buy if total score >= +min_score,
-    Sell if total score <= -min_score, otherwise Flat.
+    Returns (label, score, detail_dict)
+        label  : 'convex' | 'concave' | 'flat'
+        score  : int  in [−6, +6]
+        detail : dict of per-criterion signed contributions
 
-    Criteria and weights
-    ────────────────────
-    C1  Net direction  (weight 1)
-        last − first of the full window.
-        Positive → +1, Negative → −1, near-zero → 0.
-        Catches EIGEN (net loser) and ADA (collapsed since peak).
+    ╔══════════════════════════════════════════════════════════════╗
+    ║  Criterion  │ Wt │ Description                              ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║  C1         │  1 │ Robust net direction                     ║
+    ║             │    │ median(last 10%) − median(first 10%)     ║
+    ║             │    │ Immune to outlier start/end bars.        ║
+    ║             │    │ Fixes THETA: early-spike baseline made   ║
+    ║             │    │ single last−first near-zero.             ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║  C2         │  2 │ Majority-vote right-side quadratic       ║
+    ║             │    │ Fit quadratic on last 20%, 30%, 40%.     ║
+    ║             │    │ Score +2 if ≥2/3 windows have a>thr AND ║
+    ║             │    │ b>0; −2 if ≥2/3 have a<−thr AND b<0.   ║
+    ║             │    │ Fixes STORJ: one noisy window (pullback  ║
+    ║             │    │ from spike) no longer kills the signal.  ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║  C3         │  1 │ Second-half slope sign                   ║
+    ║             │    │ Is slope of second half positive (Buy)?  ║
+    ║             │    │ Removed "faster than first half" check   ║
+    ║             │    │ that penalised decelerating but valid    ║
+    ║             │    │ uptrends like GRT.                       ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║  C4         │  1 │ Recent momentum                         ║
+    ║             │    │ mean(last 20%) vs mean(prior 20%).       ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║  C5         │  1 │ Trend quality (linear R²)               ║
+    ║             │    │ R² of linear fit on full window.         ║
+    ║             │    │ R²>0.5: clean sustained move → +1 if    ║
+    ║             │    │ direction agrees, −1 if disagrees.       ║
+    ║             │    │ Rewards GRT/STORJ (clean uptrend, high  ║
+    ║             │    │ R²). Penalises THETA (spike+collapse,   ║
+    ║             │    │ low R² on linear fit of full move).      ║
+    ╚══════════════════════════════════════════════════════════════╝
 
-    C2  Right-side quadratic  (weight 2)  ← most informative, double weight
-        Quadratic fit on the most-recent ⌈n/3⌉ bars.
-        For upward: a > thresh AND b > 0  → +2
-        For downward: a < −thresh AND b < 0  → −2
-        Requiring a and b to agree in sign stops a tail-uptick on an
-        otherwise falling chart (EIGEN) from scoring positive here.
-
-    C3  Half-window slope acceleration  (weight 1)
-        Linear slope of second half vs. first half.
-        slope_second > slope_first → +1 (accelerating up, like ETHFI/BTC)
-        slope_second < slope_first → −1 (decelerating/reversing, like ADA)
-
-    C4  Recent momentum  (weight 1)
-        Mean of last 20 % of bars vs. mean of the preceding 20 %.
-        recent_mean > prior_mean → +1
-        recent_mean < prior_mean → −1
-        Short-range, orthogonal to the quadratic math — catches coins
-        just beginning to turn before the full-window metrics react.
-
-    Max score = 1 + 2 + 1 + 1 = 5
-    Default min_score = 3, so possible qualifying combos:
-        C2 alone (2) is NOT enough — prevents noisy tail-fits triggering
-        C1+C2 (3) — net positive + right-side curving up → Buy
-        C2+C3 (3) — right-side curving up + accelerating → Buy
-        C2+C4 (3) — right-side curving up + recent momentum → Buy
-        C1+C3+C4 (3) — no strong quadratic but all directional agree → Buy
-        Any combo ≥ 3 → Buy / Sell
-
-    flatness_thresh is scaled by the full-window y-range so the
-    dead-band is dimensionless across all magnitudes.
+    Max score = 1+2+1+1+1 = 6
+    Default min_score = 3 → any combination adding to ±3 signals.
+    C2 alone (2) never triggers alone — needs at least one more.
     """
     s = series.dropna().tail(n_bars)
     if len(s) < 9:
-        return "flat", 0
+        return "flat", 0, {}
 
     y    = s.values.astype(float)
+    n    = len(y)
     yr   = np.ptp(y)
     thr  = flatness_thresh * yr if yr > 0 else flatness_thresh
 
-    score = 0
+    detail = {}
+    score  = 0
 
-    # ── C1: net direction (weight 1) ─────────────────────────────
-    net = y[-1] - y[0]
-    if   net >  thr: score += 1
-    elif net < -thr: score -= 1
+    # ── C1: robust net direction ─────────────────────────────────
+    tenth   = max(2, n // 10)
+    med_end = np.median(y[-tenth:])
+    med_beg = np.median(y[:tenth])
+    net     = med_end - med_beg
+    c1 = 1 if net > thr else (-1 if net < -thr else 0)
+    score += c1
+    detail["C1_net_direction"] = c1
 
-    # ── C2: right-side quadratic on last third (weight 2) ────────
-    right_n = max(5, len(s) // 3)
-    yr_r    = y[-right_n:]
-    xr      = np.arange(len(yr_r), dtype=float)
-    xr_n    = xr / xr[-1] if xr[-1] != 0 else xr
+    # ── C2: majority-vote right-side quadratic ───────────────────
+    votes_up = votes_dn = 0
+    for frac in (0.20, 0.30, 0.40):
+        rn  = max(5, int(n * frac))
+        yr_ = y[-rn:]
+        xr  = np.arange(len(yr_), dtype=float)
+        xn  = xr / xr[-1] if xr[-1] != 0 else xr
+        try:
+            a, b, _ = np.polyfit(xn, yr_, 2)
+            if (a >  thr) and (b >  0): votes_up += 1
+            if (a < -thr) and (b <  0): votes_dn += 1
+        except Exception:
+            pass
+    c2 = 2 if votes_up >= 2 else (-2 if votes_dn >= 2 else 0)
+    score += c2
+    detail["C2_right_quadratic"] = c2
+
+    # ── C3: second-half slope sign ───────────────────────────────
+    mid = n // 2
+    xh  = np.arange(n - mid, dtype=float)
     try:
-        a, b, _ = np.polyfit(xr_n, yr_r, 2)
-        if   (a >  thr) and (b >  0): score += 2
-        elif (a < -thr) and (b <  0): score -= 2
+        slope_second = np.polyfit(xh, y[mid:], 1)[0]
+        c3 = 1 if slope_second > thr else (-1 if slope_second < -thr else 0)
     except Exception:
-        pass
+        c3 = 0
+    score += c3
+    detail["C3_second_half_slope"] = c3
 
-    # ── C3: half-window slope acceleration (weight 1) ────────────
-    mid = len(y) // 2
-    xh  = np.arange(mid, dtype=float)
-    try:
-        s1 = np.polyfit(xh, y[:mid], 1)[0]
-        s2 = np.polyfit(xh[:len(y[mid:mid * 2])], y[mid:mid * 2], 1)[0]
-        if   s2 > s1: score += 1
-        elif s2 < s1: score -= 1
-    except Exception:
-        pass
+    # ── C4: recent momentum ──────────────────────────────────────
+    fifth        = max(3, n // 5)
+    recent_mean  = y[-fifth:].mean()
+    prior_mean   = y[-2 * fifth:-fifth].mean()
+    diff         = recent_mean - prior_mean
+    c4 = 1 if diff > thr else (-1 if diff < -thr else 0)
+    score += c4
+    detail["C4_recent_momentum"] = c4
 
-    # ── C4: recent momentum — last 20 % vs prior 20 % (weight 1) ─
-    fifth = max(3, len(y) // 5)
-    recent_mean = y[-fifth:].mean()
-    prior_mean  = y[-2 * fifth:-fifth].mean()
-    if   recent_mean > prior_mean: score += 1
-    elif recent_mean < prior_mean: score -= 1
+    # ── C5: trend quality via linear R² ─────────────────────────
+    r2    = _linear_r2(y)
+    # Only fire if the trend is clean (R² > 0.5) AND direction is clear
+    c5 = 0
+    if r2 > 0.5:
+        # direction of the linear fit
+        try:
+            lin_slope = np.polyfit(np.arange(n, dtype=float), y, 1)[0]
+            c5 = 1 if lin_slope > thr else (-1 if lin_slope < -thr else 0)
+        except Exception:
+            c5 = 0
+    score += c5
+    detail["C5_trend_quality_R2"] = c5
+    detail["_r2"] = round(r2, 3)
 
     # ── Decision ─────────────────────────────────────────────────
-    if   score >=  min_score: return "convex",  score
-    elif score <= -min_score: return "concave", score
-    return "flat", score
+    if   score >=  min_score: label = "convex"
+    elif score <= -min_score: label = "concave"
+    else:                     label = "flat"
+
+    return label, score, detail
 
 
 # ─────────────────────────────────────────────
@@ -219,18 +259,14 @@ for theme in sorted(coin_themes.unique()):
         )
         for idx, coin in enumerate(coins):
             r, c   = divmod(idx, n_cols)
-            series = excess_display[coin].dropna()
+            s_data = excess_display[coin].dropna()
             fig_grid.add_trace(
-                go.Scatter(
-                    x=series.index, y=series.values,
-                    mode="lines", name=coin, showlegend=False,
-                ),
+                go.Scatter(x=s_data.index, y=s_data.values,
+                           mode="lines", name=coin, showlegend=False),
                 row=r + 1, col=c + 1,
             )
-        fig_grid.update_layout(
-            height=280 * rows, hovermode="x unified",
-            margin=dict(t=40, b=20),
-        )
+        fig_grid.update_layout(height=280 * rows, hovermode="x unified",
+                               margin=dict(t=40, b=20))
         st.plotly_chart(fig_grid, use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════════
@@ -240,10 +276,10 @@ for theme in sorted(coin_themes.unique()):
 st.markdown("---")
 st.subheader("Convexity Scanner — Buy / Sell Signals")
 st.caption(
-    "Scores each coin across four criteria (max 5 pts). "
-    "**Buy** = score ≥ threshold (convex/gaining).  "
-    "**Sell** = score ≤ −threshold (concave/losing).  "
-    "Adjust the sliders to control sensitivity."
+    "Scores each coin across **5 criteria** (max ±6 pts total, C2 double-weighted).  \n"
+    "**Buy** = score ≥ threshold (convex / gaining).  "
+    "**Sell** = score ≤ −threshold (concave / losing).  "
+    "Adjust sliders to control sensitivity."
 )
 
 col_a, col_b, col_c = st.columns(3)
@@ -258,19 +294,14 @@ with col_b:
         "Flatness threshold  (0 = sensitive · 0.5 = strict)",
         min_value=0.0, max_value=0.5, value=0.05, step=0.01,
         key="flatness_thresh",
-        help="Fraction of y-range used as dead-band before any criterion fires.",
+        help="Fraction of y-range as dead-band before any criterion fires.",
     )
 with col_c:
     min_score = st.slider(
-        "Min score to signal  (max possible = 5)",
-        min_value=1, max_value=5, value=3, step=1,
+        "Min score to signal  (max = 6)",
+        min_value=1, max_value=6, value=3, step=1,
         key="min_score",
-        help=(
-            "3 = at least two criteria agree (recommended). "
-            "2 = C2 alone can trigger. "
-            "4 = very strict. "
-            "5 = all criteria must agree."
-        ),
+        help="3 = recommended. 2 = C2 alone can trigger. 5-6 = very strict.",
     )
 
 # Classify every coin
@@ -278,8 +309,9 @@ raw_results = {
     coin: classify_curvature(excess_cum[coin], int(scan_n_bars), flatness_thresh, min_score)
     for coin in excess_cum.columns
 }
-classifications = {coin: label for coin, (label, _) in raw_results.items()}
-scores          = {coin: sc    for coin, (_, sc)    in raw_results.items()}
+classifications = {coin: label  for coin, (label, _, _)  in raw_results.items()}
+scores          = {coin: sc     for coin, (_, sc, _)     in raw_results.items()}
+details         = {coin: det    for coin, (_, _, det)    in raw_results.items()}
 
 buy_by_theme:  dict[str, list[str]] = {}
 sell_by_theme: dict[str, list[str]] = {}
@@ -310,10 +342,8 @@ else:
         )
         return styled
 
-    st.dataframe(
-        signal_df.style.apply(highlight_buysell, axis=None),
-        use_container_width=True,
-    )
+    st.dataframe(signal_df.style.apply(highlight_buysell, axis=None),
+                 use_container_width=True)
 
     total_buy  = sum(len(v) for v in buy_by_theme.values())
     total_sell = sum(len(v) for v in sell_by_theme.values())
@@ -324,14 +354,21 @@ else:
     c3.metric("⬜ Flat (ignored)", total_flat)
 
 # ── Score debug table ─────────────────────────────────────────────
-with st.expander("Show raw scores for all coins", expanded=False):
+with st.expander("Show raw scores & criterion breakdown for all coins", expanded=False):
     score_rows = []
     for coin in sorted(excess_cum.columns):
+        det = details.get(coin, {})
         score_rows.append({
-            "Coin":   coin,
-            "Theme":  coin_themes.get(coin, "Unknown"),
-            "Score":  scores[coin],
-            "Signal": classifications[coin].upper(),
+            "Coin":    coin,
+            "Theme":   coin_themes.get(coin, "Unknown"),
+            "Signal":  classifications[coin].upper(),
+            "Score":   scores[coin],
+            "C1 net":  det.get("C1_net_direction",    0),
+            "C2 quad": det.get("C2_right_quadratic",  0),
+            "C3 slope":det.get("C3_second_half_slope",0),
+            "C4 mom":  det.get("C4_recent_momentum",  0),
+            "C5 R²":   det.get("C5_trend_quality_R2", 0),
+            "R²":      det.get("_r2",                 0.0),
         })
     score_df = pd.DataFrame(score_rows).set_index("Coin")
 
@@ -340,8 +377,20 @@ with st.expander("Show raw scores for all coins", expanded=False):
         if val == "CONCAVE": return "color: #f87171"
         return "color: #94a3b8"
 
+    def colour_score(val):
+        try:
+            v = float(val)
+            if v > 0: return "color: #4ade80"
+            if v < 0: return "color: #f87171"
+        except Exception:
+            pass
+        return "color: #94a3b8"
+
     st.dataframe(
-        score_df.style.applymap(colour_signal, subset=["Signal"]),
+        score_df.style
+            .applymap(colour_signal, subset=["Signal"])
+            .applymap(colour_score,  subset=["Score", "C1 net", "C2 quad",
+                                              "C3 slope", "C4 mom", "C5 R²"]),
         use_container_width=True,
     )
 
@@ -369,6 +418,7 @@ if selected_coin:
     theme_label = coin_themes.get(selected_coin, "Unknown")
     shape_label = classifications.get(selected_coin, "flat")
     coin_score  = scores.get(selected_coin, 0)
+    coin_r2     = details.get(selected_coin, {}).get("_r2", 0.0)
 
     color_map  = {"convex": "#4ade80", "concave": "#f87171", "flat": "#94a3b8"}
     line_color = color_map[shape_label]
@@ -389,7 +439,7 @@ if selected_coin:
     fig_coin.update_layout(
         title=(
             f"{selected_coin}  |  Theme: {theme_label}  |  "
-            f"Signal: {shape_label.upper()}  |  Score: {coin_score} / 5"
+            f"Signal: {shape_label.upper()}  |  Score: {coin_score} / 6  |  R²: {coin_r2:.2f}"
         ),
         xaxis_title="Date",
         yaxis_title="Cumulative Excess Return (%-pts vs theme median)",
