@@ -10,7 +10,7 @@ P3  IDMAG filter direction validated empirically: coins are binned into
     quintiles and forward returns are compared. If low-IDMAG does NOT
     outperform high-IDMAG in this universe, the filter is inverted or
     disabled, and a diagnostic chart is shown.
-P5  exclude_last is expressed in bars, derived from data frequency label.
+P5  exclude_last is expressed in bars directly; data frequency is auto-detected.
 P6  Cross-sectional std guard: z-scores are set to NaN when cs-std is below
     a minimum threshold to avoid division-by-near-zero in small theme baskets.
 P7  Lookback windows unified: one sidebar parameter drives both universe and
@@ -32,7 +32,6 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
 from typing import Dict, List, Optional, Tuple
@@ -64,88 +63,104 @@ if ticker_to_theme is None:
     st.stop()
 
 # ---------------------------------------------------------
-# INFER DATA FREQUENCY
+# INFER DATA FREQUENCY  (runs once at module load)
 # ---------------------------------------------------------
 
 def infer_data_frequency(df: pd.DataFrame) -> Tuple[str, float]:
     """
-    Infer data frequency from the DataFrame index.
-    Returns (label, bar_hours) where label is a human-readable string
-    like '1D' or '4H', and bar_hours is the median bar size in hours.
+    Infer median bar size from the DataFrame index.
+    Returns (label, bar_hours).
     """
     if not isinstance(df.index, pd.DatetimeIndex) or len(df) < 2:
         return "Unknown", 4.0
     diffs = df.index.to_series().diff().dropna()
     median_hours = diffs.median().total_seconds() / 3600.0
-
-    if 20 <= median_hours <= 28:
+    if 20.0 <= median_hours <= 28.0:
         return "Daily (1D)", median_hours
     elif 3.5 <= median_hours <= 4.5:
         return "4-Hour (4H)", median_hours
     elif 0.9 <= median_hours <= 1.1:
         return "1-Hour (1H)", median_hours
     else:
-        return f"~{median_hours:.1f}H", median_hours
+        label = "~" + str(round(median_hours, 1)) + "H"
+        return label, median_hours
+
 
 freq_label, bar_hours = infer_data_frequency(df_raw)
-is_daily = "1D" in freq_label or "Daily" in freq_label
+is_daily = ("1D" in freq_label) or ("Daily" in freq_label)
 
-# Human-readable period label for sidebar
-period_unit = "days" if is_daily else "bars"
-period_unit_cap = period_unit.capitalize()
+# Pre-compute all display strings so no complex expressions appear inside f-strings
+period_unit     = "days"  if is_daily else "bars"
+period_unit_cap = "Days"  if is_daily else "Bars"
+freq_info_msg   = "Detected frequency: " + freq_label + " (" + str(round(bar_hours, 2)) + "h/bar)"
+
+momentum_label      = "Momentum lookback (" + period_unit + ")"
+skip_label          = "Short-term reversal skip (" + period_unit + ")"
+idmag_label         = "IDMAG lookback (" + period_unit + ")"
+min_expand_label    = "Min " + period_unit + " for expanding vol (warm-up)"
+expander_mom_title  = "Momentum Windows (" + period_unit_cap + ")"
+
+skip_help = (
+    "Bars shifted before computing cumulative return. "
+    "Avoids the short-term reversal effect. "
+    "1 day is a reasonable default."
+    if is_daily else
+    "Bars shifted before computing cumulative return. "
+    "Avoids the short-term reversal effect. "
+    "6 bars (~24 h) is a reasonable default."
+)
+
+idmag_help = (
+    "Should be close to (or equal to) the momentum lookback "
+    "so IDMAG quality and momentum signal measure the same window."
+)
+
+momentum_help = (
+    "Same lookback applied at universe AND theme level. "
+    "1 bar = " + str(round(bar_hours, 2)) + " h of data."
+)
+
+# Sensible defaults per frequency
+_default_momentum = 60  if is_daily else 60
+_default_skip     = 1   if is_daily else 6
+_default_idmag    = 120 if is_daily else 120
 
 # ---------------------------------------------------------
 # SIDEBAR PARAMETERS
 # ---------------------------------------------------------
 st.sidebar.header("Parameters")
+st.sidebar.info(freq_info_msg)
 
-st.sidebar.info(f"📅 Detected frequency: **{freq_label}** ({bar_hours:.2f}h/bar)")
-
-# Default lookback values — in bars, scaled to be economically meaningful
-# For daily: 60 days ≈ 3 months. For 4H: 60 bars ≈ 10 days.
-# We keep the same bar counts but display them with the right unit.
-_default_momentum = 60 if is_daily else 60
-_default_skip     = 1  if is_daily else 6
-_default_idmag    = 120 if is_daily else 120
-
-with st.sidebar.expander(f"Momentum Windows ({period_unit_cap})", expanded=True):
+with st.sidebar.expander(expander_mom_title, expanded=True):
     momentum_bars = st.number_input(
-        f"Momentum lookback ({period_unit})",
+        momentum_label,
         min_value=5, max_value=2000, value=_default_momentum, step=1,
-        help=f"Same lookback applied at universe AND theme level. "
-             f"1 {period_unit[:-1]} = {bar_hours:.2f}h of data.",
+        help=momentum_help,
         key="momentum_bars",
     )
     skip_bars = st.number_input(
-        f"Short-term reversal skip ({period_unit})",
+        skip_label,
         min_value=0, max_value=100, value=_default_skip, step=1,
-        help=(
-            f"Bars shifted before computing cumulative return. "
-            f"Avoids the short-term reversal effect. "
-            f"{'1 day' if is_daily else '6 bars (24h)'} is a reasonable default."
-        ),
+        help=skip_help,
         key="skip_bars",
     )
-    idmag_bars = st.number_input(
-        f"IDMAG lookback ({period_unit})",
+    idmag_bars_input = st.number_input(
+        idmag_label,
         min_value=5, max_value=2000, value=_default_idmag, step=1,
-        help=(
-            f"Should be close to (or equal to) the momentum lookback "
-            f"so IDMAG quality and momentum signal measure the same window."
-        ),
+        help=idmag_help,
         key="idmag_bars",
     )
     min_expanding_bars = st.number_input(
-        f"Min {period_unit} for expanding vol (warm-up)",
+        min_expand_label,
         min_value=5, max_value=100, value=20, step=5,
         key="min_expanding_bars",
     )
 
 with st.sidebar.expander("Signal Counts", expanded=True):
-    top_n_universe = st.number_input("Universe top N (buys)", 1, 25, 8, key="tnu")
-    bottom_n_universe = st.number_input("Universe bottom N (sells)", 1, 25, 8, key="bnu")
-    top_n_theme = st.number_input("Theme top N (buys)", 1, 10, 3, key="tnt")
-    bottom_n_theme = st.number_input("Theme bottom N (sells)", 1, 10, 3, key="bnt")
+    top_n_universe = st.number_input("Universe top N (buys)",    1, 25,  8, key="tnu")
+    bottom_n_universe = st.number_input("Universe bottom N (sells)", 1, 25,  8, key="bnu")
+    top_n_theme    = st.number_input("Theme top N (buys)",       1, 10,  3, key="tnt")
+    bottom_n_theme = st.number_input("Theme bottom N (sells)",   1, 10,  3, key="bnt")
     min_coins_per_theme = st.number_input(
         "Min coins per theme", 3, 20, 5, key="mcpt",
         help="Themes with fewer coins are excluded (cs-std too unstable).",
@@ -179,7 +194,7 @@ with st.sidebar.expander("Robustness", expanded=False):
     )
 
 st.sidebar.markdown("---")
-refresh = st.sidebar.button("🔄 Refresh / Recompute", use_container_width=True)
+refresh = st.sidebar.button("Refresh / Recompute", use_container_width=True)
 
 if "xs_mom_v2_results" not in st.session_state:
     st.session_state["xs_mom_v2_results"] = None
@@ -189,14 +204,15 @@ if "xs_mom_v2_results" not in st.session_state:
 # UTILITIES
 # =============================================================
 
-def bars_to_human(n_bars: int, bar_hours: float, is_daily: bool) -> str:
+def bars_to_human(n_bars: int, bh: float, daily: bool) -> str:
     """Convert a bar count to a human-readable duration string."""
-    if is_daily:
-        return f"{n_bars}d"
-    total_hours = n_bars * bar_hours
-    if total_hours >= 24:
-        return f"{total_hours/24:.1f}d ({n_bars} bars)"
-    return f"{total_hours:.0f}h ({n_bars} bars)"
+    if daily:
+        return str(n_bars) + "d"
+    total_hours = n_bars * bh
+    if total_hours >= 24.0:
+        days_str = str(round(total_hours / 24.0, 1)) + "d"
+        return days_str + " (" + str(n_bars) + " bars)"
+    return str(int(total_hours)) + "h (" + str(n_bars) + " bars)"
 
 
 # =============================================================
@@ -224,8 +240,8 @@ def expanding_vol_scale(
 ) -> pd.DataFrame:
     """
     Scale each bar's return by the expanding std known BEFORE that bar.
-    expanding_std is shifted by 1 so we never use the current bar's return
-    in its own denominator. No lookahead bias.
+    Shifted by 1 — never uses the current bar's return in its own denominator.
+    No lookahead bias.
     """
     expanding_std = log_returns.expanding(min_periods=min_periods).std().shift(1)
     expanding_std = expanding_std.replace(0, np.nan)
@@ -241,7 +257,7 @@ def expanding_vol_scale(
 def _idmag_single_window(window_returns: pd.Series) -> float:
     """
     IDMAG for one window, Equation (2) of Da-Gurun-Warachka (2014).
-    Weights: Q1 (smallest |r|) = 5/15, …, Q5 (largest |r|) = 1/15.
+    Weights: Q1 (smallest |r|) = 5/15, Q5 (largest |r|) = 1/15.
     Returns NaN if the window cannot be quintile-split.
     """
     weights_by_quintile = {0: 5/15, 1: 4/15, 2: 3/15, 3: 2/15, 4: 1/15}
@@ -288,6 +304,7 @@ def validate_idmag_direction(
 ) -> Tuple[pd.DataFrame, bool]:
     """
     P3: Empirically test whether low-IDMAG coins outperform high-IDMAG coins.
+    Returns (quintile_df, low_idmag_wins).
     """
     valid_coins = idmag.dropna().index.tolist()
     valid_coins = [c for c in valid_coins if c in log_returns.columns]
@@ -301,7 +318,7 @@ def validate_idmag_direction(
     try:
         combined["quintile"] = pd.qcut(
             combined["IDMAG"], n_quintiles,
-            labels=[f"Q{i+1}" for i in range(n_quintiles)],
+            labels=["Q1", "Q2", "Q3", "Q4", "Q5"],
             duplicates="drop",
         )
     except ValueError:
@@ -332,9 +349,7 @@ def apply_idmag_filter(
     filter_pct: float,
     low_idmag_wins: bool,
 ) -> Tuple[List[str], List[str]]:
-    """
-    Returns (kept_coins, removed_coins).
-    """
+    """Returns (kept_coins, removed_coins)."""
     valid = idmag.dropna()
     valid = valid[valid.index.isin(log_returns.columns)]
     n_remove = max(1, int(len(valid) * filter_pct))
@@ -362,23 +377,25 @@ def calculate_momentum_scores(
     """
     Momentum = rolling sum of vol-scaled log returns over lookback_bars,
     after skipping the most recent exclude_bars (reversal avoidance).
+    Winsorization uses expanding quantiles — no lookahead.
+    Z-score guard: rows with cs-std below cs_std_min become NaN.
     """
-    shifted = vol_scaled.shift(exclude_bars)
-    cum_ret = shifted.rolling(window=lookback_bars, min_periods=lookback_bars // 2).sum()
+    shifted  = vol_scaled.shift(exclude_bars)
+    cum_ret  = shifted.rolling(window=lookback_bars, min_periods=lookback_bars // 2).sum()
 
-    # Winsorize using expanding quantiles — no lookahead
-    cum_ret_winsorized = cum_ret.copy()
+    # Winsorize with expanding quantiles (no lookahead)
+    cum_ret_w = cum_ret.copy()
     for col in cum_ret.columns:
         series = cum_ret[col]
         lo = series.expanding(min_periods=10).quantile(winsorize_pct)
-        hi = series.expanding(min_periods=10).quantile(1 - winsorize_pct)
-        cum_ret_winsorized[col] = series.clip(lower=lo, upper=hi)
+        hi = series.expanding(min_periods=10).quantile(1.0 - winsorize_pct)
+        cum_ret_w[col] = series.clip(lower=lo, upper=hi)
 
-    cs_mean = cum_ret_winsorized.mean(axis=1)
-    cs_std = cum_ret_winsorized.std(axis=1)
+    cs_mean     = cum_ret_w.mean(axis=1)
+    cs_std      = cum_ret_w.std(axis=1)
     cs_std_safe = cs_std.where(cs_std >= cs_std_min, other=np.nan)
-    z_scores = cum_ret_winsorized.sub(cs_mean, axis=0).div(cs_std_safe, axis=0)
-    ranks = z_scores.rank(axis=1, ascending=False)
+    z_scores    = cum_ret_w.sub(cs_mean, axis=0).div(cs_std_safe, axis=0)
+    ranks       = z_scores.rank(axis=1, ascending=False)
 
     return z_scores, ranks
 
@@ -392,13 +409,13 @@ def generate_signals(
     top_n: int,
     bottom_n: int,
 ) -> Tuple[pd.Series, pd.Series]:
-    buy_dict, sell_dict = {}, {}
+    buy_dict:  Dict = {}
+    sell_dict: Dict = {}
     for idx in ranks.index:
         row = ranks.loc[idx].dropna()
-        n_valid = len(row)
-        if n_valid < top_n + bottom_n:
+        if len(row) < top_n + bottom_n:
             continue
-        buy_dict[idx] = row.nsmallest(top_n).index.tolist()
+        buy_dict[idx]  = row.nsmallest(top_n).index.tolist()
         sell_dict[idx] = row.nlargest(bottom_n).index.tolist()
     return pd.Series(buy_dict, dtype=object), pd.Series(sell_dict, dtype=object)
 
@@ -418,7 +435,7 @@ def signal_to_df(s: pd.Series) -> pd.DataFrame:
 # =============================================================
 
 def build_alignment_matrix(
-    universe_buy: List[str],
+    universe_buy:  List[str],
     universe_sell: List[str],
     theme_signals: Dict[str, Dict[str, List[str]]],
 ) -> pd.DataFrame:
@@ -426,19 +443,19 @@ def build_alignment_matrix(
     for theme, signals in theme_signals.items():
         for coin in signals.get("buy", []):
             if coin in universe_buy:
-                alignment = "✅ Aligned (Buy)"
+                alignment = "Aligned (Buy)"
             elif coin in universe_sell:
-                alignment = "⚠️ Conflict (Theme=Buy, Universe=Sell)"
+                alignment = "Conflict (Theme=Buy, Universe=Sell)"
             else:
-                alignment = "— Theme-only Buy"
+                alignment = "Theme-only Buy"
             rows.append({"Theme": theme, "Coin": coin, "Theme Signal": "Buy", "Alignment": alignment})
         for coin in signals.get("sell", []):
             if coin in universe_sell:
-                alignment = "✅ Aligned (Sell)"
+                alignment = "Aligned (Sell)"
             elif coin in universe_buy:
-                alignment = "⚠️ Conflict (Theme=Sell, Universe=Buy)"
+                alignment = "Conflict (Theme=Sell, Universe=Buy)"
             else:
-                alignment = "— Theme-only Sell"
+                alignment = "Theme-only Sell"
             rows.append({"Theme": theme, "Coin": coin, "Theme Signal": "Sell", "Alignment": alignment})
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -448,47 +465,46 @@ def build_alignment_matrix(
 # =============================================================
 
 if refresh or st.session_state["xs_mom_v2_results"] is None:
-    with st.spinner("Computing signals…"):
+    with st.spinner("Computing signals..."):
 
-        # All windows are already in bars — no conversion needed.
-        # bar_hours is used only for human-readable audit labels.
-        _momentum_bars  = int(momentum_bars)
-        _skip_bars      = int(skip_bars)
-        _idmag_bars     = int(idmag_bars)
-        _forward_bars   = int(momentum_bars)   # IDMAG forward validation = same as momentum
+        _momentum_bars = int(momentum_bars)
+        _skip_bars     = int(skip_bars)
+        _idmag_bars    = int(idmag_bars_input)
+        _forward_bars  = int(momentum_bars)   # IDMAG forward validation window = momentum window
 
         param_audit = {
-            "Detected frequency": freq_label,
-            "Bar size (hours)": round(bar_hours, 2),
-            f"Momentum lookback ({period_unit})": _momentum_bars,
-            "Momentum lookback (equivalent time)": bars_to_human(_momentum_bars, bar_hours, is_daily),
-            f"Reversal skip ({period_unit})": _skip_bars,
-            "Reversal skip (equivalent time)": bars_to_human(_skip_bars, bar_hours, is_daily),
-            f"IDMAG lookback ({period_unit})": _idmag_bars,
-            "IDMAG lookback (equivalent time)": bars_to_human(_idmag_bars, bar_hours, is_daily),
-            f"IDMAG forward validation ({period_unit})": _forward_bars,
-            f"Min expanding vol ({period_unit})": int(min_expanding_bars),
+            "Detected frequency":                    freq_label,
+            "Bar size (hours)":                      round(bar_hours, 2),
+            "Momentum lookback (" + period_unit + ")":   _momentum_bars,
+            "Momentum (time equivalent)":            bars_to_human(_momentum_bars, bar_hours, is_daily),
+            "Reversal skip (" + period_unit + ")":       _skip_bars,
+            "Reversal skip (time equivalent)":       bars_to_human(_skip_bars, bar_hours, is_daily),
+            "IDMAG lookback (" + period_unit + ")":      _idmag_bars,
+            "IDMAG lookback (time equivalent)":      bars_to_human(_idmag_bars, bar_hours, is_daily),
+            "IDMAG fwd validation (" + period_unit + ")": _forward_bars,
+            "Min expanding vol (" + period_unit + ")":   int(min_expanding_bars),
         }
 
-        # ── P2: Log returns ──────────────────────────────────────────────────
+        # P2: Log returns
         log_ret = compute_log_returns(df_raw)
 
-        # ── P1: Expanding vol scaling ────────────────────────────────────────
+        # P1: Expanding vol scaling
         vol_scaled_all = expanding_vol_scale(log_ret, min_periods=int(min_expanding_bars))
 
-        # ── IDMAG ────────────────────────────────────────────────────────────
+        # IDMAG
         idmag_series = compute_idmag(log_ret, lookback_bars=_idmag_bars)
 
-        # ── P3: Validate IDMAG direction ─────────────────────────────────────
+        # P3: Validate IDMAG direction
         quintile_df, low_idmag_wins = validate_idmag_direction(
             idmag_series, log_ret, forward_bars=_forward_bars
         )
         filter_direction_label = (
-            "Standard (remove high-IDMAG)" if low_idmag_wins
-            else "⚠️ INVERTED — removing low-IDMAG (high-IDMAG outperforms in this universe)"
+            "Standard (remove high-IDMAG)"
+            if low_idmag_wins
+            else "INVERTED: removing low-IDMAG (high-IDMAG outperforms here)"
         )
 
-        # ── Apply IDMAG filter ───────────────────────────────────────────────
+        # Apply IDMAG filter
         if idmag_filter_enabled and not idmag_series.dropna().empty:
             kept_coins, removed_coins = apply_idmag_filter(
                 idmag_series, log_ret,
@@ -496,12 +512,12 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
                 low_idmag_wins=low_idmag_wins,
             )
         else:
-            kept_coins = list(log_ret.columns)
+            kept_coins    = list(log_ret.columns)
             removed_coins = []
 
         vol_scaled = vol_scaled_all[kept_coins]
 
-        # ── Universe momentum  (P7: same lookback as theme) ─────────────────
+        # Universe momentum (P7: same lookback as theme)
         z_scores_u, ranks_u = calculate_momentum_scores(
             vol_scaled,
             lookback_bars=_momentum_bars,
@@ -513,27 +529,22 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
             ranks_u, top_n=int(top_n_universe), bottom_n=int(bottom_n_universe)
         )
 
-        # ── Latest universe signals ──────────────────────────────────────────
         last_ts = ranks_u.index[-1] if len(ranks_u) > 0 else None
-        universe_buy_latest  = buy_signals_u.iloc[-1]  if len(buy_signals_u)  > 0 else []
-        universe_sell_latest = sell_signals_u.iloc[-1] if len(sell_signals_u) > 0 else []
-        if not isinstance(universe_buy_latest, list):
-            universe_buy_latest  = list(universe_buy_latest)  if hasattr(universe_buy_latest, '__iter__') else []
-        if not isinstance(universe_sell_latest, list):
-            universe_sell_latest = list(universe_sell_latest) if hasattr(universe_sell_latest, '__iter__') else []
 
-        # ── Theme-level momentum  (P7: same lookback_bars) ──────────────────
+        universe_buy_latest  = list(buy_signals_u.iloc[-1])  if len(buy_signals_u)  > 0 else []
+        universe_sell_latest = list(sell_signals_u.iloc[-1]) if len(sell_signals_u) > 0 else []
+
+        # Theme-level momentum (P7: unified lookback)
         filtered_tickers = vol_scaled.columns.tolist()
         theme_map = {t: ticker_to_theme.get(t, "UNKNOWN") for t in filtered_tickers}
-
         theme_list = sorted({
             th for th in theme_map.values()
             if th and th.upper() != "UNKNOWN"
         })
 
-        all_theme_signals_row = {}
-        consolidated_rows = []
-        theme_diagnostics = {}
+        all_theme_signals_row: Dict = {}
+        consolidated_rows: List    = []
+        theme_diagnostics: Dict    = {}
 
         for theme in theme_list:
             theme_tickers = [t for t in filtered_tickers if theme_map.get(t) == theme]
@@ -543,33 +554,36 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
             th_vol = vol_scaled[theme_tickers]
             z_th, rk_th = calculate_momentum_scores(
                 th_vol,
-                lookback_bars=_momentum_bars,   # P7: unified
+                lookback_bars=_momentum_bars,
                 exclude_bars=_skip_bars,
                 cs_std_min=float(cs_std_min),
                 winsorize_pct=float(winsorize_pct),
             )
-            buy_th, sell_th = generate_signals(
+            buy_th,  sell_th  = generate_signals(
                 rk_th, top_n=int(top_n_theme), bottom_n=int(bottom_n_theme)
             )
-
             buy_last  = list(buy_th.iloc[-1])  if len(buy_th)  > 0 else []
             sell_last = list(sell_th.iloc[-1]) if len(sell_th) > 0 else []
 
             all_theme_signals_row[theme] = {"buy": buy_last, "sell": sell_last}
 
-            cs_std_last = th_vol.iloc[-_momentum_bars:].std(axis=1).iloc[-1] if len(th_vol) >= _momentum_bars else np.nan
+            cs_std_last = (
+                th_vol.iloc[-_momentum_bars:].std(axis=1).iloc[-1]
+                if len(th_vol) >= _momentum_bars else np.nan
+            )
+            cs_std_val = round(float(cs_std_last), 6) if not np.isnan(cs_std_last) else "NaN"
+            cs_below   = bool(cs_std_last < float(cs_std_min)) if not np.isnan(cs_std_last) else False
 
             theme_diagnostics[theme] = {
-                "n_coins": len(theme_tickers),
-                "cs_std_last_bar": round(float(cs_std_last), 6) if not np.isnan(cs_std_last) else "NaN",
-                "cs_std_below_guard": bool(cs_std_last < float(cs_std_min)) if not np.isnan(cs_std_last) else False,
+                "n_coins":           len(theme_tickers),
+                "cs_std_last_bar":   cs_std_val,
+                "cs_std_below_guard": cs_below,
             }
-
             consolidated_rows.append({
-                "Theme": theme,
+                "Theme":   theme,
                 "N coins": len(theme_tickers),
-                "Buy": ", ".join(buy_last),
-                "Sell": ", ".join(sell_last),
+                "Buy":     ", ".join(buy_last),
+                "Sell":    ", ".join(sell_last),
             })
 
         consolidated_signals = (
@@ -577,39 +591,37 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
             if consolidated_rows else pd.DataFrame()
         )
 
-        # ── Signal alignment matrix (P7) ─────────────────────────────────────
         alignment_df = build_alignment_matrix(
             universe_buy_latest, universe_sell_latest, all_theme_signals_row
         )
 
-        # ── Vol scaling comparison diagnostic ────────────────────────────────
-        full_period_std = log_ret[kept_coins].std()
+        # Vol scaling diagnostic
+        full_period_std    = log_ret[kept_coins].std()
         expanding_std_last = log_ret[kept_coins].expanding(
             min_periods=int(min_expanding_bars)
         ).std().iloc[-1]
         vol_ratio = (expanding_std_last / full_period_std).dropna()
 
-        # Store everything
         st.session_state["xs_mom_v2_results"] = {
-            "log_ret": log_ret,
-            "vol_scaled": vol_scaled,
-            "idmag_series": idmag_series,
-            "quintile_df": quintile_df,
-            "low_idmag_wins": low_idmag_wins,
+            "log_ret":               log_ret,
+            "vol_scaled":            vol_scaled,
+            "idmag_series":          idmag_series,
+            "quintile_df":           quintile_df,
+            "low_idmag_wins":        low_idmag_wins,
             "filter_direction_label": filter_direction_label,
-            "removed_coins": removed_coins,
-            "kept_coins": kept_coins,
-            "z_scores_u": z_scores_u,
-            "buy_signals_u": buy_signals_u,
-            "sell_signals_u": sell_signals_u,
-            "universe_buy_latest": universe_buy_latest,
-            "universe_sell_latest": universe_sell_latest,
-            "consolidated_signals": consolidated_signals,
-            "alignment_df": alignment_df,
-            "theme_diagnostics": theme_diagnostics,
-            "vol_ratio": vol_ratio,
-            "param_audit": param_audit,
-            "last_ts": last_ts,
+            "removed_coins":         removed_coins,
+            "kept_coins":            kept_coins,
+            "z_scores_u":            z_scores_u,
+            "buy_signals_u":         buy_signals_u,
+            "sell_signals_u":        sell_signals_u,
+            "universe_buy_latest":   universe_buy_latest,
+            "universe_sell_latest":  universe_sell_latest,
+            "consolidated_signals":  consolidated_signals,
+            "alignment_df":          alignment_df,
+            "theme_diagnostics":     theme_diagnostics,
+            "vol_ratio":             vol_ratio,
+            "param_audit":           param_audit,
+            "last_ts":               last_ts,
         }
 
 
@@ -622,25 +634,28 @@ if results is None:
     st.info("Click **Refresh / Recompute** in the sidebar to run the strategy.")
     st.stop()
 
-(
-    log_ret, vol_scaled, idmag_series, quintile_df, low_idmag_wins,
-    filter_direction_label, removed_coins, kept_coins,
-    z_scores_u, buy_signals_u, sell_signals_u,
-    universe_buy_latest, universe_sell_latest,
-    consolidated_signals, alignment_df, theme_diagnostics,
-    vol_ratio, param_audit, last_ts,
-) = (
-    results["log_ret"], results["vol_scaled"], results["idmag_series"],
-    results["quintile_df"], results["low_idmag_wins"],
-    results["filter_direction_label"], results["removed_coins"], results["kept_coins"],
-    results["z_scores_u"], results["buy_signals_u"], results["sell_signals_u"],
-    results["universe_buy_latest"], results["universe_sell_latest"],
-    results["consolidated_signals"], results["alignment_df"], results["theme_diagnostics"],
-    results["vol_ratio"], results["param_audit"], results["last_ts"],
-)
+log_ret               = results["log_ret"]
+vol_scaled            = results["vol_scaled"]
+idmag_series          = results["idmag_series"]
+quintile_df           = results["quintile_df"]
+low_idmag_wins        = results["low_idmag_wins"]
+filter_direction_label = results["filter_direction_label"]
+removed_coins         = results["removed_coins"]
+kept_coins            = results["kept_coins"]
+z_scores_u            = results["z_scores_u"]
+buy_signals_u         = results["buy_signals_u"]
+sell_signals_u        = results["sell_signals_u"]
+universe_buy_latest   = results["universe_buy_latest"]
+universe_sell_latest  = results["universe_sell_latest"]
+consolidated_signals  = results["consolidated_signals"]
+alignment_df          = results["alignment_df"]
+theme_diagnostics     = results["theme_diagnostics"]
+vol_ratio             = results["vol_ratio"]
+param_audit           = results["param_audit"]
+last_ts               = results["last_ts"]
 
 # ── Parameter audit ──────────────────────────────────────────────────────────
-with st.expander("📐 Parameter Audit (bar-count translation)", expanded=False):
+with st.expander("Parameter Audit (bar-count translation)", expanded=False):
     st.table(pd.DataFrame.from_dict(param_audit, orient="index", columns=["Value"]))
 
 # ── IDMAG section ─────────────────────────────────────────────────────────────
@@ -648,17 +663,29 @@ st.subheader("IDMAG Momentum Quality Filter")
 
 col_a, col_b = st.columns([1, 2])
 with col_a:
-    st.metric("Filter direction", filter_direction_label[:40])
-    st.metric("Coins removed", len(removed_coins))
-    st.metric("Coins retained", len(kept_coins))
+    st.metric("Filter direction", filter_direction_label[:50])
+    st.metric("Coins removed",   len(removed_coins))
+    st.metric("Coins retained",  len(kept_coins))
     if removed_coins:
         st.markdown("**Removed coins:**")
-        st.dataframe(pd.DataFrame({"Coin": removed_coins}), use_container_width=True, height=200)
+        st.dataframe(
+            pd.DataFrame({"Coin": removed_coins}),
+            use_container_width=True, height=200,
+        )
 
 with col_b:
     if quintile_df is not None and not quintile_df.empty:
-        bar_colors = ["#2e7d32" if v >= 0 else "#c62828"
-                      for v in quintile_df["mean_fwd_return"]]
+        bar_colors = [
+            "#2e7d32" if v >= 0 else "#c62828"
+            for v in quintile_df["mean_fwd_return"]
+        ]
+        annotation_text = (
+            "Low-IDMAG outperforms: standard filter correct"
+            if low_idmag_wins
+            else "High-IDMAG outperforms: filter INVERTED for this universe"
+        )
+        annotation_color = "#2e7d32" if low_idmag_wins else "#c62828"
+
         fig_idmag = go.Figure(go.Bar(
             x=quintile_df["quintile"].astype(str),
             y=quintile_df["mean_fwd_return"],
@@ -673,8 +700,8 @@ with col_b:
         ))
         fig_idmag.update_layout(
             title=(
-                "IDMAG Quintile → Mean Forward Return<br>"
-                "<sup>Q1 = lowest IDMAG (consistent momentum), Q5 = highest IDMAG (noisy momentum)</sup>"
+                "IDMAG Quintile — Mean Forward Return<br>"
+                "<sup>Q1 = lowest IDMAG (consistent), Q5 = highest IDMAG (noisy)</sup>"
             ),
             xaxis_title="IDMAG Quintile",
             yaxis_title="Mean forward log-return",
@@ -684,13 +711,9 @@ with col_b:
             paper_bgcolor="rgba(0,0,0,0)",
             annotations=[dict(
                 x=0.5, y=1.12, xref="paper", yref="paper",
-                text=(
-                    "✅ Low-IDMAG outperforms → standard filter correct"
-                    if low_idmag_wins
-                    else "⚠️ High-IDMAG outperforms → filter INVERTED for this universe"
-                ),
+                text=annotation_text,
                 showarrow=False,
-                font=dict(size=11, color="#2e7d32" if low_idmag_wins else "#c62828"),
+                font=dict(size=11, color=annotation_color),
             )],
         )
         st.plotly_chart(fig_idmag, use_container_width=True)
@@ -698,11 +721,10 @@ with col_b:
         st.info("Not enough data for IDMAG quintile validation.")
 
 # ── Vol scaling diagnostic ────────────────────────────────────────────────────
-with st.expander("🔬 Vol Scaling Diagnostic: Expanding vs Full-Period Std", expanded=False):
+with st.expander("Vol Scaling Diagnostic: Expanding vs Full-Period Std", expanded=False):
     st.markdown(
-        "Ratio of expanding-std (used in v2) to full-period-std (v1 lookahead). "
-        "Values < 1 mean the expanding estimate is tighter at this point in time — "
-        "showing where v1 was under-scaling (inflating momentum scores)."
+        "Ratio of expanding-std (v2, no lookahead) to full-period-std (v1 lookahead). "
+        "Values below 1 show where v1 was under-scaling and inflating momentum scores."
     )
     if not vol_ratio.empty:
         fig_vr = go.Figure(go.Bar(
@@ -710,27 +732,122 @@ with st.expander("🔬 Vol Scaling Diagnostic: Expanding vs Full-Period Std", ex
             y=vol_ratio.values,
             marker_color=["#1565c0" if v < 1 else "#e65100" for v in vol_ratio.values],
         ))
-        fig_vr.add_hline(y=1.0, line_dash="dash", line_color="gray",
-                         annotation_text="ratio = 1 (no difference)")
+        fig_vr.add_hline(
+            y=1.0, line_dash="dash", line_color="gray",
+            annotation_text="ratio = 1 (no difference)",
+        )
         fig_vr.update_layout(
             title="Expanding Std / Full-Period Std (last bar, per coin)",
-            xaxis_title="Coin", yaxis_title="Ratio",
-            height=320, margin=dict(t=40, b=60),
+            xaxis_title="Coin",
+            yaxis_title="Ratio",
+            height=320,
+            margin=dict(t=40, b=60),
             xaxis_tickangle=-45,
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
         )
         st.plotly_chart(fig_vr, use_container_width=True)
 
 # ── Momentum score distribution ───────────────────────────────────────────────
-with st.expander("📊 Momentum Score Distribution (latest bar)", expanded=False):
+with st.expander("Momentum Score Distribution (latest bar)", expanded=False):
     if not z_scores_u.empty:
-        last_z = z_scores_u.iloc[-1].dropna().sort_values(ascending=False)
-        colors = ["#2e7d32" if v > 0 else "#c62828" for v in last_z.values]
-        fig_zd = go.Figure(go.Bar(
-            x=last_z.index, y=last_z.values,
+        last_z   = z_scores_u.iloc[-1].dropna().sort_values(ascending=False)
+        ts_label = str(last_ts)[:16] if last_ts is not None else ""
+        colors   = ["#2e7d32" if v > 0 else "#c62828" for v in last_z.values]
+        fig_zd   = go.Figure(go.Bar(
+            x=last_z.index,
+            y=last_z.values,
             marker_color=colors,
         ))
         fig_zd.add_hline(y=0, line_dash="dot", line_color="white")
         fig_zd.update_layout(
-            title=f"Universe Momentum Z-scores — {str(last_ts)[:16]}",
-            xaxis_title="Coi
+            title="Universe Momentum Z-scores — " + ts_label,
+            xaxis_title="Coin",
+            yaxis_title="Z-score",
+            height=350,
+            margin=dict(t=40, b=60),
+            xaxis_tickangle=-45,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_zd, use_container_width=True)
+
+# ── Universe signals ──────────────────────────────────────────────────────────
+st.subheader("Excess Momentum Signals — Universe")
+
+ts_label_short = str(last_ts)[:16] if last_ts is not None else ""
+
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**Buy signals (latest: " + ts_label_short + ")**")
+    st.dataframe(
+        pd.DataFrame({"Coin": universe_buy_latest, "Signal": "BUY"}),
+        use_container_width=True, hide_index=True,
+    )
+with col2:
+    st.markdown("**Sell signals (latest: " + ts_label_short + ")**")
+    st.dataframe(
+        pd.DataFrame({"Coin": universe_sell_latest, "Signal": "SELL"}),
+        use_container_width=True, hide_index=True,
+    )
+
+with st.expander("All universe signals (all dates)", expanded=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Buy signals (all dates)**")
+        st.dataframe(signal_to_df(buy_signals_u), use_container_width=True)
+    with c2:
+        st.markdown("**Sell signals (all dates)**")
+        st.dataframe(signal_to_df(sell_signals_u), use_container_width=True)
+
+# ── Theme signals ─────────────────────────────────────────────────────────────
+st.subheader("Excess Momentum Signals — By Theme")
+
+if consolidated_signals is None or consolidated_signals.empty:
+    st.info("No theme-level signals. Check min coins per theme or data length.")
+else:
+    st.dataframe(consolidated_signals, use_container_width=True)
+
+# ── Signal alignment matrix (P7) ─────────────────────────────────────────────
+st.subheader("Universe vs Theme Signal Alignment")
+
+if alignment_df is None or alignment_df.empty:
+    st.info("No conflicts or alignments to display.")
+else:
+    def _color_alignment(val: str) -> str:
+        if "Aligned" in str(val):
+            return "background-color: #1a5c2a; color: white"
+        if "Conflict" in str(val):
+            return "background-color: #7b1a1a; color: white"
+        return ""
+
+    styled_align = alignment_df.style.applymap(_color_alignment, subset=["Alignment"])
+    st.dataframe(styled_align, use_container_width=True, hide_index=True)
+
+    n_conflicts = int(alignment_df["Alignment"].str.contains("Conflict").sum())
+    n_aligned   = int(alignment_df["Alignment"].str.contains("Aligned").sum())
+    st.markdown(
+        "**" + str(n_aligned) + " aligned signals** · "
+        "**" + str(n_conflicts) + " conflicting signals** "
+        "(conflicting = theme and universe disagree on direction)"
+    )
+
+# ── Theme cs-std health ───────────────────────────────────────────────────────
+with st.expander("Theme Cross-Sectional Std Health (P6 guard)", expanded=False):
+    cs_guard_str = "{:.2e}".format(float(cs_std_min))
+    st.markdown(
+        "Themes where the cross-sectional std falls below the guard threshold "
+        "(`" + cs_guard_str + "`) produce unreliable z-scores and are marked."
+    )
+    if theme_diagnostics:
+        diag_df = (
+            pd.DataFrame(theme_diagnostics)
+            .T.reset_index()
+            .rename(columns={"index": "Theme"})
+        )
+
+        def _flag_cs(val: object) -> str:
+            return "background-color: #7b1a1a; color: white" if val is True else ""
+
+        styled_diag = diag_df.style.applymap(_flag_cs, subset=["cs_std_below_guard"])
+        st.dataframe(styled_diag, use_container_width=True, hide_index=True)
