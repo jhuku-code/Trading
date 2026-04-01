@@ -9,21 +9,11 @@ st.set_page_config(page_title="Excess Return Scanner", layout="wide")
 st.title("Excess Return Scanner")
 
 # ─────────────────────────────────────────────
-# Cached computations
+# Cached: per-coin excess cumulative returns
 # ─────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def compute_excess_cumreturns(price_theme: pd.DataFrame, theme_values_aligned, cache_token):
-    """
-    For each coin compute:
-        excess_return[t] = coin_return[t] - theme_median_return[t]
-    Then cumsum the excess returns (additive, in %-pts).
-
-    Returns
-    -------
-    excess_cum  : pd.DataFrame  shape (n_dates, n_coins)
-    coin_themes : pd.Series     coin -> theme mapping
-    """
     df_prices = price_theme.copy()
     if not isinstance(df_prices.index, pd.DatetimeIndex):
         df_prices.index = pd.to_datetime(df_prices.index)
@@ -38,51 +28,115 @@ def compute_excess_cumreturns(price_theme: pd.DataFrame, theme_values_aligned, c
     else:
         coin_themes = pd.Series(["Unknown"] * len(price_theme.columns), index=price_theme.columns)
 
-    # theme median return at each date  →  (n_dates, n_themes)
     theme_median_ts = {}
     for theme in coin_themes.unique():
         coins_in = coin_themes[coin_themes == theme].index.tolist()
         theme_median_ts[theme] = returns[coins_in].median(axis=1)
     theme_median_df = pd.DataFrame(theme_median_ts)
 
-    # broadcast theme medians to coin level
     theme_median_per_coin = pd.DataFrame(
         {coin: theme_median_df[coin_themes[coin]] for coin in returns.columns},
         index=returns.index,
     )
 
-    excess_returns = returns - theme_median_per_coin   # (n_dates, n_coins)
-    excess_cum     = excess_returns.cumsum()           # additive cumsum in %-pts
+    excess_returns = returns - theme_median_per_coin
+    excess_cum     = excess_returns.cumsum()
 
     return excess_cum, coin_themes
 
 
 # ─────────────────────────────────────────────
-# Convexity classifier
+# Improved convexity classifier
 # ─────────────────────────────────────────────
 
 def classify_curvature(series: pd.Series, n_bars: int, flatness_thresh: float = 0.05):
     """
-    Fit quadratic y = a*x^2 + b*x + c to the last `n_bars` of `series`.
-    `a` is normalised by the y-range so the threshold is dimensionless.
+    Multi-criteria curvature classifier.
 
-    Returns 'convex', 'concave', or 'flat'.
+    A single global quadratic fit over the full window is unreliable:
+    a chart like EIGEN (big dip in the middle, slight uptick at the
+    tail) can produce a positive 'a' coefficient while still being an
+    overall loser; ADA (strong early rise then collapse) can also
+    appear convex globally despite falling hard recently.
+
+    Instead, three criteria must ALL agree before a non-flat label
+    is assigned:
+
+    Criterion 1 — NET DIRECTION (full window)
+        net_change = last value − first value
+        Must be positive for Buy, negative for Sell.
+        Eliminates EIGEN (net negative over the window).
+
+    Criterion 2 — RIGHT-SIDE QUADRATIC (last ⌈n/3⌉ bars only)
+        Fit y = ax² + bx + c to the most-recent third of the window.
+        For Buy:  a > thresh  AND  b > 0
+                  (curving upward AND currently sloping upward)
+        For Sell: a < −thresh AND  b < 0
+                  (curving downward AND currently sloping downward)
+        Requiring both a and b to agree in sign prevents a momentary
+        uptick at the tail of a falling chart (EIGEN) from qualifying
+        as convex, and prevents a big early rise (ADA) from carrying
+        through as convex once the right side is falling.
+
+    Criterion 3 — HALF-WINDOW SLOPE COMPARISON
+        Compare linear trend of the second half vs. the first half.
+        For Buy:  slope_second > slope_first   (accelerating up)
+        For Sell: slope_second < slope_first   (accelerating down)
+        ETHFI / BTC rise faster in their second half → Buy.
+        ADA rises in the first half then falls → slope_second much
+        lower than slope_first → correctly excluded from Buy and
+        flagged as Sell.
+
+    flatness_thresh is applied as a fraction of the full y-range so
+    the dead-band scales with the magnitude of the series.
     """
     s = series.dropna().tail(n_bars)
-    if len(s) < 5:
+    if len(s) < 9:
         return "flat"
-    x = np.arange(len(s), dtype=float)
-    y = s.values.astype(float)
-    x_norm = x / x[-1] if x[-1] != 0 else x
+
+    y_full  = s.values.astype(float)
+    y_range = np.ptp(y_full)
+    thresh  = flatness_thresh * y_range if y_range > 0 else flatness_thresh
+
+    # ── Criterion 1: net direction ───────────────────────────────
+    net_change = y_full[-1] - y_full[0]
+    if abs(net_change) < thresh:
+        return "flat"
+    net_up = net_change > 0
+
+    # ── Criterion 2: right-side quadratic (last third) ───────────
+    right_n = max(5, len(s) // 3)
+    y_right = y_full[-right_n:]
+    x_right = np.arange(len(y_right), dtype=float)
+    x_norm  = x_right / x_right[-1] if x_right[-1] != 0 else x_right
+
     try:
-        coeffs = np.polyfit(x_norm, y, 2)
+        a, b, _ = np.polyfit(x_norm, y_right, 2)
     except Exception:
         return "flat"
-    a      = coeffs[0]
-    y_range = np.ptp(y)
-    thresh  = flatness_thresh * y_range if y_range > 0 else flatness_thresh
-    if   a >  thresh: return "convex"
-    elif a < -thresh: return "concave"
+
+    right_convex  = (a >  thresh) and (b >  0)
+    right_concave = (a < -thresh) and (b <  0)
+
+    # ── Criterion 3: second-half slope vs. first-half slope ──────
+    mid = len(y_full) // 2
+    x_h = np.arange(mid, dtype=float)
+
+    try:
+        slope_first  = np.polyfit(x_h, y_full[:mid], 1)[0]
+        end_idx      = min(mid * 2, len(y_full))
+        slope_second = np.polyfit(x_h[:end_idx - mid], y_full[mid:end_idx], 1)[0]
+    except Exception:
+        return "flat"
+
+    accelerating_up   = slope_second > slope_first
+    accelerating_down = slope_second < slope_first
+
+    # ── Final decision: all three must agree ─────────────────────
+    if net_up and right_convex and accelerating_up:
+        return "convex"
+    if (not net_up) and right_concave and accelerating_down:
+        return "concave"
     return "flat"
 
 
@@ -119,7 +173,7 @@ excess_cum, coin_themes = compute_excess_cumreturns(price_theme, theme_values, c
 st.subheader("Coin Excess Returns vs. Theme Average")
 st.caption(
     "Each coin's return minus its theme median return, cumulated over time (additive, %-pts). "
-    "Positive = outperforming theme; Negative = underperforming."
+    "Positive = outperforming theme;  Negative = underperforming."
 )
 
 excess_n_bars = st.number_input(
@@ -135,8 +189,8 @@ for theme in sorted(coin_themes.unique()):
     if not coins:
         continue
     with st.expander(f"Theme: {theme}  ({len(coins)} coins)", expanded=False):
-        n_cols = min(4, len(coins))
-        rows   = (len(coins) + n_cols - 1) // n_cols
+        n_cols   = min(4, len(coins))
+        rows     = (len(coins) + n_cols - 1) // n_cols
         fig_grid = make_subplots(
             rows=rows, cols=n_cols,
             subplot_titles=coins,
@@ -166,15 +220,18 @@ for theme in sorted(coin_themes.unique()):
 st.markdown("---")
 st.subheader("Convexity Scanner — Buy / Sell Signals")
 st.caption(
-    "Fits a quadratic to the right-most N bars of each coin's excess-cumulative-return chart. "
-    "Convex (∪) → gaining → **Buy**.  Concave (∩) → losing → **Sell**.  Flat → ignored."
+    "**Buy (Convex ↑):** net positive over the window  +  right side curving & sloping upward  "
+    "+  second half accelerating vs. first half.  \n"
+    "**Sell (Concave ↓):** net negative over the window  +  right side curving & sloping downward  "
+    "+  second half decelerating vs. first half.  \n"
+    "All three criteria must agree — reduces false signals from mid-window spikes/dips."
 )
 
 col_a, col_b, _ = st.columns(3)
 with col_a:
     scan_n_bars = st.number_input(
         "Bars to scan (right-most window)",
-        min_value=5, max_value=len(excess_cum), value=min(90, len(excess_cum)), step=1,
+        min_value=9, max_value=len(excess_cum), value=min(90, len(excess_cum)), step=1,
         key="scan_n_bars",
     )
 with col_b:
@@ -182,10 +239,12 @@ with col_b:
         "Flatness threshold  (0 = very sensitive · 0.5 = strict)",
         min_value=0.0, max_value=0.5, value=0.05, step=0.01,
         key="flatness_thresh",
-        help="Fraction of the y-range used as dead-band for 'flat' classification.",
+        help=(
+            "Fraction of the full-window y-range used as dead-band. "
+            "Increase to require stronger moves before signalling."
+        ),
     )
 
-# Classify every coin
 classifications = {
     coin: classify_curvature(excess_cum[coin], int(scan_n_bars), flatness_thresh)
     for coin in excess_cum.columns
@@ -195,7 +254,7 @@ buy_by_theme:  dict[str, list[str]] = {}
 sell_by_theme: dict[str, list[str]] = {}
 for coin, label in classifications.items():
     theme = coin_themes.get(coin, "Unknown")
-    if   label == "convex":  buy_by_theme.setdefault(theme, []).append(coin)
+    if   label == "convex":  buy_by_theme.setdefault(theme,  []).append(coin)
     elif label == "concave": sell_by_theme.setdefault(theme, []).append(coin)
 
 table_rows = []
@@ -259,7 +318,7 @@ if selected_coin:
 
     color_map  = {"convex": "#4ade80", "concave": "#f87171", "flat": "#94a3b8"}
     line_color = color_map[shape_label]
-    fill_color = line_color + "26"   # 15 % opacity hex suffix
+    fill_color = line_color + "26"
 
     fig_coin = go.Figure()
     fig_coin.add_trace(
