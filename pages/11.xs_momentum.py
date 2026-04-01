@@ -10,9 +10,7 @@ P3  IDMAG filter direction validated empirically: coins are binned into
     quintiles and forward returns are compared. If low-IDMAG does NOT
     outperform high-IDMAG in this universe, the filter is inverted or
     disabled, and a diagnostic chart is shown.
-P5  exclude_last is expressed in hours; bars are derived from data frequency
-    automatically so the short-term reversal skip is always economically
-    meaningful regardless of bar size.
+P5  exclude_last is expressed in bars, derived from data frequency label.
 P6  Cross-sectional std guard: z-scores are set to NaN when cs-std is below
     a minimum threshold to avoid division-by-near-zero in small theme baskets.
 P7  Lookback windows unified: one sidebar parameter drives both universe and
@@ -21,11 +19,11 @@ P7  Lookback windows unified: one sidebar parameter drives both universe and
 
 Diagnostics added
 ------------------
-• IDMAG quintile forward-return chart (validates filter direction)
-• Vol scaling comparison: expanding vs full-period std
-• Momentum score distribution per timestamp
-• Universe vs theme signal alignment matrix
-• Parameter audit table showing effective bar counts for each window
+- IDMAG quintile forward-return chart (validates filter direction)
+- Vol scaling comparison: expanding vs full-period std
+- Momentum score distribution per timestamp
+- Universe vs theme signal alignment matrix
+- Parameter audit table showing effective bar counts for each window
 """
 
 import warnings
@@ -66,46 +64,79 @@ if ticker_to_theme is None:
     st.stop()
 
 # ---------------------------------------------------------
+# INFER DATA FREQUENCY
+# ---------------------------------------------------------
+
+def infer_data_frequency(df: pd.DataFrame) -> Tuple[str, float]:
+    """
+    Infer data frequency from the DataFrame index.
+    Returns (label, bar_hours) where label is a human-readable string
+    like '1D' or '4H', and bar_hours is the median bar size in hours.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) < 2:
+        return "Unknown", 4.0
+    diffs = df.index.to_series().diff().dropna()
+    median_hours = diffs.median().total_seconds() / 3600.0
+
+    if 20 <= median_hours <= 28:
+        return "Daily (1D)", median_hours
+    elif 3.5 <= median_hours <= 4.5:
+        return "4-Hour (4H)", median_hours
+    elif 0.9 <= median_hours <= 1.1:
+        return "1-Hour (1H)", median_hours
+    else:
+        return f"~{median_hours:.1f}H", median_hours
+
+freq_label, bar_hours = infer_data_frequency(df_raw)
+is_daily = "1D" in freq_label or "Daily" in freq_label
+
+# Human-readable period label for sidebar
+period_unit = "days" if is_daily else "bars"
+period_unit_cap = period_unit.capitalize()
+
+# ---------------------------------------------------------
 # SIDEBAR PARAMETERS
 # ---------------------------------------------------------
 st.sidebar.header("Parameters")
 
-with st.sidebar.expander("Data Frequency", expanded=True):
-    bar_hours = st.number_input(
-        "Bar size (hours)",
-        min_value=0.25, max_value=24.0, value=4.0, step=0.25,
-        help="Used to convert hour-based windows to bar counts.",
-        key="bar_hours",
-    )
+st.sidebar.info(f"📅 Detected frequency: **{freq_label}** ({bar_hours:.2f}h/bar)")
 
-with st.sidebar.expander("Momentum Windows (hours)", expanded=True):
-    momentum_hours = st.number_input(
-        "Momentum lookback (hours)",
-        min_value=24, max_value=8760, value=240, step=24,
-        help="Same lookback applied at universe AND theme level.",
-        key="momentum_hours",
+# Default lookback values — in bars, scaled to be economically meaningful
+# For daily: 60 days ≈ 3 months. For 4H: 60 bars ≈ 10 days.
+# We keep the same bar counts but display them with the right unit.
+_default_momentum = 60 if is_daily else 60
+_default_skip     = 1  if is_daily else 6
+_default_idmag    = 120 if is_daily else 120
+
+with st.sidebar.expander(f"Momentum Windows ({period_unit_cap})", expanded=True):
+    momentum_bars = st.number_input(
+        f"Momentum lookback ({period_unit})",
+        min_value=5, max_value=2000, value=_default_momentum, step=1,
+        help=f"Same lookback applied at universe AND theme level. "
+             f"1 {period_unit[:-1]} = {bar_hours:.2f}h of data.",
+        key="momentum_bars",
     )
-    skip_hours = st.number_input(
-        "Short-term reversal skip (hours)",
-        min_value=0, max_value=336, value=24, step=4,
+    skip_bars = st.number_input(
+        f"Short-term reversal skip ({period_unit})",
+        min_value=0, max_value=100, value=_default_skip, step=1,
         help=(
-            "Bars shifted before computing cumulative return. "
-            "Avoids the short-term reversal effect. "
-            "24h is a reasonable default for 4H data."
+            f"Bars shifted before computing cumulative return. "
+            f"Avoids the short-term reversal effect. "
+            f"{'1 day' if is_daily else '6 bars (24h)'} is a reasonable default."
         ),
-        key="skip_hours",
+        key="skip_bars",
     )
-    idmag_hours = st.number_input(
-        "IDMAG lookback (hours)",
-        min_value=24, max_value=8760, value=480, step=24,
+    idmag_bars = st.number_input(
+        f"IDMAG lookback ({period_unit})",
+        min_value=5, max_value=2000, value=_default_idmag, step=1,
         help=(
-            "Should be close to (or equal to) the momentum lookback "
-            "so IDMAG quality and momentum signal measure the same window."
+            f"Should be close to (or equal to) the momentum lookback "
+            f"so IDMAG quality and momentum signal measure the same window."
         ),
-        key="idmag_hours",
+        key="idmag_bars",
     )
     min_expanding_bars = st.number_input(
-        "Min bars for expanding vol (warm-up)",
+        f"Min {period_unit} for expanding vol (warm-up)",
         min_value=5, max_value=100, value=20, step=5,
         key="min_expanding_bars",
     )
@@ -158,21 +189,14 @@ if "xs_mom_v2_results" not in st.session_state:
 # UTILITIES
 # =============================================================
 
-def bars_from_hours(hours: float, bar_hours: float) -> int:
-    """Convert an hour-denominated window to a bar count."""
-    return max(1, int(round(hours / bar_hours)))
-
-
-def infer_bar_hours(df: pd.DataFrame) -> float:
-    """
-    Infer the median bar size in hours from the DataFrame index.
-    Falls back to the user-supplied value if inference fails.
-    """
-    if not isinstance(df.index, pd.DatetimeIndex) or len(df) < 2:
-        return float(bar_hours)
-    diffs = df.index.to_series().diff().dropna()
-    median_diff = diffs.median()
-    return median_diff.total_seconds() / 3600.0
+def bars_to_human(n_bars: int, bar_hours: float, is_daily: bool) -> str:
+    """Convert a bar count to a human-readable duration string."""
+    if is_daily:
+        return f"{n_bars}d"
+    total_hours = n_bars * bar_hours
+    if total_hours >= 24:
+        return f"{total_hours/24:.1f}d ({n_bars} bars)"
+    return f"{total_hours:.0f}h ({n_bars} bars)"
 
 
 # =============================================================
@@ -185,7 +209,6 @@ def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
     Rolling sum of log returns = ln of compounded return (geometrically exact).
     """
     lr = np.log(prices / prices.shift(1))
-    # Drop the first row (all NaN) and any all-NaN columns
     lr = lr.iloc[1:]
     lr = lr.dropna(axis=1, how="all")
     return lr
@@ -202,14 +225,11 @@ def expanding_vol_scale(
     """
     Scale each bar's return by the expanding std known BEFORE that bar.
     expanding_std is shifted by 1 so we never use the current bar's return
-    in its own denominator.
-    No lookahead bias.
+    in its own denominator. No lookahead bias.
     """
     expanding_std = log_returns.expanding(min_periods=min_periods).std().shift(1)
-    # Guard: never divide by near-zero vol
     expanding_std = expanding_std.replace(0, np.nan)
     scaled = log_returns / expanding_std
-    # Clip extreme values (5-sigma) without lookahead
     scaled = scaled.clip(lower=-5, upper=5)
     return scaled
 
@@ -268,22 +288,13 @@ def validate_idmag_direction(
 ) -> Tuple[pd.DataFrame, bool]:
     """
     P3: Empirically test whether low-IDMAG coins outperform high-IDMAG coins.
-
-    Returns
-    -------
-    quintile_df : DataFrame with columns [IDMAG_quintile, mean_fwd_return, median_fwd_return]
-    low_idmag_wins : bool
-        True  → standard filter (remove high IDMAG) is correct for this universe.
-        False → filter should be inverted (or disabled).
     """
     valid_coins = idmag.dropna().index.tolist()
     valid_coins = [c for c in valid_coins if c in log_returns.columns]
     if len(valid_coins) < n_quintiles:
-        return pd.DataFrame(), True  # not enough data — assume standard direction
+        return pd.DataFrame(), True
 
-    # Forward return: sum of next `forward_bars` log returns for each coin
     fwd_return = log_returns[valid_coins].iloc[-forward_bars:].sum()
-
     combined = pd.DataFrame({"IDMAG": idmag[valid_coins], "fwd_return": fwd_return})
     combined = combined.dropna()
 
@@ -303,7 +314,6 @@ def validate_idmag_direction(
         .reset_index()
     )
 
-    # low-IDMAG = Q1. If Q1 mean_fwd > Q5 mean_fwd → standard direction is correct
     if len(quintile_df) >= 2:
         q1_ret = quintile_df.loc[quintile_df["quintile"] == "Q1", "mean_fwd_return"].values
         q5_ret = quintile_df.loc[quintile_df["quintile"] == "Q5", "mean_fwd_return"].values
@@ -324,8 +334,6 @@ def apply_idmag_filter(
 ) -> Tuple[List[str], List[str]]:
     """
     Returns (kept_coins, removed_coins).
-    If low_idmag_wins → remove top `filter_pct` by IDMAG (high-IDMAG).
-    If not            → remove bottom `filter_pct` by IDMAG (low-IDMAG).
     """
     valid = idmag.dropna()
     valid = valid[valid.index.isin(log_returns.columns)]
@@ -354,18 +362,11 @@ def calculate_momentum_scores(
     """
     Momentum = rolling sum of vol-scaled log returns over lookback_bars,
     after skipping the most recent exclude_bars (reversal avoidance).
-
-    Winsorization uses EXPANDING quantiles to avoid lookahead bias.  (P1/P2 fix)
-
-    Z-score guard: cs-std below cs_std_min → NaN row.  (P6)
     """
-    # Skip recent bars
     shifted = vol_scaled.shift(exclude_bars)
-
-    # Rolling sum of log returns = log of compounded return
     cum_ret = shifted.rolling(window=lookback_bars, min_periods=lookback_bars // 2).sum()
 
-    # Winsorize using expanding quantiles — no lookahead (P1 extension)
+    # Winsorize using expanding quantiles — no lookahead
     cum_ret_winsorized = cum_ret.copy()
     for col in cum_ret.columns:
         series = cum_ret[col]
@@ -373,16 +374,10 @@ def calculate_momentum_scores(
         hi = series.expanding(min_periods=10).quantile(1 - winsorize_pct)
         cum_ret_winsorized[col] = series.clip(lower=lo, upper=hi)
 
-    # Cross-sectional z-score with std guard  (P6)
     cs_mean = cum_ret_winsorized.mean(axis=1)
     cs_std = cum_ret_winsorized.std(axis=1)
-
-    # Mask rows where cs-std is too small
     cs_std_safe = cs_std.where(cs_std >= cs_std_min, other=np.nan)
-
     z_scores = cum_ret_winsorized.sub(cs_mean, axis=0).div(cs_std_safe, axis=0)
-
-    # Rank: rank 1 = best momentum
     ranks = z_scores.rank(axis=1, ascending=False)
 
     return z_scores, ranks
@@ -427,10 +422,6 @@ def build_alignment_matrix(
     universe_sell: List[str],
     theme_signals: Dict[str, Dict[str, List[str]]],
 ) -> pd.DataFrame:
-    """
-    For the latest timestamp, show whether each coin's theme-level signal
-    agrees with, conflicts with, or is absent from the universe signal.
-    """
     rows = []
     for theme, signals in theme_signals.items():
         for coin in signals.get("buy", []):
@@ -459,24 +450,24 @@ def build_alignment_matrix(
 if refresh or st.session_state["xs_mom_v2_results"] is None:
     with st.spinner("Computing signals…"):
 
-        # ── Infer or use user-supplied bar size ──────────────────────────────
-        inferred_bar_h = infer_bar_hours(df_raw)
-        effective_bar_h = float(bar_hours) if not np.isclose(inferred_bar_h, float(bar_hours), rtol=0.2) \
-                          else inferred_bar_h
-
-        # Convert all hour-based windows to bar counts (P5)
-        momentum_bars = bars_from_hours(float(momentum_hours), effective_bar_h)
-        exclude_bars  = bars_from_hours(float(skip_hours), effective_bar_h)
-        idmag_bars    = bars_from_hours(float(idmag_hours), effective_bar_h)
-        forward_bars  = bars_from_hours(float(momentum_hours), effective_bar_h)  # for IDMAG validation
+        # All windows are already in bars — no conversion needed.
+        # bar_hours is used only for human-readable audit labels.
+        _momentum_bars  = int(momentum_bars)
+        _skip_bars      = int(skip_bars)
+        _idmag_bars     = int(idmag_bars)
+        _forward_bars   = int(momentum_bars)   # IDMAG forward validation = same as momentum
 
         param_audit = {
-            "Effective bar size (h)": round(effective_bar_h, 2),
-            "Momentum lookback (bars)": momentum_bars,
-            "Reversal skip (bars)": exclude_bars,
-            "IDMAG lookback (bars)": idmag_bars,
-            "IDMAG forward validation (bars)": forward_bars,
-            "Min expanding vol bars": int(min_expanding_bars),
+            "Detected frequency": freq_label,
+            "Bar size (hours)": round(bar_hours, 2),
+            f"Momentum lookback ({period_unit})": _momentum_bars,
+            "Momentum lookback (equivalent time)": bars_to_human(_momentum_bars, bar_hours, is_daily),
+            f"Reversal skip ({period_unit})": _skip_bars,
+            "Reversal skip (equivalent time)": bars_to_human(_skip_bars, bar_hours, is_daily),
+            f"IDMAG lookback ({period_unit})": _idmag_bars,
+            "IDMAG lookback (equivalent time)": bars_to_human(_idmag_bars, bar_hours, is_daily),
+            f"IDMAG forward validation ({period_unit})": _forward_bars,
+            f"Min expanding vol ({period_unit})": int(min_expanding_bars),
         }
 
         # ── P2: Log returns ──────────────────────────────────────────────────
@@ -486,11 +477,11 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
         vol_scaled_all = expanding_vol_scale(log_ret, min_periods=int(min_expanding_bars))
 
         # ── IDMAG ────────────────────────────────────────────────────────────
-        idmag_series = compute_idmag(log_ret, lookback_bars=idmag_bars)
+        idmag_series = compute_idmag(log_ret, lookback_bars=_idmag_bars)
 
         # ── P3: Validate IDMAG direction ─────────────────────────────────────
         quintile_df, low_idmag_wins = validate_idmag_direction(
-            idmag_series, log_ret, forward_bars=forward_bars
+            idmag_series, log_ret, forward_bars=_forward_bars
         )
         filter_direction_label = (
             "Standard (remove high-IDMAG)" if low_idmag_wins
@@ -513,8 +504,8 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
         # ── Universe momentum  (P7: same lookback as theme) ─────────────────
         z_scores_u, ranks_u = calculate_momentum_scores(
             vol_scaled,
-            lookback_bars=momentum_bars,
-            exclude_bars=exclude_bars,
+            lookback_bars=_momentum_bars,
+            exclude_bars=_skip_bars,
             cs_std_min=float(cs_std_min),
             winsorize_pct=float(winsorize_pct),
         )
@@ -552,8 +543,8 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
             th_vol = vol_scaled[theme_tickers]
             z_th, rk_th = calculate_momentum_scores(
                 th_vol,
-                lookback_bars=momentum_bars,   # P7: unified
-                exclude_bars=exclude_bars,
+                lookback_bars=_momentum_bars,   # P7: unified
+                exclude_bars=_skip_bars,
                 cs_std_min=float(cs_std_min),
                 winsorize_pct=float(winsorize_pct),
             )
@@ -566,8 +557,7 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
 
             all_theme_signals_row[theme] = {"buy": buy_last, "sell": sell_last}
 
-            # cs-std health for this theme at last bar
-            cs_std_last = th_vol.iloc[-momentum_bars:].std(axis=1).iloc[-1] if len(th_vol) >= momentum_bars else np.nan
+            cs_std_last = th_vol.iloc[-_momentum_bars:].std(axis=1).iloc[-1] if len(th_vol) >= _momentum_bars else np.nan
 
             theme_diagnostics[theme] = {
                 "n_coins": len(theme_tickers),
@@ -593,7 +583,6 @@ if refresh or st.session_state["xs_mom_v2_results"] is None:
         )
 
         # ── Vol scaling comparison diagnostic ────────────────────────────────
-        # Show ratio of expanding-scaled vol vs full-period-scaled vol for last bar
         full_period_std = log_ret[kept_coins].std()
         expanding_std_last = log_ret[kept_coins].expanding(
             min_periods=int(min_expanding_bars)
@@ -667,7 +656,6 @@ with col_a:
         st.dataframe(pd.DataFrame({"Coin": removed_coins}), use_container_width=True, height=200)
 
 with col_b:
-    # P3: IDMAG quintile forward-return validation chart
     if quintile_df is not None and not quintile_df.empty:
         bar_colors = ["#2e7d32" if v >= 0 else "#c62828"
                       for v in quintile_df["mean_fwd_return"]]
@@ -745,80 +733,4 @@ with st.expander("📊 Momentum Score Distribution (latest bar)", expanded=False
         fig_zd.add_hline(y=0, line_dash="dot", line_color="white")
         fig_zd.update_layout(
             title=f"Universe Momentum Z-scores — {str(last_ts)[:16]}",
-            xaxis_title="Coin", yaxis_title="Z-score",
-            height=350, margin=dict(t=40, b=60),
-            xaxis_tickangle=-45,
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_zd, use_container_width=True)
-
-# ── Universe signals ──────────────────────────────────────────────────────────
-st.subheader("Excess Momentum Signals — Universe")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.markdown(f"**Buy signals (latest: {str(last_ts)[:16]})**")
-    st.dataframe(
-        pd.DataFrame({"Coin": universe_buy_latest, "Signal": "BUY"}),
-        use_container_width=True, hide_index=True,
-    )
-
-with col2:
-    st.markdown(f"**Sell signals (latest: {str(last_ts)[:16]})**")
-    st.dataframe(
-        pd.DataFrame({"Coin": universe_sell_latest, "Signal": "SELL"}),
-        use_container_width=True, hide_index=True,
-    )
-
-with st.expander("All universe signals (all dates)", expanded=False):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Buy signals (all dates)**")
-        st.dataframe(signal_to_df(buy_signals_u), use_container_width=True)
-    with c2:
-        st.markdown("**Sell signals (all dates)**")
-        st.dataframe(signal_to_df(sell_signals_u), use_container_width=True)
-
-# ── Theme signals ─────────────────────────────────────────────────────────────
-st.subheader("Excess Momentum Signals — By Theme")
-
-if consolidated_signals is None or consolidated_signals.empty:
-    st.info("No theme-level signals. Check min coins per theme or data length.")
-else:
-    st.dataframe(consolidated_signals, use_container_width=True)
-
-# ── Signal alignment matrix (P7) ─────────────────────────────────────────────
-st.subheader("Universe ↔ Theme Signal Alignment")
-
-if alignment_df is None or alignment_df.empty:
-    st.info("No conflicts or alignments to display.")
-else:
-    def _color_alignment(val):
-        if "Aligned" in str(val):
-            return "background-color: #1a5c2a; color: white"
-        elif "Conflict" in str(val):
-            return "background-color: #7b1a1a; color: white"
-        return ""
-
-    styled_align = alignment_df.style.applymap(_color_alignment, subset=["Alignment"])
-    st.dataframe(styled_align, use_container_width=True, hide_index=True)
-
-    n_conflicts = alignment_df["Alignment"].str.contains("Conflict").sum()
-    n_aligned   = alignment_df["Alignment"].str.contains("Aligned").sum()
-    st.markdown(
-        f"**{n_aligned} aligned signals** · **{n_conflicts} conflicting signals** "
-        f"(conflicting = theme and universe disagree on direction)"
-    )
-
-# ── Theme cs-std health ───────────────────────────────────────────────────────
-with st.expander("🏥 Theme Cross-Sectional Std Health (P6 guard)", expanded=False):
-    st.markdown(
-        "Themes where the cross-sectional std falls below the guard threshold "
-        f"(`{float(cs_std_min):.2e}`) produce unreliable z-scores and are marked."
-    )
-    if theme_diagnostics:
-        diag_df = pd.DataFrame(theme_diagnostics).T.reset_index().rename(columns={"index": "Theme"})
-        def _flag_cs(val):
-            return "background-color: #7b1a1a; color: white" if val is True else ""
-        styled_diag = diag_df.style.applymap(_flag_cs, subset=["cs_std_below_guard"])
-        st.dataframe(styled_diag, use_container_width=True, hide_index=True)
+            xaxis_title="Coi
