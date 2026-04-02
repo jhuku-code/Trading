@@ -18,7 +18,7 @@ GEX formula (per contract):
   This is a *modelling convention*, not a statement that any single dealer is
   literally long gamma on calls; actual desk positioning varies.
 
-Total GEX = Σ GEX_i  (USD, reported in billions for readability)
+Total GEX = Σ GEX_i  (USD, reported in thousands for readability)
 
 Positive GEX → Market-stabilising (mean-reverting, low vol)
 Negative GEX → Market-destabilising (trending, high vol)
@@ -30,13 +30,14 @@ Fixes vs. v1
 2. Sign conv  – code unchanged (+1 calls / −1 puts); misleading docstring fixed.
 3. OTM filter – instruments with |delta| < 0.05 or > 0.95 are excluded (deep
                 OTM/ITM: near-zero gamma, unreliable IV, stale OI artefacts).
-4. DTE filter – instruments with tte_days < 2 are excluded (expiry-day pinning
-                is a distinct phenomenon; gamma explodes to noise levels).
-5. Stale UI   – sidebar `max_expiry_days` change now triggers an automatic
+4. Stale UI   – sidebar `max_expiry_days` change now triggers an automatic
                 re-fetch without requiring the user to click Refresh.
-6. Flip level – zero-crossing nearest to spot is used instead of first crossing.
-7. Deprecation– `datetime.utcfromtimestamp` replaced with timezone-aware call.
-8. Rate limit – 50 ms sleep between order-book requests to respect Deribit limits.
+5. Flip level – zero-crossing nearest to spot is used instead of first crossing.
+6. Deprecation– `datetime.utcfromtimestamp` replaced with timezone-aware call.
+7. Rate limit – 50 ms sleep between order-book requests to respect Deribit limits.
+8. Key levels – Call wall, put wall, and GEX flip level shown as header cards.
+9. Units      – All GEX values shown in USD thousands (not billions) with comma
+                delimitation for readability.
 """
 
 import math
@@ -161,7 +162,7 @@ def compute_gex(currency: str = "BTC", max_expiry_days: int = 60) -> tuple:
 
     rows    = []
     errors  = []
-    skipped = {"dte": 0, "delta": 0, "no_data": 0}
+    skipped = {"delta": 0, "no_data": 0}
     progress = st.progress(0, text="Fetching options chain…")
 
     for idx, inst in enumerate(filtered):
@@ -170,11 +171,9 @@ def compute_gex(currency: str = "BTC", max_expiry_days: int = 60) -> tuple:
             text=f"Fetching {idx + 1}/{len(filtered)}: {inst['instrument_name']}",
         )
 
-        # ── Fix 4: DTE < 2 filter ─────────────────────────────────────────
+        # DTE filter removed — all instruments including sub-2-day expiries included.
+        # Expiry-day pinning effects are captured in the data rather than excluded.
         tte_days = (inst["expiration_timestamp"] - now_ms) / 86_400_000
-        if tte_days < 2:
-            skipped["dte"] += 1
-            continue
 
         try:
             ob = get_order_book(inst["instrument_name"])
@@ -244,7 +243,7 @@ def compute_gex(currency: str = "BTC", max_expiry_days: int = 60) -> tuple:
     if not rows:
         raise ValueError(
             "No option data passed filters. "
-            f"Skipped — DTE<2: {skipped['dte']}, deep OTM/ITM: {skipped['delta']}, "
+            f"Skipped — deep OTM/ITM: {skipped['delta']}, "
             f"no data / zero OI: {skipped['no_data']}."
         )
 
@@ -258,8 +257,8 @@ def compute_gex(currency: str = "BTC", max_expiry_days: int = 60) -> tuple:
         .reset_index()
         .sort_values("strike")
     )
-    df_by_strike["gex_bn"] = df_by_strike["gex"] / 1e9
-    df_by_strike["color"]  = df_by_strike["gex_bn"].apply(
+    df_by_strike["gex_k"] = df_by_strike["gex"] / 1e3
+    df_by_strike["color"] = df_by_strike["gex_k"].apply(
         lambda x: "#00d4a4" if x >= 0 else "#ff4b6e"
     )
 
@@ -270,7 +269,7 @@ def compute_gex(currency: str = "BTC", max_expiry_days: int = 60) -> tuple:
         .reset_index()
         .sort_values("tte_days")
     )
-    df_by_expiry["gex_bn"] = df_by_expiry["gex"] / 1e9
+    df_by_expiry["gex_k"] = df_by_expiry["gex"] / 1e3
 
     total_gex = df_raw["gex"].sum()
 
@@ -339,7 +338,6 @@ if errors:
 # ── Filter summary ───────────────────────────────────────────────────────────
 with st.expander("🔍 Filter summary", expanded=False):
     st.markdown(
-        f"- **DTE < 2 excluded:** {skipped['dte']} instruments  \n"
         f"- **Deep OTM/ITM excluded (|Δ| < 0.05 or > 0.95):** {skipped['delta']} instruments  \n"
         f"- **No data / zero OI excluded:** {skipped['no_data']} instruments  \n"
         f"- **Included in GEX:** {len(df_raw)} instruments"
@@ -354,19 +352,62 @@ st.caption(
 # ─────────────────────────────────────────────
 # Top-level metric cards
 # ─────────────────────────────────────────────
-total_gex_bn = total_gex / 1e9
-call_gex_bn  = df_raw[df_raw["option_type"] == "call"]["gex"].sum() / 1e9
-put_gex_bn   = df_raw[df_raw["option_type"] == "put"]["gex"].sum() / 1e9
+total_gex_k  = total_gex / 1e3
+call_gex_k   = df_raw[df_raw["option_type"] == "call"]["gex"].sum() / 1e3
+put_gex_k    = df_raw[df_raw["option_type"] == "put"]["gex"].sum() / 1e3
 total_oi     = df_raw["open_interest"].sum()   # in contracts
 num_strikes  = df_raw["strike"].nunique()
-gex_regime   = "🟢 Positive (Stabilising)" if total_gex_bn >= 0 else "🔴 Negative (Destabilising)"
+gex_regime   = "🟢 Positive (Stabilising)" if total_gex_k >= 0 else "🔴 Negative (Destabilising)"
 
+# ── Pre-compute key levels for header cards ──────────────────────────────────
+# Call wall: strike with largest positive per-strike GEX
+df_pos = df_by_strike[df_by_strike["gex_k"] > 0]
+call_wall_strike = int(df_pos.loc[df_pos["gex_k"].idxmax(), "strike"]) if len(df_pos) else None
+
+# Put wall: strike with largest negative per-strike GEX (most negative)
+df_neg = df_by_strike[df_by_strike["gex_k"] < 0]
+put_wall_strike = int(df_neg.loc[df_neg["gex_k"].idxmin(), "strike"]) if len(df_neg) else None
+
+# GEX flip level: cumulative GEX zero-crossing nearest to spot
+_df_flip       = df_by_strike.sort_values("strike").copy()
+_df_flip["cum"] = _df_flip["gex_k"].cumsum()
+_prev          = _df_flip["cum"].shift(1, fill_value=0)
+_crossings     = _df_flip[(_prev * _df_flip["cum"]) < 0].copy()
+if len(_crossings):
+    _crossings["dist"] = (_crossings["strike"] - spot).abs()
+    flip_strike_header = int(_crossings.loc[_crossings["dist"].idxmin(), "strike"])
+else:
+    flip_strike_header = None
+
+# Row 1: GEX summary metrics
 col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Total GEX",           f"${total_gex_bn:.2f}B",     gex_regime)
-col2.metric("Call GEX",            f"${call_gex_bn:.2f}B")
-col3.metric("Put GEX",             f"${put_gex_bn:.2f}B")
+col1.metric("Total GEX",           f"${total_gex_k:,.0f}K",   gex_regime)
+col2.metric("Call GEX",            f"${call_gex_k:,.0f}K")
+col3.metric("Put GEX",             f"${put_gex_k:,.0f}K")
 col4.metric("Total Open Interest", f"{total_oi:,.0f} contracts")
 col5.metric("Strikes Covered",     str(num_strikes))
+
+# Row 2: key structural levels
+col6, col7, col8, col9 = st.columns(4)
+col6.metric(
+    "📗 Call Wall",
+    f"${call_wall_strike:,}" if call_wall_strike else "N/A",
+    help="Strike with the largest positive GEX — acts as upside resistance / price magnet.",
+)
+col7.metric(
+    "📕 Put Wall",
+    f"${put_wall_strike:,}" if put_wall_strike else "N/A",
+    help="Strike with the largest negative GEX — dealers buy aggressively if spot breaches.",
+)
+col8.metric(
+    "🔀 GEX Flip Level",
+    f"${flip_strike_header:,}" if flip_strike_header else "N/A",
+    help="Cumulative GEX zero-crossing nearest to spot. Above = positive gamma regime; below = negative.",
+)
+col9.metric(
+    "📍 BTC Spot",
+    f"${spot:,.0f}",
+)
 
 st.markdown("---")
 
@@ -394,10 +435,10 @@ fig_profile = go.Figure()
 fig_profile.add_trace(
     go.Bar(
         x=df_plot["strike"],
-        y=df_plot["gex_bn"],
+        y=df_plot["gex_k"],
         marker_color=df_plot["color"].tolist(),
         name="GEX",
-        hovertemplate="Strike: $%{x:,.0f}<br>GEX: $%{y:.3f}B<extra></extra>",
+        hovertemplate="Strike: $%{x:,.0f}<br>GEX: $%{y:,.0f}K<extra></extra>",
     )
 )
 fig_profile.add_vline(
@@ -413,7 +454,7 @@ fig_profile.update_layout(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0.2)",
     xaxis_title="Strike (USD)",
-    yaxis_title="GEX (USD Billions)",
+    yaxis_title="GEX (USD Thousands)",
     height=420,
     margin=dict(l=60, r=20, t=20, b=60),
     bargap=0.1,
@@ -437,11 +478,11 @@ fig_expiry = go.Figure()
 fig_expiry.add_trace(
     go.Bar(
         x=df_by_expiry["expiry_label"],
-        y=df_by_expiry["gex_bn"],
-        marker_color=df_by_expiry["gex_bn"].apply(
+        y=df_by_expiry["gex_k"],
+        marker_color=df_by_expiry["gex_k"].apply(
             lambda x: "#00d4a4" if x >= 0 else "#ff4b6e"
         ).tolist(),
-        hovertemplate="Expiry: %{x}<br>GEX: $%{y:.3f}B<extra></extra>",
+        hovertemplate="Expiry: %{x}<br>GEX: $%{y:,.0f}K<extra></extra>",
     )
 )
 fig_expiry.update_layout(
@@ -449,7 +490,7 @@ fig_expiry.update_layout(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0.2)",
     xaxis_title="Expiry",
-    yaxis_title="GEX (USD Billions)",
+    yaxis_title="GEX (USD Thousands)",
     height=380,
     margin=dict(l=60, r=20, t=20, b=60),
 )
@@ -488,7 +529,7 @@ pivot = pivot.reindex(columns=[c for c in expiry_order if c in pivot.columns])
 pivot = pivot.sort_index()
 
 y_labels = [f"${k:,.0f}" for k in pivot.index.tolist()]
-z_data   = (pivot.values / 1e9).tolist()
+z_data   = (pivot.values / 1e3).tolist()
 
 fig_heat = go.Figure(
     go.Heatmap(
@@ -501,8 +542,8 @@ fig_heat = go.Figure(
             [1.0, "#00d4a4"],
         ],
         zmid=0,
-        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>GEX: $%{z:.3f}B<extra></extra>",
-        colorbar=dict(title="GEX ($B)", tickfont=dict(color="white")),
+        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>GEX: $%{z:,.0f}K<extra></extra>",
+        colorbar=dict(title="GEX ($K)", tickfont=dict(color="white")),
     )
 )
 
@@ -557,11 +598,11 @@ st.caption(
 )
 
 df_flip = df_by_strike.sort_values("strike").copy()
-df_flip["cumulative_gex_bn"] = df_flip["gex_bn"].cumsum()
+df_flip["cumulative_gex_k"] = df_flip["gex_k"].cumsum()
 
 # ── Fix 6: nearest-to-spot zero crossing ─────────────────────────────────────
-prev           = df_flip["cumulative_gex_bn"].shift(1, fill_value=0)
-flip_crossings = df_flip[(prev * df_flip["cumulative_gex_bn"]) < 0].copy()
+prev           = df_flip["cumulative_gex_k"].shift(1, fill_value=0)
+flip_crossings = df_flip[(prev * df_flip["cumulative_gex_k"]) < 0].copy()
 
 if len(flip_crossings):
     flip_crossings["dist_to_spot"] = (flip_crossings["strike"] - spot).abs()
@@ -575,13 +616,13 @@ fig_flip = go.Figure()
 fig_flip.add_trace(
     go.Scatter(
         x=df_flip["strike"],
-        y=df_flip["cumulative_gex_bn"],
+        y=df_flip["cumulative_gex_k"],
         mode="lines",
         line=dict(color="#a78bfa", width=2),
         fill="tozeroy",
         fillcolor="rgba(167,139,250,0.1)",
         name="Cumulative GEX",
-        hovertemplate="Strike: $%{x:,.0f}<br>Cum. GEX: $%{y:.3f}B<extra></extra>",
+        hovertemplate="Strike: $%{x:,.0f}<br>Cum. GEX: $%{y:,.0f}K<extra></extra>",
     )
 )
 fig_flip.add_vline(
@@ -618,7 +659,7 @@ fig_flip.update_layout(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0.2)",
     xaxis_title="Strike (USD)",
-    yaxis_title="Cumulative GEX (USD Billions)",
+    yaxis_title="Cumulative GEX (USD Thousands)",
     height=380,
     margin=dict(l=60, r=20, t=20, b=60),
 )
@@ -643,8 +684,8 @@ if show_raw:
     st.dataframe(
         df_raw[display_cols]
         .sort_values(["tte_days", "strike"])
-        .assign(gex=lambda d: d["gex"] / 1e6)
-        .rename(columns={"gex": "gex_$M", "open_interest": "oi_contracts"})
+        .assign(gex=lambda d: d["gex"] / 1e3)
+        .rename(columns={"gex": "gex_$K", "open_interest": "oi_contracts"})
         .style.format({
             "strike":       "${:,.0f}",
             "tte_days":     "{:.1f}d",
@@ -652,7 +693,7 @@ if show_raw:
             "gamma":        "{:.6f}",
             "oi_contracts": "{:,.2f}",
             "mark_iv":      "{:.1f}%",
-            "gex_$M":       "${:,.2f}M",
+            "gex_$K":       "${:,.2f}K",
         }),
         use_container_width=True,
         height=400,
@@ -680,7 +721,7 @@ GEX_i = Gamma_i × OI_i(contracts) × ContractSize × Spot² × sign_i
 | **ContractSize** | 1 BTC | Deribit standard |
 | **sign** | +1 calls / −1 puts | Industry convention: net GEX = call exposure − put exposure |
 
-**Total GEX** = Σ GEX_i across all included strikes and expiries, reported in USD billions.
+**Total GEX** = Σ GEX_i across all included strikes and expiries, reported in USD thousands.
 
 ---
 
@@ -688,9 +729,10 @@ GEX_i = Gamma_i × OI_i(contracts) × ContractSize × Spot² × sign_i
 
 | Filter | Threshold | Rationale |
 |---|---|---|
-| **DTE** | ≥ 2 days | Sub-2-day gamma explodes to noise; expiry-day pinning is a distinct phenomenon |
 | **Delta** | 0.05 ≤ \|Δ\| ≤ 0.95 | Excludes deep OTM/ITM: near-zero gamma, unreliable IV, stale OI artefacts |
 | **Zero OI** | OI > 0 contracts | No meaningful exposure |
+
+Note: sub-2-day (expiry-day) instruments are **included** to capture pinning effects.
 
 ---
 
