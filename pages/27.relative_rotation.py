@@ -9,137 +9,187 @@ import streamlit as st
 import plotly.graph_objects as go
 
 # ---------------- Page Config ----------------
-st.set_page_config(page_title="Theme Alpha RRG", layout="wide")
-st.title("Theme Excess Return Rotation (Alpha RRG)")
+st.set_page_config(page_title="Alpha RRG Dashboard", layout="wide")
+st.title("Theme Excess Return (Alpha) RRG")
 
-# ... [Keep your existing Sidebar, Fetch Logic, and compute_returns as is] ...
+# ---------------- Sidebar ----------------
+st.sidebar.header("Settings")
 
-# ---------------- Advanced RRG Calculation (Excess Return Based) ----------------
+default_excel_relpath = Path("Input-Files") / "Themes_mapping.xlsx"
+st.sidebar.write(f"Using: `{default_excel_relpath}`")
 
+timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h"], index=0)
+# NOTE: Increased max limit to 500 to support the 180-day trail + smoothing window
+limit = st.sidebar.number_input("OHLCV limit", value=250, min_value=50, max_value=2000)
+sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.2)
+
+# ---------------- Session State ----------------
+if "final_df" not in st.session_state:
+    st.session_state.final_df = None
+if "price_theme" not in st.session_state:
+    st.session_state.price_theme = None
+
+# ---------------- Helpers ----------------
+@st.cache_data
+def read_theme_excel(path):
+    return pd.read_excel(path, engine="openpyxl")
+
+@st.cache_resource
+def get_exchange():
+    ex = ccxt.kucoin()
+    ex.load_markets()
+    return ex
+
+def fetch_prices(exchange, symbols, timeframe, limit):
+    frames = []
+    for sym in symbols:
+        try:
+            ohlcv = exchange.fetch_ohlcv(f"{sym}/USDT", timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            frames.append(df.set_index("ts")["c"].rename(sym))
+            time.sleep(sleep_seconds)
+        except Exception as e:
+            st.error(f"Error fetching {sym}: {e}")
+            continue
+    return pd.concat(frames, axis=1)
+
+# ---------------- RRG Math (Excess Return Based) ----------------
 def calculate_excess_rrg(price_df, coins, window=14):
     """
-    Calculates RRG coordinates based on Excess Returns.
     X-axis: RS-Ratio (Smoothed Cumulative Excess Return)
-    Y-axis: RS-Momentum (Rate of Change of the Ratio)
+    Y-axis: RS-Momentum (Rate of Change of RS-Ratio)
     """
-    # 1. Calculate percentage returns
+    # 1. Periodic Returns
     returns_df = price_df[coins].pct_change().dropna()
     
-    # 2. Define Theme Benchmark (Mean return of selected coins)
-    benchmark_return = returns_df.mean(axis=1)
+    # 2. Benchmark (Theme Average Return)
+    benchmark_ret = returns_df.mean(axis=1)
     
-    rrg_data = {}
+    rrg_results = {}
     
     for coin in coins:
-        # 3. Calculate Daily Excess Return
-        excess_return = returns_df[coin] - benchmark_return
+        # 3. Excess Return (Alpha)
+        excess_ret = returns_df[coin] - benchmark_ret
         
-        # 4. Create Cumulative Excess Index (Equity Curve of Alpha)
-        # We start at 100 for normalization
-        excess_index = (1 + excess_return).cumprod() * 100
+        # 4. Cumulative Alpha Index (Base 100)
+        alpha_index = (1 + excess_ret).cumprod() * 100
         
-        # 5. RS-Ratio: Double smoothed trend of the index
-        # We normalize by the average index value to keep it centered near 100
-        short_avg = excess_index.rolling(window=window).mean()
-        rs_ratio = (short_avg / short_avg.rolling(window=window*2).mean()) * 100
+        # 5. RS-Ratio (Trend) 
+        # Normalized against its own 2*window moving average
+        short_ma = alpha_index.rolling(window=window).mean()
+        long_ma = alpha_index.rolling(window=window * 2).mean()
+        rs_ratio = (short_ma / long_ma) * 100
         
-        # 6. RS-Momentum: Rate of change of the RS-Ratio
-        rs_momentum = (rs_ratio.pct_change(periods=window//2) * 100) + 100
+        # 6. RS-Momentum (Acceleration)
+        # ROC of the RS-Ratio
+        rs_mom = (rs_ratio.pct_change(periods=max(1, window // 2)) * 100) + 100
         
-        rrg_data[coin] = pd.DataFrame({
-            'x': rs_ratio,
-            'y': rs_momentum
-        }).dropna()
+        rrg_results[coin] = pd.DataFrame({'x': rs_ratio, 'y': rs_mom}).dropna()
         
-    return rrg_data
+    return rrg_results
 
-# ---------------- Streamlit UI Logic ----------------
+# ---------------- Fetch Logic ----------------
+if st.sidebar.button("🔄 Fetch Data"):
+    df_map = read_theme_excel(default_excel_relpath)
+    symbols = df_map["Symbol"].str.upper().tolist()
+    mapping = dict(zip(symbols, df_map["Theme"].tolist()))
+    
+    ex = get_exchange()
+    with st.spinner("Fetching prices and computing Alpha..."):
+        prices = fetch_prices(ex, symbols, timeframe, limit)
+        st.session_state["price_theme"] = prices
+        st.session_state["ticker_to_theme"] = mapping
+        st.session_state.last_fetch = datetime.utcnow()
+        st.success("Data Updated!")
 
-if "price_theme" not in st.session_state:
-    st.info("Please fetch data from the sidebar to generate the RRG.")
-else:
+# ---------------- RRG Visualization Section ----------------
+if st.session_state["price_theme"] is not None:
     prices = st.session_state["price_theme"]
     mapping = st.session_state["ticker_to_theme"]
-    
-    st.divider()
-    st.subheader("Relative Rotation Graph: Alpha vs. Theme Average")
-    st.write("This chart uses **Excess Returns** to strip out market noise, showing which coins are genuinely outperforming the sector average.")
 
-    # --- Controls ---
+    st.divider()
+    st.header("Relative Rotation Graph (Excess Returns)")
+    
+    # --- UI Controls ---
     c1, c2, c3 = st.columns([1, 1, 2])
     
     with c1:
-        unique_themes = sorted(list(set(mapping.values())))
-        theme_choice = st.selectbox("Select Theme", unique_themes)
-        
-    theme_coins = [k for k, v in mapping.items() if v == theme_choice and k in prices.columns]
-    
-    with c3:
-        selected_subset = st.multiselect("Active Coins", theme_coins, default=theme_coins)
+        themes = sorted(list(set(mapping.values())))
+        sel_theme = st.selectbox("Select Theme", themes)
+        theme_coins = [k for k, v in mapping.items() if v == sel_theme and k in prices.columns]
         
     with c2:
-        trail_size = st.slider("Trail Length", 5, 40, 15)
-        smoothing = st.number_input("Smoothing Window", 5, 30, 14)
+        # User requested up to 180 days trail
+        trail_len = st.slider("Trail Length (Periods)", 5, 180, 20)
+        smooth_win = st.number_input("Smoothing (Window)", 5, 40, 14)
 
-    if len(selected_subset) < 2:
-        st.warning("Select at least 2 coins to compute a relative average.")
+    with c3:
+        active_coins = st.multiselect("Coins to Plot", theme_coins, default=theme_coins)
+
+    if len(active_coins) < 2:
+        st.warning("Please select at least 2 coins to calculate a relative average.")
     else:
-        # Compute the RRG coordinates
-        rrg_results = calculate_excess_rrg(prices, selected_subset, window=smoothing)
+        results = calculate_excess_rrg(prices, active_coins, window=smooth_win)
         
         fig = go.Figure()
 
-        # Define colors for quadrants
-        # Note: Plotly's shapes or annotations can label quadrants
-        
-        for coin in selected_subset:
-            df = rrg_results[coin].tail(trail_size)
+        # Quadrant Colors & Lines
+        fig.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.5)
+        fig.add_vline(x=100, line_dash="dot", line_color="gray", opacity=0.5)
+
+        for coin in active_coins:
+            df = results[coin].tail(trail_len)
             if df.empty: continue
             
-            # Draw the tail (history)
+            # 1. The Trail (Line)
             fig.add_trace(go.Scatter(
                 x=df['x'], y=df['y'],
                 mode='lines',
                 line=dict(width=2),
                 hoverinfo='skip',
                 showlegend=False,
-                opacity=0.4
+                name=f"{coin} trail"
             ))
             
-            # Draw the head (current)
+            # 2. The Directional Arrow (Latest Point)
+            # We use 'triangle-up' and calculate the angle of movement
+            # Or simply use the 'arrow' symbol with angleref
             fig.add_trace(go.Scatter(
                 x=[df['x'].iloc[-1]],
                 y=[df['y'].iloc[-1]],
                 mode='markers+text',
-                marker=dict(size=12, symbol='circle'),
+                marker=dict(
+                    symbol='arrow', 
+                    size=15, 
+                    angleref='previous', # Points arrow in direction of movement
+                    line=dict(width=1, color='white')
+                ),
                 text=[coin],
                 textposition="top center",
                 name=coin,
-                hovertemplate=f"<b>{coin}</b><br>Trend (RS-Ratio): %{{x:.2f}}<br>Momentum: %{{y:.2f}}"
+                hovertemplate=f"<b>{coin}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Mom: %{{y:.2f}}"
             ))
 
-        # Layout styling to create the "Four Quadrants"
+        # Annotate Quadrants
+        quad_attr = dict(showarrow=False, font=dict(size=14, color="rgba(255,255,255,0.5)"))
+        fig.add_annotation(x=102, y=102, text="LEADING", **quad_attr)
+        fig.add_annotation(x=102, y=98, text="WEAKENING", **quad_attr)
+        fig.add_annotation(x=98, y=98, text="LAGGING", **quad_attr)
+        fig.add_annotation(x=98, y=102, text="IMPROVING", **quad_attr)
+
         fig.update_layout(
-            height=700,
+            height=800,
             xaxis_title="Relative Strength Ratio (Trend)",
-            yaxis_title="Relative Strength Momentum",
+            yaxis_title="Relative Strength Momentum (Momentum)",
             template="plotly_dark",
-            shapes=[
-                # Horizontal Center Line
-                dict(type="line", x0=90, x1=110, y0=100, y1=100, line=dict(color="rgba(255,255,255,0.2)", dash="dot")),
-                # Vertical Center Line
-                dict(type="line", x0=100, x1=100, y0=90, y1=110, line=dict(color="rgba(255,255,255,0.2)", dash="dot")),
-            ],
-            annotations=[
-                dict(x=105, y=105, text="<b>LEADING</b>", showarrow=False, font=dict(color="#00ff00")),
-                dict(x=105, y=95, text="<b>WEAKENING</b>", showarrow=False, font=dict(color="#ffa500")),
-                dict(x=95, y=95, text="<b>LAGGING</b>", showarrow=False, font=dict(color="#ff0000")),
-                dict(x=95, y=105, text="<b>IMPROVING</b>", showarrow=False, font=dict(color="#00bfff")),
-            ]
+            xaxis=dict(range=[min(95, df['x'].min() if 'df' in locals() else 95), 
+                             max(105, df['x'].max() if 'df' in locals() else 105)]),
+            yaxis=dict(range=[min(95, df['y'].min() if 'df' in locals() else 95), 
+                             max(105, df['y'].max() if 'df' in locals() else 105)])
         )
-        
-        # Force the plot to stay somewhat centered around 100, 100
-        fig.update_xaxes(range=[95, 105])
-        fig.update_yaxes(range=[95, 105])
 
         st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Click 'Fetch Data' in the sidebar to load the price history.")
