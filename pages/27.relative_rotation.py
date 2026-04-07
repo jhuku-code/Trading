@@ -9,140 +9,137 @@ import streamlit as st
 import plotly.graph_objects as go
 
 # ---------------- Page Config ----------------
-st.set_page_config(page_title="Theme Returns Dashboard", layout="wide")
-st.title("Theme Returns Dashboard")
+st.set_page_config(page_title="Theme Alpha RRG", layout="wide")
+st.title("Theme Excess Return Rotation (Alpha RRG)")
 
-# ... [KEEP ALL YOUR EXISTING SIDEBAR, HELPERS, AND FETCH LOGIC UNCHANGED] ...
-# (The code below assumes your existing session_state variables are populated)
+# ... [Keep your existing Sidebar, Fetch Logic, and compute_returns as is] ...
 
-# [START OF ADDITION] ---------------------------------------------------------
-# ---------------- RRG Calculation Logic ----------------
+# ---------------- Advanced RRG Calculation (Excess Return Based) ----------------
 
-def calculate_rrg(price_df, coins, window=14):
+def calculate_excess_rrg(price_df, coins, window=14):
     """
-    Calculates simplified RS-Ratio and RS-Momentum for RRG.
-    Benchmark is the mean price of the selected coins.
+    Calculates RRG coordinates based on Excess Returns.
+    X-axis: RS-Ratio (Smoothed Cumulative Excess Return)
+    Y-axis: RS-Momentum (Rate of Change of the Ratio)
     """
-    # 1. Define Benchmark (Mean of selected coins)
-    benchmark = price_df[coins].mean(axis=1)
+    # 1. Calculate percentage returns
+    returns_df = price_df[coins].pct_change().dropna()
+    
+    # 2. Define Theme Benchmark (Mean return of selected coins)
+    benchmark_return = returns_df.mean(axis=1)
     
     rrg_data = {}
     
     for coin in coins:
-        # 2. Relative Strength (RS)
-        rs = price_df[coin] / benchmark
+        # 3. Calculate Daily Excess Return
+        excess_return = returns_df[coin] - benchmark_return
         
-        # 3. RS-Ratio (Trend of RS)
-        # We use a rolling mean and normalize around 100
-        rs_ratio = rs.rolling(window=window).mean()
-        rs_ratio_norm = (rs_ratio / rs_ratio.mean()) * 100
+        # 4. Create Cumulative Excess Index (Equity Curve of Alpha)
+        # We start at 100 for normalization
+        excess_index = (1 + excess_return).cumprod() * 100
         
-        # 4. RS-Momentum (Rate of change of RS-Ratio)
-        # Difference between current ratio and previous, normalized around 100
-        rs_mom = rs_ratio.pct_change(periods=window//2) + 1
-        rs_mom_norm = (rs_mom / rs_mom.mean()) * 100
+        # 5. RS-Ratio: Double smoothed trend of the index
+        # We normalize by the average index value to keep it centered near 100
+        short_avg = excess_index.rolling(window=window).mean()
+        rs_ratio = (short_avg / short_avg.rolling(window=window*2).mean()) * 100
+        
+        # 6. RS-Momentum: Rate of change of the RS-Ratio
+        rs_momentum = (rs_ratio.pct_change(periods=window//2) * 100) + 100
         
         rrg_data[coin] = pd.DataFrame({
-            'x': rs_ratio_norm,
-            'y': rs_mom_norm
-        })
+            'x': rs_ratio,
+            'y': rs_momentum
+        }).dropna()
         
     return rrg_data
 
-# ---------------- RRG Section ----------------
-st.divider()
-st.header("Relative Rotation Graph (RRG)")
+# ---------------- Streamlit UI Logic ----------------
 
 if "price_theme" not in st.session_state:
-    st.warning("Please 'Fetch Data' first to enable RRG.")
+    st.info("Please fetch data from the sidebar to generate the RRG.")
 else:
     prices = st.session_state["price_theme"]
     mapping = st.session_state["ticker_to_theme"]
     
-    # --- RRG Controls ---
-    col1, col2, col3 = st.columns([1, 1, 2])
-    
-    with col1:
-        unique_themes = sorted(list(set(mapping.values())))
-        selected_theme = st.selectbox("Select Theme for RRG", unique_themes)
-        
-    # Filter coins for this theme
-    theme_coins = [coin for coin, theme in mapping.items() if theme == selected_theme and coin in prices.columns]
-    
-    with col3:
-        selected_coins = st.multiselect(
-            "Select/Unselect Coins", 
-            options=theme_coins, 
-            default=theme_coins
-        )
-        
-    with col2:
-        history_len = st.slider("History Trail (Periods)", min_value=5, max_value=50, value=15)
+    st.divider()
+    st.subheader("Relative Rotation Graph: Alpha vs. Theme Average")
+    st.write("This chart uses **Excess Returns** to strip out market noise, showing which coins are genuinely outperforming the sector average.")
 
-    if len(selected_coins) < 2:
-        st.error("Select at least 2 coins to generate a relative benchmark.")
-    else:
-        # Calculate RRG Values
-        rrg_results = calculate_rrg(prices, selected_coins)
+    # --- Controls ---
+    c1, c2, c3 = st.columns([1, 1, 2])
+    
+    with c1:
+        unique_themes = sorted(list(set(mapping.values())))
+        theme_choice = st.selectbox("Select Theme", unique_themes)
         
-        # --- Plotly Visualization ---
+    theme_coins = [k for k, v in mapping.items() if v == theme_choice and k in prices.columns]
+    
+    with c3:
+        selected_subset = st.multiselect("Active Coins", theme_coins, default=theme_coins)
+        
+    with c2:
+        trail_size = st.slider("Trail Length", 5, 40, 15)
+        smoothing = st.number_input("Smoothing Window", 5, 30, 14)
+
+    if len(selected_subset) < 2:
+        st.warning("Select at least 2 coins to compute a relative average.")
+    else:
+        # Compute the RRG coordinates
+        rrg_results = calculate_excess_rrg(prices, selected_subset, window=smoothing)
+        
         fig = go.Figure()
 
-        # Add Background Quadrant Shapes/Colors
-        # Leading (Top Right), Weakening (Bottom Right), Lagging (Bottom Left), Improving (Top Left)
-        # Quadrant logic centered at 100, 100
+        # Define colors for quadrants
+        # Note: Plotly's shapes or annotations can label quadrants
         
-        for coin in selected_coins:
-            df_plot = rrg_results[coin].tail(history_len).dropna()
+        for coin in selected_subset:
+            df = rrg_results[coin].tail(trail_size)
+            if df.empty: continue
             
-            if df_plot.empty: continue
-            
-            # Add the trail line
+            # Draw the tail (history)
             fig.add_trace(go.Scatter(
-                x=df_plot['x'], y=df_plot['y'],
+                x=df['x'], y=df['y'],
                 mode='lines',
-                name=coin,
-                line=dict(width=1.5),
+                line=dict(width=2),
+                hoverinfo='skip',
                 showlegend=False,
-                hoverinfo='skip'
+                opacity=0.4
             ))
             
-            # Add the head (current position)
+            # Draw the head (current)
             fig.add_trace(go.Scatter(
-                x=[df_plot['x'].iloc[-1]], 
-                y=[df_plot['y'].iloc[-1]],
+                x=[df['x'].iloc[-1]],
+                y=[df['y'].iloc[-1]],
                 mode='markers+text',
-                name=coin,
+                marker=dict(size=12, symbol='circle'),
                 text=[coin],
                 textposition="top center",
-                marker=dict(size=10, symbol='arrow', angleref='previous'),
-                hovertemplate=f"<b>{coin}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Mom: %{{y:.2f}}"
+                name=coin,
+                hovertemplate=f"<b>{coin}</b><br>Trend (RS-Ratio): %{{x:.2f}}<br>Momentum: %{{y:.2f}}"
             ))
 
-        # Update Layout for RRG Look
+        # Layout styling to create the "Four Quadrants"
         fig.update_layout(
             height=700,
-            xaxis_title="RS-Ratio (Trend)",
-            yaxis_title="RS-Momentum (Momentum)",
+            xaxis_title="Relative Strength Ratio (Trend)",
+            yaxis_title="Relative Strength Momentum",
+            template="plotly_dark",
             shapes=[
-                # Vertical Line
-                dict(type="line", x0=100, x1=100, y0=min([95, fig.layout.yaxis.range[0] if fig.layout.yaxis.range else 95]), 
-                     y1=max([105, fig.layout.yaxis.range[1] if fig.layout.yaxis.range else 105]), line=dict(color="gray", dash="dash")),
-                # Horizontal Line
-                dict(type="line", x0=min([95, fig.layout.xaxis.range[0] if fig.layout.xaxis.range else 95]), 
-                     x1=max([105, fig.layout.xaxis.range[1] if fig.layout.xaxis.range else 105]), y0=100, y1=100, line=dict(color="gray", dash="dash")),
+                # Horizontal Center Line
+                dict(type="line", x0=90, x1=110, y0=100, y1=100, line=dict(color="rgba(255,255,255,0.2)", dash="dot")),
+                # Vertical Center Line
+                dict(type="line", x0=100, x1=100, y0=90, y1=110, line=dict(color="rgba(255,255,255,0.2)", dash="dot")),
             ],
             annotations=[
-                dict(x=101, y=101, text="LEADING", showarrow=False, font=dict(color="green", size=16)),
-                dict(x=101, y=99, text="WEAKENING", showarrow=False, font=dict(color="orange", size=16)),
-                dict(x=99, y=99, text="LAGGING", showarrow=False, font=dict(color="red", size=16)),
-                dict(x=99, y=101, text="IMPROVING", showarrow=False, font=dict(color="blue", size=16)),
+                dict(x=105, y=105, text="<b>LEADING</b>", showarrow=False, font=dict(color="#00ff00")),
+                dict(x=105, y=95, text="<b>WEAKENING</b>", showarrow=False, font=dict(color="#ffa500")),
+                dict(x=95, y=95, text="<b>LAGGING</b>", showarrow=False, font=dict(color="#ff0000")),
+                dict(x=95, y=105, text="<b>IMPROVING</b>", showarrow=False, font=dict(color="#00bfff")),
             ]
         )
         
-        # Center the axis around 100
-        fig.update_xaxes(zeroline=False)
-        fig.update_yaxes(zeroline=False)
+        # Force the plot to stay somewhat centered around 100, 100
+        fig.update_xaxes(range=[95, 105])
+        fig.update_yaxes(range=[95, 105])
 
         st.plotly_chart(fig, use_container_width=True)
-# [END OF ADDITION] -----------------------------------------------------------
