@@ -154,7 +154,7 @@ for theme in sorted(coin_themes.unique()):
         st.plotly_chart(fig, use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════════
-# SECTION 2 — SCANNER TABLE
+# SECTION 2 — SCANNER TABLE (FIXED STYLING)
 # ═════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.subheader("Convexity Scanner")
@@ -178,19 +178,27 @@ for theme in sorted(coin_themes.unique()):
 
 if table_data:
     df_sig = pd.DataFrame(table_data).set_index("Theme")
-    st.dataframe(df_sig.style.apply(lambda d: pd.DataFrame(
-        np.where(d.columns == "Buy (Convex ↑)", "background-color: #0d3b1e; color: #4ade80", 
-        np.where(d.columns == "Sell (Concave ↓)", "background-color: #3b0d0d; color: #f87171", "")),
-        index=d.index, columns=d.columns), axis=None), use_container_width=True)
+    
+    # Fix: Robust styling function that matches dataframe dimensions perfectly
+    def style_buy_sell(df):
+        style_df = pd.DataFrame('', index=df.index, columns=df.columns)
+        if "Buy (Convex ↑)" in df.columns:
+            style_df["Buy (Convex ↑)"] = "background-color: #0d3b1e; color: #4ade80"
+        if "Sell (Concave ↓)" in df.columns:
+            style_df["Sell (Concave ↓)"] = "background-color: #3b0d0d; color: #f87171"
+        return style_df
+
+    st.dataframe(df_sig.style.apply(style_buy_sell, axis=None), use_container_width=True)
 
 # Debug expansion
 with st.expander("Raw Scores Breakdown"):
     score_rows = [{"Coin": c, "Signal": classifications[c].upper(), "Score": scores[c], "R2": details[c].get("_r2", 0)} for c in sorted(excess_cum.columns)]
     sdf = pd.DataFrame(score_rows).set_index("Coin")
+    # Using .map instead of .applymap for Pandas 2.x/3.x
     st.dataframe(sdf.style.map(lambda v: "color: #4ade80" if v == "CONVEX" else ("color: #f87171" if v == "CONCAVE" else ""), subset=["Signal"]), use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════════
-# SECTION 3 — SINGLE LOOKUP (FIXED COLOR LOGIC)
+# SECTION 3 — SINGLE LOOKUP
 # ═════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.subheader("Single-Coin Lookup")
@@ -201,7 +209,6 @@ if sel_coin:
     s_data = excess_cum[sel_coin].dropna().tail(int(sel_period))
     label = classifications.get(sel_coin, "flat")
     
-    # FIX: Use safe RGBA strings for Plotly instead of appending '26' to hex
     color_map = {
         "convex":  {"line": "#4ade80", "fill": "rgba(74, 222, 128, 0.15)"},
         "concave": {"line": "#f87171", "fill": "rgba(248, 113, 113, 0.15)"},
@@ -212,12 +219,11 @@ if sel_coin:
     
     fig_c = go.Figure()
     fig_c.add_trace(go.Scatter(
-        x=s_data.index, 
-        y=s_data.values,
+        x=s_data.index, y=s_data.values,
         mode="lines",
         line=dict(color=cfg["line"], width=2),
         fill="tozeroy",
-        fillcolor=cfg["fill"],  # Using the safe RGBA string here
+        fillcolor=cfg["fill"],
         name=sel_coin
     ))
     fig_c.update_layout(
