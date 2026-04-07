@@ -1,16 +1,18 @@
 """
-Volatility Breakout Signals — v3 (Streamlined Vol-Momentum + CS Gate)
-======================================================================
-Key improvements over v2:
---------------------------
-1.  Simplified Breakout Logic: Replaced complex "vol_skew" with a direct momentum
-    check (window return > 0). If volatility is expanding and price is up, it's bullish.
-2.  Dual-Gate Filtering: Cross-sectional Z-score is now an explicit gate (filter)
-    rather than a blended composite weight. This removes the "beta" of market rallies.
-3.  Removed Fragile Math: Dropped _robust_clip_std and ratio normalizations, 
-    making the script significantly faster and statistically sound.
-4.  Ranking: Candidates are ranked cleanly by the magnitude of their 
-    historical volatility expansion (hist_z_score).
+Volatility Breakout Signals — v4 (The Coiled Spring)
+======================================================
+Key improvements for Close-Only Data:
+-------------------------------------
+1.  Close-Only Vol Proxy: Uses the rolling standard deviation of log returns 
+    so high-priced and low-priced coins are perfectly normalized.
+2.  The Squeeze Gate: Requires short-term volatility to have been LOWER than 
+    long-term volatility within the last week (a contraction period).
+3.  The Expansion Gate: Requires short-term volatility today to violently 
+    expand past the long-term baseline (the release).
+4.  Donchian Proxy: Requires today's close to be >= the highest close of the 
+    previous 20 days.
+5.  Ranking: Ranks purely by the "Expansion Multiplier" to surface the most 
+    explosive breakouts.
 """
 
 import numpy as np
@@ -22,8 +24,8 @@ from typing import Dict, Optional
 # ---------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------
-st.set_page_config(page_title="Volatility Breakout v3", layout="wide")
-st.title("Volatility Breakout Signals · v3 (Streamlined)")
+st.set_page_config(page_title="Volatility Breakout: Coiled Spring", layout="wide")
+st.title("Volatility Breakout · The Coiled Spring")
 
 # ---------------------------------------------------------
 # INPUT DATA FROM SESSION STATE
@@ -44,32 +46,32 @@ if df_h is None or df_h.empty:
 st.sidebar.header("Parameters")
 
 with st.sidebar.expander("Lookback Windows", expanded=True):
-    historical_window = st.number_input(
-        "Historical window (bars)",
-        min_value=10, max_value=365, value=90, step=5,
-        help="Lookback for historical vol baseline and price MA.",
+    donchian_window = st.number_input(
+        "Donchian Breakout Window (bars)",
+        min_value=5, max_value=100, value=20, step=5,
+        help="Price must hit a new high over this many previous bars.",
     )
-    volatility_window = st.number_input(
-        "Volatility window (bars)",
-        min_value=5, max_value=96, value=14, step=1,
-        help="Rolling window for current vol.",
+    vol_long_window = st.number_input(
+        "Long-Term Volatility (bars)",
+        min_value=20, max_value=200, value=90, step=10,
+        help="Baseline for normal market volatility.",
     )
-    min_signal_bars = st.number_input(
-        "Signal persistence (bars)",
-        min_value=1, max_value=20, value=2, step=1,
-        help="Signal must be active for this many consecutive bars.",
+    vol_short_window = st.number_input(
+        "Short-Term Volatility (bars)",
+        min_value=5, max_value=50, value=14, step=1,
+        help="Recent volatility window.",
+    )
+    squeeze_lookback = st.number_input(
+        "Squeeze Lookback (bars)",
+        min_value=1, max_value=20, value=5, step=1,
+        help="How many days back we look to confirm a volatility contraction.",
     )
 
 with st.sidebar.expander("Threshold Gates", expanded=True):
-    hist_z_threshold = st.number_input(
-        "Historical Vol Z-Score Gate",
-        min_value=0.1, max_value=5.0, value=1.5, step=0.1,
-        help="Gate 1: Asset's volatility must be high relative to its own history.",
-    )
-    cs_z_threshold = st.number_input(
-        "Cross-Sectional Z-Score Gate",
-        min_value=-1.0, max_value=5.0, value=1.0, step=0.1,
-        help="Gate 2: Asset's volatility expansion must be higher than the market average.",
+    expansion_ratio = st.number_input(
+        "Vol Expansion Ratio",
+        min_value=1.1, max_value=3.0, value=1.5, step=0.1,
+        help="Short-term vol must be this many times larger than long-term vol today.",
     )
 
 with st.sidebar.expander("Ranking & Display", expanded=True):
@@ -90,140 +92,120 @@ with st.sidebar.expander("Ranking & Display", expanded=True):
 st.sidebar.markdown("---")
 refresh = st.sidebar.button("🔄 Refresh / Recompute", use_container_width=True)
 
-if "vol_brkout_v3_results" not in st.session_state:
-    st.session_state["vol_brkout_v3_results"] = None
+if "vol_spring_results" not in st.session_state:
+    st.session_state["vol_spring_results"] = None
 
 # ---------------------------------------------------------
 # CLASS DEFINITION
 # ---------------------------------------------------------
-class VolatilityBreakoutSignal:
-    """
-    Volatility breakout signal generator — Streamlined.
-    Requires Vol expansion (Time-series AND Cross-sectional) + Positive Momentum.
-    """
-
+class CoiledSpringBreakout:
     def __init__(
         self,
-        historical_window: int = 90,
-        volatility_window: int = 14,
-        hist_z_threshold: float = 1.5,
-        cs_z_threshold: float = 1.0,
-        min_signal_bars: int = 2,
+        donchian_window: int = 20,
+        vol_short_window: int = 14,
+        vol_long_window: int = 90,
+        expansion_ratio: float = 1.5,
+        squeeze_lookback: int = 5,
     ):
-        self.historical_window = historical_window
-        self.volatility_window = volatility_window
-        self.hist_z_threshold = hist_z_threshold
-        self.cs_z_threshold = cs_z_threshold
-        self.min_signal_bars = min_signal_bars
+        self.donchian_window = donchian_window
+        self.vol_short = vol_short_window
+        self.vol_long = vol_long_window
+        self.expansion_ratio = expansion_ratio
+        self.squeeze_lookback = squeeze_lookback
 
     def generate_signals(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        # 1. Base Volatility
+        # 1. Volatility Proxy (Rolling Std Dev of Log Returns)
         returns = np.log(df / df.shift(1))
-        vol = returns.rolling(window=self.volatility_window).std()
+        short_vol = returns.rolling(window=self.vol_short).std()
+        long_vol = returns.rolling(window=self.vol_long).std()
 
-        # 2. Time-Series Z-Score (Relative to own history)
-        ts_mean = vol.rolling(window=self.historical_window).mean()
-        ts_std = vol.rolling(window=self.historical_window).std().replace(0, np.nan)
-        hist_z = (vol - ts_mean) / ts_std
+        # 2. Squeeze Condition: Short vol was less than long vol recently
+        is_squeezed = (short_vol < long_vol).astype(int)
+        recent_squeeze = is_squeezed.rolling(window=self.squeeze_lookback).max() == 1
 
-        # 3. Cross-Sectional Z-Score (Relative to peers)
-        cs_mean = vol.mean(axis=1)
-        cs_std = vol.std(axis=1).replace(0, np.nan)
-        cs_z = vol.sub(cs_mean, axis=0).div(cs_std, axis=0)
+        # 3. Expansion Gate: Short vol is rapidly expanding today
+        vol_expansion = short_vol > (long_vol * self.expansion_ratio)
 
-        # 4. Filters: Momentum & Trend
-        window_return = df / df.shift(self.volatility_window) - 1
-        price_above_ma = df > df.rolling(window=self.historical_window).mean()
+        # 4. Donchian Proxy: Today's close >= highest close of previous N days
+        rolling_high_close = df.shift(1).rolling(window=self.donchian_window).max()
+        donchian_breakout = df >= rolling_high_close
 
-        # 5. Funnel Logic: All conditions must be met
-        raw_signal = (
-            (hist_z > self.hist_z_threshold) & 
-            (cs_z > self.cs_z_threshold) & 
-            (window_return > 0) & 
-            price_above_ma
-        ).astype(int)
-
-        # 6. Persistence Filter
-        persistent_signal = (
-            raw_signal.rolling(window=self.min_signal_bars).min().fillna(0).astype(int)
-        )
+        # 5. Master Signal
+        raw_signal = (recent_squeeze & vol_expansion & donchian_breakout).astype(int)
 
         return {
-            "hist_z": hist_z,
-            "cs_z": cs_z,
-            "window_return": window_return,
-            "raw_signal": raw_signal,
-            "persistent_signal": persistent_signal
+            "short_vol": short_vol,
+            "long_vol": long_vol,
+            "is_squeezed": is_squeezed,
+            "donchian_breakout": donchian_breakout,
+            "raw_signal": raw_signal
         }
 
     def get_top_signals(self, signals_dict: Dict, top_n: int = 20) -> pd.DataFrame:
-        ts = signals_dict["persistent_signal"].index[-1]
-
-        persistent = signals_dict["persistent_signal"].loc[ts]
-        hist_z = signals_dict["hist_z"].loc[ts].dropna()
-        cs_z = signals_dict["cs_z"].loc[ts].dropna()
-        window_ret = signals_dict["window_return"].loc[ts].dropna()
-
-        eligible = persistent[persistent == 1].index.tolist()
-
+        ts = signals_dict["raw_signal"].index[-1]
+        
+        signal_today = signals_dict["raw_signal"].loc[ts]
+        short_vol = signals_dict["short_vol"].loc[ts].dropna()
+        long_vol = signals_dict["long_vol"].loc[ts].dropna()
+        
+        eligible = signal_today[signal_today == 1].index.tolist()
+        
         if not eligible:
             return pd.DataFrame()
 
+        expansion_multiplier = (short_vol.reindex(eligible) / long_vol.reindex(eligible))
+
         df_out = pd.DataFrame({
             "coin": eligible,
-            "hist_vol_zscore": hist_z.reindex(eligible).values,
-            "cs_vol_zscore": cs_z.reindex(eligible).values,
-            "window_return_pct": window_ret.reindex(eligible).values * 100,
+            "expansion_multiplier": expansion_multiplier.values,
+            "short_term_vol": short_vol.reindex(eligible).values,
+            "long_term_vol": long_vol.reindex(eligible).values,
         })
 
-        # Rank by absolute magnitude of historical breakout
-        df_out = df_out.sort_values("hist_vol_zscore", ascending=False)
+        # Rank by the most explosive volatility expansion
+        df_out = df_out.sort_values("expansion_multiplier", ascending=False)
         return df_out.head(top_n).reset_index(drop=True)
 
     def diagnose_signals(self, signals_dict: Dict) -> Dict:
-        ts = signals_dict["persistent_signal"].index[-1]
-        
-        hist_z = signals_dict["hist_z"].loc[ts].dropna()
-        cs_z = signals_dict["cs_z"].loc[ts].dropna()
+        ts = signals_dict["raw_signal"].index[-1]
         raw = signals_dict["raw_signal"].loc[ts]
-        persistent = signals_dict["persistent_signal"].loc[ts]
-
+        breakout = signals_dict["donchian_breakout"].loc[ts]
+        squeezed = signals_dict["is_squeezed"].loc[ts]
+        
         return {
             "timestamp": str(ts),
-            "total_coins": int(len(hist_z)),
-            "coins_raw_signal": int((raw == 1).sum()),
-            "coins_persistent_signal": int((persistent == 1).sum()),
-            "hist_z_threshold": float(self.hist_z_threshold),
-            "cs_z_threshold": float(self.cs_z_threshold),
-            "hist_z_max": float(hist_z.max()) if len(hist_z) else np.nan,
-            "cs_z_max": float(cs_z.max()) if len(cs_z) else np.nan,
+            "total_coins": int(len(raw)),
+            "coins_hitting_new_highs": int(breakout.sum()),
+            "coins_currently_squeezed": int(squeezed.sum()),
+            "coins_triggering_full_signal": int(raw.sum()),
+            "expansion_ratio_required": float(self.expansion_ratio),
         }
 
 # ---------------------------------------------------------
 # MAIN COMPUTATION
 # ---------------------------------------------------------
-if refresh or st.session_state["vol_brkout_v3_results"] is None:
-    with st.spinner("Computing signals…"):
-        vb = VolatilityBreakoutSignal(
-            historical_window=int(historical_window),
-            volatility_window=int(volatility_window),
-            hist_z_threshold=float(hist_z_threshold),
-            cs_z_threshold=float(cs_z_threshold),
-            min_signal_bars=int(min_signal_bars),
+if refresh or st.session_state["vol_spring_results"] is None:
+    with st.spinner("Hunting for coiled springs…"):
+        spring = CoiledSpringBreakout(
+            donchian_window=int(donchian_window),
+            vol_short_window=int(vol_short_window),
+            vol_long_window=int(vol_long_window),
+            expansion_ratio=float(expansion_ratio),
+            squeeze_lookback=int(squeeze_lookback),
         )
 
-        signals_dict = vb.generate_signals(df_h)
-        base_top = vb.get_top_signals(signals_dict, top_n=int(top_n_total))
-        diagnostics = vb.diagnose_signals(signals_dict)
+        signals_dict = spring.generate_signals(df_h)
+        base_top = spring.get_top_signals(signals_dict, top_n=int(top_n_total))
+        diagnostics = spring.diagnose_signals(signals_dict)
 
-        st.session_state["vol_brkout_v3_results"] = {
+        st.session_state["vol_spring_results"] = {
             "signals_dict": signals_dict,
             "base_top": base_top,
             "diagnostics": diagnostics,
-            "vb": vb,
+            "spring": spring,
         }
 
-results = st.session_state["vol_brkout_v3_results"]
+results = st.session_state["vol_spring_results"]
 
 if results is None:
     st.info("Click **Refresh / Recompute** in the sidebar to compute signals.")
@@ -236,12 +218,13 @@ signals_dict: Dict = results["signals_dict"]
 # ---------------------------------------------------------
 # DISPLAY — SELECTED RANK SLICE
 # ---------------------------------------------------------
-st.subheader(f"Breakout Candidates — Rank {int(rank_start)}–{int(rank_end)}")
+st.subheader(f"Explosive Breakouts — Rank {int(rank_start)}–{int(rank_end)}")
 
 if base_top is None or base_top.empty:
     st.warning(
-        "No breakout signals under current parameters. "
-        "Try lowering the historical or cross-sectional Z-score thresholds."
+        "No coiled spring breakouts detected today. "
+        "The market might be too choppy, or no assets have built up enough compression. "
+        "Try lowering the Vol Expansion Ratio."
     )
 else:
     display_df = base_top.iloc[int(rank_start) - 1 : int(rank_end)].copy()
@@ -249,29 +232,38 @@ else:
 
     # Format the dataframe cleanly
     styled = display_df.style.format({
-        "hist_vol_zscore": "{:.2f}",
-        "cs_vol_zscore": "{:.2f}",
-        "window_return_pct": "{:.2f}%"
+        "expansion_multiplier": "{:.2f}x",
+        "short_term_vol": "{:.4f}",
+        "long_term_vol": "{:.4f}"
     })
     st.dataframe(styled, use_container_width=True)
 
     # ---------------------------------------------------------
-    # CHART — Historical Z-Score Bar Chart
+    # CHART — Expansion Multiplier Bar Chart
     # ---------------------------------------------------------
     if not display_df.empty:
         fig = go.Figure(
             go.Bar(
                 x=display_df["coin"],
-                y=display_df["hist_vol_zscore"],
-                marker_color="#1f77b4",
-                text=display_df["hist_vol_zscore"].round(2),
+                y=display_df["expansion_multiplier"],
+                marker_color="#d62728", # A strong red to indicate an explosive move
+                text=[f"{v:.2f}x" for v in display_df["expansion_multiplier"]],
                 textposition="outside",
             )
         )
+        
+        # Add a line showing the minimum required expansion ratio
+        fig.add_hline(
+            y=expansion_ratio, 
+            line_dash="dot", 
+            annotation_text="Required Expansion Gate", 
+            annotation_position="bottom right"
+        )
+
         fig.update_layout(
-            title="Historical Volatility Z-Score by Coin",
+            title="Volatility Expansion Multiplier by Coin",
             xaxis_title="Coin",
-            yaxis_title="Hist Z-Score",
+            yaxis_title="Short Vol / Long Vol",
             height=350,
             margin=dict(t=50, b=40),
             plot_bgcolor="rgba(0,0,0,0)",
@@ -280,45 +272,13 @@ else:
         st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------
-# DISPLAY — Diagnostics & Distributions
+# DISPLAY — Diagnostics
 # ---------------------------------------------------------
-with st.expander("Diagnostics & Distributions", expanded=False):
-    st.json(diagnostics)
+with st.expander("Under the Hood: Market Diagnostics", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Coins Scanned", diagnostics["total_coins"])
+    col2.metric(f"{donchian_window}-Day Highs", diagnostics["coins_hitting_new_highs"])
+    col3.metric("Currently Squeezed", diagnostics["coins_currently_squeezed"])
     
-    ts_last = signals_dict["hist_z"].index[-1]
-    hist_z_row = signals_dict["hist_z"].loc[ts_last].dropna()
-    cs_z_row = signals_dict["cs_z"].loc[ts_last].dropna()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        fig_hz = go.Figure()
-        fig_hz.add_trace(go.Histogram(x=hist_z_row.values, nbinsx=30, name="Hist Z"))
-        fig_hz.add_vline(
-            x=float(hist_z_threshold),
-            line_dash="dash", line_color="red",
-            annotation_text=f"Gate 1: {hist_z_threshold}",
-            annotation_position="top right",
-        )
-        fig_hz.update_layout(
-            title="Historical Z-Score Distribution",
-            height=300, margin=dict(t=40, b=30, l=20, r=20),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_hz, use_container_width=True)
-
-    with col2:
-        fig_cs = go.Figure()
-        fig_cs.add_trace(go.Histogram(x=cs_z_row.values, nbinsx=30, name="CS Z"))
-        fig_cs.add_vline(
-            x=float(cs_z_threshold),
-            line_dash="dash", line_color="orange",
-            annotation_text=f"Gate 2: {cs_z_threshold}",
-            annotation_position="top right",
-        )
-        fig_cs.update_layout(
-            title="Cross-Sectional Z-Score Distribution",
-            height=300, margin=dict(t=40, b=30, l=20, r=20),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_cs, use_container_width=True)
+    st.write("---")
+    st.json(diagnostics)
