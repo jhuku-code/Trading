@@ -5,11 +5,14 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
 st.set_page_config(page_title="Excess Return Scanner", layout="wide")
 st.title("Excess Return Scanner")
 
 # ─────────────────────────────────────────────
-# Cached: per-coin excess cumulative returns
+# CACHED: PER-COIN EXCESS CUMULATIVE RETURNS
 # ─────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -49,7 +52,7 @@ def compute_excess_cumreturns(price_theme: pd.DataFrame, theme_values_aligned, c
 
 
 # ─────────────────────────────────────────────
-# Improved weighted scoring classifier
+# IMPROVED WEIGHTED SCORING CLASSIFIER
 # ─────────────────────────────────────────────
 
 def _linear_r2(y: np.ndarray) -> float:
@@ -75,49 +78,7 @@ def classify_curvature(
 ):
     """
     Five-criterion weighted scoring classifier.
-
     Returns (label, score, detail_dict)
-        label  : 'convex' | 'concave' | 'flat'
-        score  : int  in [−6, +6]
-        detail : dict of per-criterion signed contributions
-
-    ╔══════════════════════════════════════════════════════════════╗
-    ║  Criterion  │ Wt │ Description                              ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  C1         │  1 │ Robust net direction                     ║
-    ║             │    │ median(last 10%) − median(first 10%)     ║
-    ║             │    │ Immune to outlier start/end bars.        ║
-    ║             │    │ Fixes THETA: early-spike baseline made   ║
-    ║             │    │ single last−first near-zero.             ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  C2         │  2 │ Majority-vote right-side quadratic       ║
-    ║             │    │ Fit quadratic on last 20%, 30%, 40%.     ║
-    ║             │    │ Score +2 if ≥2/3 windows have a>thr AND ║
-    ║             │    │ b>0; −2 if ≥2/3 have a<−thr AND b<0.   ║
-    ║             │    │ Fixes STORJ: one noisy window (pullback  ║
-    ║             │    │ from spike) no longer kills the signal.  ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  C3         │  1 │ Second-half slope sign                   ║
-    ║             │    │ Is slope of second half positive (Buy)?  ║
-    ║             │    │ Removed "faster than first half" check   ║
-    ║             │    │ that penalised decelerating but valid    ║
-    ║             │    │ uptrends like GRT.                       ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  C4         │  1 │ Recent momentum                         ║
-    ║             │    │ mean(last 20%) vs mean(prior 20%).       ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  C5         │  1 │ Trend quality (linear R²)               ║
-    ║             │    │ R² of linear fit on full window.         ║
-    ║             │    │ R²>0.5: clean sustained move → +1 if    ║
-    ║             │    │ direction agrees, −1 if disagrees.       ║
-    ║             │    │ Rewards GRT/STORJ (clean uptrend, high  ║
-    ║             │    │ R²). Penalises THETA (spike+collapse,   ║
-    ║             │    │ low R² on linear fit of full move).      ║
-    ╚══════════════════════════════════════════════════════════════╝
-
-    Max score = 1+2+1+1+1 = 6
-    Default min_score = 3 → any combination adding to ±3 signals.
-    C2 alone (2) never triggers alone — needs at least one more.
     """
     s = series.dropna().tail(n_bars)
     if len(s) < 9:
@@ -179,10 +140,8 @@ def classify_curvature(
 
     # ── C5: trend quality via linear R² ─────────────────────────
     r2    = _linear_r2(y)
-    # Only fire if the trend is clean (R² > 0.5) AND direction is clear
     c5 = 0
     if r2 > 0.5:
-        # direction of the linear fit
         try:
             lin_slope = np.polyfit(np.arange(n, dtype=float), y, 1)[0]
             c5 = 1 if lin_slope > thr else (-1 if lin_slope < -thr else 0)
@@ -201,7 +160,7 @@ def classify_curvature(
 
 
 # ─────────────────────────────────────────────
-# Session state guard
+# SESSION STATE GUARD
 # ─────────────────────────────────────────────
 
 price_theme         = st.session_state.get("price_theme",         None)
@@ -232,8 +191,8 @@ excess_cum, coin_themes = compute_excess_cumreturns(price_theme, theme_values, c
 
 st.subheader("Coin Excess Returns vs. Theme Average")
 st.caption(
-    "Each coin's return minus its theme median return, cumulated over time (additive, %-pts). "
-    "Positive = outperforming theme;  Negative = underperforming."
+    "Each coin's return minus its theme median return, cumulated over time. "
+    "Positive = outperforming theme; Negative = underperforming."
 )
 
 excess_n_bars = st.number_input(
@@ -275,33 +234,25 @@ for theme in sorted(coin_themes.unique()):
 
 st.markdown("---")
 st.subheader("Convexity Scanner — Buy / Sell Signals")
-st.caption(
-    "Scores each coin across **5 criteria** (max ±6 pts total, C2 double-weighted).  \n"
-    "**Buy** = score ≥ threshold (convex / gaining).  "
-    "**Sell** = score ≤ −threshold (concave / losing).  "
-    "Adjust sliders to control sensitivity."
-)
 
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     scan_n_bars = st.number_input(
-        "Bars to scan (right-most window)",
+        "Bars to scan",
         min_value=9, max_value=len(excess_cum), value=min(90, len(excess_cum)), step=1,
         key="scan_n_bars",
     )
 with col_b:
     flatness_thresh = st.slider(
-        "Flatness threshold  (0 = sensitive · 0.5 = strict)",
+        "Flatness threshold",
         min_value=0.0, max_value=0.5, value=0.05, step=0.01,
         key="flatness_thresh",
-        help="Fraction of y-range as dead-band before any criterion fires.",
     )
 with col_c:
     min_score = st.slider(
-        "Min score to signal  (max = 6)",
+        "Min score to signal",
         min_value=1, max_value=6, value=3, step=1,
         key="min_score",
-        help="3 = recommended. 2 = C2 alone can trigger. 5-6 = very strict.",
     )
 
 # Classify every coin
@@ -386,11 +337,12 @@ with st.expander("Show raw scores & criterion breakdown for all coins", expanded
             pass
         return "color: #94a3b8"
 
+    # CRITICAL FIX: Changed .applymap() to .map() for Pandas 2.x+
     st.dataframe(
         score_df.style
-            .applymap(colour_signal, subset=["Signal"])
-            .applymap(colour_score,  subset=["Score", "C1 net", "C2 quad",
-                                              "C3 slope", "C4 mom", "C5 R²"]),
+            .map(colour_signal, subset=["Signal"])
+            .map(colour_score,  subset=["Score", "C1 net", "C2 quad", 
+                                        "C3 slope", "C4 mom", "C5 R²"]),
         use_container_width=True,
     )
 
@@ -418,7 +370,7 @@ if selected_coin:
     theme_label = coin_themes.get(selected_coin, "Unknown")
     shape_label = classifications.get(selected_coin, "flat")
     coin_score  = scores.get(selected_coin, 0)
-    coin_r2     = details.get(selected_coin, {}).get("_r2", 0.0)
+    coin_r2      = details.get(selected_coin, {}).get("_r2", 0.0)
 
     color_map  = {"convex": "#4ade80", "concave": "#f87171", "flat": "#94a3b8"}
     line_color = color_map[shape_label]
@@ -448,4 +400,4 @@ if selected_coin:
     )
     st.plotly_chart(fig_coin, use_container_width=True)
 
-st.success("Done")
+st.success("Scanner Refreshed")
