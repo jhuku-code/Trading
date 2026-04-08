@@ -336,8 +336,8 @@ with col_tbl:
 
     st.dataframe(
         df_s1_detail.style
-            .applymap(_c_pass, subset=["Passes"])
-            .applymap(_c_pct,  subset=["Hist Pct", "X-sec Pct"])
+            .map(_c_pass, subset=["Passes"])
+            .map(_c_pct,  subset=["Hist Pct", "X-sec Pct"])
             .format({"Hist Pct": "{:.3f}", "X-sec Pct": "{:.3f}"}, na_rep="—"),
         use_container_width=True, height=360
     )
@@ -408,8 +408,7 @@ st.markdown(f"""
 | S2 | **X-sec Pct** | Rank vs all peers today | Leading the field |
 | S3 | **Momentum** | Δ x-sec pct over {momentum_lookback}d | Alpha rank rising |
 
-*N1–N3 are cross-sec ranked within Stage 1 survivors (0–1). Composite = equal-weighted average.*  
-*Showing coins with composite ≥ **{min_score_abs:.2f}** ({min_score_pct}% of max).*
+*N1–N3 are cross-sec ranked within Stage 1 survivors (0–1). Composite = equal-weighted average.* *Showing coins with composite ≥ **{min_score_abs:.2f}** ({min_score_pct}% of max).*
 """)
 
 if not df_signal_filtered.empty:
@@ -463,9 +462,9 @@ with tab_full:
     st.dataframe(
         df_signal_filtered.style
             .apply(highlight_row, axis=1)
-            .applymap(_c_norm, subset=norm_cols)
-            .applymap(_c_comp, subset=["Composite"])
-            .applymap(_c_gate, subset=["Stage-1 gate"])
+            .map(_c_norm, subset=norm_cols)
+            .map(_c_comp, subset=["Composite"])
+            .map(_c_gate, subset=["Stage-1 gate"])
             .format(fmt, na_rep="—"),
         use_container_width=True, height=500
     )
@@ -476,8 +475,8 @@ with tab_raw:
     st.dataframe(
         df_signal_filtered[raw_cols].style
             .apply(highlight_row, axis=1)
-            .applymap(_c_comp, subset=["Composite"])
-            .applymap(_c_gate, subset=["Stage-1 gate"])
+            .map(_c_comp, subset=["Composite"])
+            .map(_c_gate, subset=["Stage-1 gate"])
             .format({c: "{:.3f}" for c in raw_cols if c not in ("Coin", "Stage-1 gate")},
                     na_rep="—"),
         use_container_width=True, height=500
@@ -488,9 +487,9 @@ with tab_norm_tab:
     st.dataframe(
         df_signal_filtered[n_cols].style
             .apply(highlight_row, axis=1)
-            .applymap(_c_norm, subset=norm_cols)
-            .applymap(_c_comp, subset=["Composite"])
-            .applymap(_c_gate, subset=["Stage-1 gate"])
+            .map(_c_norm, subset=norm_cols)
+            .map(_c_comp, subset=["Composite"])
+            .map(_c_gate, subset=["Stage-1 gate"])
             .format({c: "{:.3f}" for c in n_cols if c not in ("Coin", "Stage-1 gate")},
                     na_rep="—"),
         use_container_width=True, height=500
@@ -701,8 +700,8 @@ with st.expander("🔬 QC Diagnostics", expanded=False):
 
     st.dataframe(
         diag_df.style
-            .applymap(_c_pr, subset=["QC Pass Rate"])
-            .applymap(_c_ac, subset=[f"Autocorr (lag={AUTOCORR_LAG}d)"])
+            .map(_c_pr, subset=["QC Pass Rate"])
+            .map(_c_ac, subset=[f"Autocorr (lag={AUTOCORR_LAG}d)"])
             .format({
                 "QC Pass Rate":        "{:.1%}",
                 "Alpha today (×100)":  "{:.4f}",
