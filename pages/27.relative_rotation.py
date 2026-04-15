@@ -62,7 +62,7 @@ def calculate_excess_rrg(price_df, coins, window=14):
     
     rrg_results = {}
     for coin in coins:
-        # 1. Relative Price (Asset cumulated return / Benchmark cumulated return)
+        # 1. Relative Price
         rel_price = (1 + returns_df[coin]).cumprod() / (1 + benchmark_ret).cumprod()
         
         # 2. RS-Ratio: EMA smoothed relative price + Z-Score Normalization
@@ -70,7 +70,6 @@ def calculate_excess_rrg(price_df, coins, window=14):
         rs_ratio_mean = rs_ratio_raw.rolling(window=window, min_periods=1).mean()
         rs_ratio_std = rs_ratio_raw.rolling(window=window, min_periods=1).std().replace(0, 0.0001)
         
-        # Scale factor (e.g., 5) keeps the visualization tight around the 100 center
         rs_ratio = ((rs_ratio_raw - rs_ratio_mean) / rs_ratio_std * 5) + 100
         
         # 3. RS-Momentum: Rate of change of RS-Ratio + Z-Score Normalization
@@ -99,7 +98,7 @@ if st.sidebar.button("🔄 Fetch Data"):
         st.session_state.last_fetch = datetime.utcnow()
         st.success("Data Updated!")
 
-# ---------------- RRG Visualization Section ----------------
+# ---------------- Dashboard Body ----------------
 if st.session_state["price_theme"] is not None:
     prices = st.session_state["price_theme"]
     mapping = st.session_state["ticker_to_theme"]
@@ -111,7 +110,7 @@ if st.session_state["price_theme"] is not None:
     
     with c1:
         themes = sorted(list(set(mapping.values())))
-        sel_theme = st.selectbox("Select Theme", themes)
+        sel_theme = st.selectbox("Select Theme to Visualize", themes)
         theme_coins = [k for k, v in mapping.items() if v == sel_theme and k in prices.columns]
         
     with c2:
@@ -121,15 +120,16 @@ if st.session_state["price_theme"] is not None:
     with c3:
         active_coins = st.multiselect("Coins to Plot", theme_coins, default=theme_coins)
 
+    # --- 1. PLOTLY VISUALIZATION ---
     if len(active_coins) < 2:
         st.warning("Please select at least 2 coins to calculate a relative average.")
     else:
         results = calculate_excess_rrg(prices, active_coins, window=smooth_win)
         fig = go.Figure()
 
-        # Explicit 100-lines for X and Y axes
-        fig.add_hline(y=100, line_width=3, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
-        fig.add_vline(x=100, line_width=3, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
+        # Explicit Bold 100-lines for X (Trend) and Y (Momentum)
+        fig.add_hline(y=100, line_width=2, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
+        fig.add_vline(x=100, line_width=2, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
 
         for coin in active_coins:
             if coin not in results:
@@ -141,7 +141,7 @@ if st.session_state["price_theme"] is not None:
             x_vals = df['x'].tolist()
             y_vals = df['y'].tolist()
 
-            # 1. The Trail
+            # The Trail
             fig.add_trace(go.Scatter(
                 x=x_vals, y=y_vals,
                 mode='lines',
@@ -150,49 +150,31 @@ if st.session_state["price_theme"] is not None:
                 name=coin
             ))
             
-            # 2. Entry / Exit Marker Logic
-            entries_x, entries_y = [], []
-            exits_x, exits_y = [], []
-            
+            # Entry / Exit Markers
+            entries_x, entries_y, exits_x, exits_y = [], [], [], []
             for i in range(1, len(x_vals)):
                 prev_x, prev_y = x_vals[i-1], y_vals[i-1]
                 curr_x, curr_y = x_vals[i], y_vals[i]
                 
-                # Entry: Crossing into 'Improving' (Y goes > 100 while X <= 100) 
-                # OR Crossing into 'Leading' (X goes > 100 while Y >= 100)
+                # Entry Logic
                 if (prev_y < 100 <= curr_y and curr_x <= 100) or (prev_x < 100 <= curr_x and curr_y >= 100):
-                    entries_x.append(curr_x)
-                    entries_y.append(curr_y)
-                    
-                # Exit: Crossing into 'Weakening' (Y goes < 100 while X >= 100)
-                # OR Crossing into 'Lagging' (X goes < 100 while Y <= 100)
+                    entries_x.append(curr_x); entries_y.append(curr_y)
+                # Exit Logic
                 if (prev_y > 100 >= curr_y and curr_x >= 100) or (prev_x > 100 >= curr_x and curr_y <= 100):
-                    exits_x.append(curr_x)
-                    exits_y.append(curr_y)
+                    exits_x.append(curr_x); exits_y.append(curr_y)
             
-            # Plot Entries
             if entries_x:
-                fig.add_trace(go.Scatter(
-                    x=entries_x, y=entries_y,
-                    mode='markers',
+                fig.add_trace(go.Scatter(x=entries_x, y=entries_y, mode='markers',
                     marker=dict(symbol='triangle-up', size=12, color='#00FF00', line=dict(width=1, color='white')),
-                    name=f'{coin} Entry',
-                    showlegend=False,
-                    hovertemplate="<b>Entry Signal</b>"
+                    name=f'{coin} Entry', showlegend=False, hovertemplate="<b>Entry Signal</b>"
                 ))
-            
-            # Plot Exits
             if exits_x:
-                fig.add_trace(go.Scatter(
-                    x=exits_x, y=exits_y,
-                    mode='markers',
+                fig.add_trace(go.Scatter(x=exits_x, y=exits_y, mode='markers',
                     marker=dict(symbol='triangle-down', size=12, color='#FF0000', line=dict(width=1, color='white')),
-                    name=f'{coin} Exit',
-                    showlegend=False,
-                    hovertemplate="<b>Exit Signal</b>"
+                    name=f'{coin} Exit', showlegend=False, hovertemplate="<b>Exit Signal</b>"
                 ))
 
-            # 3. The Latest Data Point
+            # Latest Data Point
             fig.add_trace(go.Scatter(
                 x=[x_vals[-1]], y=[y_vals[-1]],
                 mode='markers+text',
@@ -203,40 +185,85 @@ if st.session_state["price_theme"] is not None:
                 hovertemplate=f"<b>{coin}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Mom: %{{y:.2f}}"
             ))
 
-            # 4. Directional Arrow Annotation
+            # Directional Arrow Annotation
             fig.add_annotation(
                 x=x_vals[-1], y=y_vals[-1],
                 ax=x_vals[-2], ay=y_vals[-2],
-                xref="x", yref="y",
-                axref="x", ayref="y",
+                xref="x", yref="y", axref="x", ayref="y",
                 showarrow=True,
-                arrowhead=2,
-                arrowsize=1.5,
-                arrowwidth=2,
-                arrowcolor="rgba(255, 255, 255, 0.8)"
+                arrowhead=2, arrowsize=2, arrowwidth=3,  # Thickened arrow for visibility
+                arrowcolor="rgba(255, 255, 255, 0.9)"
             )
 
         # Annotate Quadrants
         quad_attr = dict(showarrow=False, font=dict(size=16, color="rgba(255,255,255,0.3)"))
-        
-        # Calculate dynamic positions for quadrant text based on layout limits
         fig.add_annotation(x=105, y=105, text="LEADING", **quad_attr)
         fig.add_annotation(x=105, y=95, text="WEAKENING", **quad_attr)
         fig.add_annotation(x=95, y=95, text="LAGGING", **quad_attr)
         fig.add_annotation(x=95, y=105, text="IMPROVING", **quad_attr)
 
-        # Ensure aspect ratio is exactly 1:1 and limits are properly buffered
         fig.update_layout(
-            height=800,
+            height=700,
             xaxis_title="Relative Strength Ratio (Trend)",
             yaxis_title="Relative Strength Momentum (Momentum)",
             template="plotly_dark",
             xaxis=dict(range=[90, 110]),
             yaxis=dict(range=[90, 110], scaleanchor="x", scaleratio=1),
-            hovermode="closest"
+            hovermode="closest",
+            margin=dict(l=40, r=40, t=40, b=40)
         )
 
         st.plotly_chart(fig, use_container_width=True)
+
+    # --- 2. ACTIONABLE SUMMARY MATRIX ---
+    st.divider()
+    st.header("Actionable Summary Matrix (All Themes)")
+    st.markdown("This table calculates the current quadrant for **all tracked coins** across all themes, instantly highlighting where to deploy or withdraw capital.")
+    
+    summary_data = []
+    
+    with st.spinner("Calculating matrices for all themes..."):
+        for theme_name in themes:
+            t_coins = [k for k, v in mapping.items() if v == theme_name and k in prices.columns]
+            
+            # Skip if we can't do an intra-theme relative calculation
+            if len(t_coins) < 2:
+                continue
+                
+            t_results = calculate_excess_rrg(prices, t_coins, window=smooth_win)
+            
+            improving, leading, weakening, lagging = [], [], [], []
+            
+            for c, df_rrg in t_results.items():
+                if df_rrg.empty:
+                    continue
+                    
+                curr_x = df_rrg['x'].iloc[-1]
+                curr_y = df_rrg['y'].iloc[-1]
+                
+                if curr_x >= 100 and curr_y >= 100:
+                    leading.append(c)
+                elif curr_x >= 100 and curr_y < 100:
+                    weakening.append(c)
+                elif curr_x < 100 and curr_y < 100:
+                    lagging.append(c)
+                else:  # curr_x < 100 and curr_y >= 100
+                    improving.append(c)
+                    
+            summary_data.append({
+                "Theme": theme_name,
+                "🟢 BUY / ACCUMULATE (Improving)": ", ".join(improving) if improving else "-",
+                "🔵 HOLD / OVERWEIGHT (Leading)": ", ".join(leading) if leading else "-",
+                "🟠 SELL / REDUCE (Weakening)": ", ".join(weakening) if weakening else "-",
+                "🔴 AVOID / SHORT (Lagging)": ", ".join(lagging) if lagging else "-"
+            })
+            
+    if summary_data:
+        # Convert to DataFrame and display without the index
+        summary_df = pd.DataFrame(summary_data)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Not enough data to build the summary table.")
 
 else:
     st.info("Click 'Fetch Data' in the sidebar to load the price history.")
