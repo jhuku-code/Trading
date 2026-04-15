@@ -138,7 +138,14 @@ excess_cum, coin_themes = compute_excess_cumreturns(price_theme, theme_values, (
 # ═════════════════════════════════════════════════════════════════
 st.subheader("Coin Excess Returns vs. Theme Average")
 excess_n_bars = st.number_input("Display bars", 5, len(excess_cum), min(90, len(excess_cum)))
-excess_display = excess_cum.tail(int(excess_n_bars))
+
+# Fetch the tail of the data and make a copy
+excess_display = excess_cum.tail(int(excess_n_bars)).copy()
+
+# Rebase all columns to start at 100 based on their first valid value in the display window
+excess_display = excess_display.apply(
+    lambda col: col - col.loc[col.first_valid_index()] + 100 if col.first_valid_index() is not None else col
+)
 
 for theme in sorted(coin_themes.unique()):
     coins = [c for c in coin_themes[coin_themes == theme].index if c in excess_display.columns]
