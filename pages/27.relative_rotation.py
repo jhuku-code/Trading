@@ -53,21 +53,33 @@ def fetch_prices(exchange, symbols, timeframe, limit):
             continue
     return pd.concat(frames, axis=1)
 
-# ---------------- RRG Math (Excess Return Based) ----------------
+# ---------------- RRG Math (EMA + Z-Score Standardization) ----------------
 def calculate_excess_rrg(price_df, coins, window=14):
     returns_df = price_df[coins].pct_change().dropna()
+    
+    # Intra-theme benchmark: average return of the selected group
     benchmark_ret = returns_df.mean(axis=1)
     
     rrg_results = {}
     for coin in coins:
-        excess_ret = returns_df[coin] - benchmark_ret
-        alpha_index = (1 + excess_ret).cumprod() * 100
+        # 1. Relative Price (Asset cumulated return / Benchmark cumulated return)
+        rel_price = (1 + returns_df[coin]).cumprod() / (1 + benchmark_ret).cumprod()
         
-        short_ma = alpha_index.rolling(window=window).mean()
-        long_ma = alpha_index.rolling(window=window * 2).mean()
-        rs_ratio = (short_ma / long_ma) * 100
+        # 2. RS-Ratio: EMA smoothed relative price + Z-Score Normalization
+        rs_ratio_raw = rel_price.ewm(span=window).mean()
+        rs_ratio_mean = rs_ratio_raw.rolling(window=window, min_periods=1).mean()
+        rs_ratio_std = rs_ratio_raw.rolling(window=window, min_periods=1).std().replace(0, 0.0001)
         
-        rs_mom = (rs_ratio.pct_change(periods=max(1, window // 2)) * 100) + 100
+        # Scale factor (e.g., 5) keeps the visualization tight around the 100 center
+        rs_ratio = ((rs_ratio_raw - rs_ratio_mean) / rs_ratio_std * 5) + 100
+        
+        # 3. RS-Momentum: Rate of change of RS-Ratio + Z-Score Normalization
+        roc_period = max(1, window // 2)
+        rs_mom_raw = rs_ratio_raw.pct_change(periods=roc_period).ewm(span=roc_period).mean()
+        rs_mom_mean = rs_mom_raw.rolling(window=window, min_periods=1).mean()
+        rs_mom_std = rs_mom_raw.rolling(window=window, min_periods=1).std().replace(0, 0.0001)
+        
+        rs_mom = ((rs_mom_raw - rs_mom_mean) / rs_mom_std * 5) + 100
         
         rrg_results[coin] = pd.DataFrame({'x': rs_ratio, 'y': rs_mom}).dropna()
         
@@ -93,7 +105,7 @@ if st.session_state["price_theme"] is not None:
     mapping = st.session_state["ticker_to_theme"]
 
     st.divider()
-    st.header("Relative Rotation Graph (Excess Returns)")
+    st.header("Relative Rotation Graph (Intra-Theme Outperformance)")
     
     c1, c2, c3 = st.columns([1, 1, 2])
     
@@ -104,7 +116,7 @@ if st.session_state["price_theme"] is not None:
         
     with c2:
         trail_len = st.slider("Trail Length (Periods)", 5, 180, 20)
-        smooth_win = st.number_input("Smoothing (Window)", 5, 40, 14)
+        smooth_win = st.number_input("EMA Smoothing Window", 5, 40, 14)
 
     with c3:
         active_coins = st.multiselect("Coins to Plot", theme_coins, default=theme_coins)
@@ -115,18 +127,21 @@ if st.session_state["price_theme"] is not None:
         results = calculate_excess_rrg(prices, active_coins, window=smooth_win)
         fig = go.Figure()
 
-        # >>> FIX 1: Explicit, Bold 100-lines for both X and Y axis <<<
+        # Explicit 100-lines for X and Y axes
         fig.add_hline(y=100, line_width=3, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
         fig.add_vline(x=100, line_width=3, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
 
         for coin in active_coins:
+            if coin not in results:
+                continue
+                
             df = results[coin].tail(trail_len)
             if len(df) < 2: continue
             
             x_vals = df['x'].tolist()
             y_vals = df['y'].tolist()
 
-            # 1. The Trail (Line)
+            # 1. The Trail
             fig.add_trace(go.Scatter(
                 x=x_vals, y=y_vals,
                 mode='lines',
@@ -135,7 +150,49 @@ if st.session_state["price_theme"] is not None:
                 name=coin
             ))
             
-            # 2. The Latest Data Point (Dot + Text)
+            # 2. Entry / Exit Marker Logic
+            entries_x, entries_y = [], []
+            exits_x, exits_y = [], []
+            
+            for i in range(1, len(x_vals)):
+                prev_x, prev_y = x_vals[i-1], y_vals[i-1]
+                curr_x, curr_y = x_vals[i], y_vals[i]
+                
+                # Entry: Crossing into 'Improving' (Y goes > 100 while X <= 100) 
+                # OR Crossing into 'Leading' (X goes > 100 while Y >= 100)
+                if (prev_y < 100 <= curr_y and curr_x <= 100) or (prev_x < 100 <= curr_x and curr_y >= 100):
+                    entries_x.append(curr_x)
+                    entries_y.append(curr_y)
+                    
+                # Exit: Crossing into 'Weakening' (Y goes < 100 while X >= 100)
+                # OR Crossing into 'Lagging' (X goes < 100 while Y <= 100)
+                if (prev_y > 100 >= curr_y and curr_x >= 100) or (prev_x > 100 >= curr_x and curr_y <= 100):
+                    exits_x.append(curr_x)
+                    exits_y.append(curr_y)
+            
+            # Plot Entries
+            if entries_x:
+                fig.add_trace(go.Scatter(
+                    x=entries_x, y=entries_y,
+                    mode='markers',
+                    marker=dict(symbol='triangle-up', size=12, color='#00FF00', line=dict(width=1, color='white')),
+                    name=f'{coin} Entry',
+                    showlegend=False,
+                    hovertemplate="<b>Entry Signal</b>"
+                ))
+            
+            # Plot Exits
+            if exits_x:
+                fig.add_trace(go.Scatter(
+                    x=exits_x, y=exits_y,
+                    mode='markers',
+                    marker=dict(symbol='triangle-down', size=12, color='#FF0000', line=dict(width=1, color='white')),
+                    name=f'{coin} Exit',
+                    showlegend=False,
+                    hovertemplate="<b>Exit Signal</b>"
+                ))
+
+            # 3. The Latest Data Point
             fig.add_trace(go.Scatter(
                 x=[x_vals[-1]], y=[y_vals[-1]],
                 mode='markers+text',
@@ -146,8 +203,7 @@ if st.session_state["price_theme"] is not None:
                 hovertemplate=f"<b>{coin}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Mom: %{{y:.2f}}"
             ))
 
-            # >>> FIX 2: Explicit Arrow Annotation for Direction <<<
-            # This draws a literal arrow from the second-to-last point to the last point
+            # 4. Directional Arrow Annotation
             fig.add_annotation(
                 x=x_vals[-1], y=y_vals[-1],
                 ax=x_vals[-2], ay=y_vals[-2],
@@ -162,20 +218,22 @@ if st.session_state["price_theme"] is not None:
 
         # Annotate Quadrants
         quad_attr = dict(showarrow=False, font=dict(size=16, color="rgba(255,255,255,0.3)"))
-        fig.add_annotation(x=102, y=102, text="LEADING", **quad_attr)
-        fig.add_annotation(x=102, y=98, text="WEAKENING", **quad_attr)
-        fig.add_annotation(x=98, y=98, text="LAGGING", **quad_attr)
-        fig.add_annotation(x=98, y=102, text="IMPROVING", **quad_attr)
+        
+        # Calculate dynamic positions for quadrant text based on layout limits
+        fig.add_annotation(x=105, y=105, text="LEADING", **quad_attr)
+        fig.add_annotation(x=105, y=95, text="WEAKENING", **quad_attr)
+        fig.add_annotation(x=95, y=95, text="LAGGING", **quad_attr)
+        fig.add_annotation(x=95, y=105, text="IMPROVING", **quad_attr)
 
-        # >>> FIX 3: Force 1:1 Aspect Ratio (scaleanchor) <<<
-        # This guarantees rotation vectors are visually accurate regardless of screen size.
+        # Ensure aspect ratio is exactly 1:1 and limits are properly buffered
         fig.update_layout(
             height=800,
             xaxis_title="Relative Strength Ratio (Trend)",
             yaxis_title="Relative Strength Momentum (Momentum)",
             template="plotly_dark",
-            xaxis=dict(range=[95, 105]),
-            yaxis=dict(range=[95, 105], scaleanchor="x", scaleratio=1) 
+            xaxis=dict(range=[90, 110]),
+            yaxis=dict(range=[90, 110], scaleanchor="x", scaleratio=1),
+            hovermode="closest"
         )
 
         st.plotly_chart(fig, use_container_width=True)
