@@ -55,13 +55,18 @@ def fetch_prices(exchange, symbols, timeframe, limit):
 
 # ---------------- RRG Math (EMA + Z-Score Standardization) ----------------
 def calculate_excess_rrg(price_df, coins, window=14):
-    returns_df = price_df[coins].pct_change().dropna()
+    # Ensure we only use coins that actually exist in the dataframe
+    valid_coins = [c for c in coins if c in price_df.columns]
+    if not valid_coins:
+        return {}
+        
+    returns_df = price_df[valid_coins].pct_change().dropna()
     
-    # Intra-theme benchmark: average return of the selected group
+    # Intra-theme benchmark: average return of ALL coins passed to the function
     benchmark_ret = returns_df.mean(axis=1)
     
     rrg_results = {}
-    for coin in coins:
+    for coin in valid_coins:
         # 1. Relative Price
         rel_price = (1 + returns_df[coin]).cumprod() / (1 + benchmark_ret).cumprod()
         
@@ -111,6 +116,7 @@ if st.session_state["price_theme"] is not None:
     with c1:
         themes = sorted(list(set(mapping.values())))
         sel_theme = st.selectbox("Select Theme to Visualize", themes)
+        # Identify ALL coins in this theme to calculate the true benchmark
         theme_coins = [k for k, v in mapping.items() if v == sel_theme and k in prices.columns]
         
     with c2:
@@ -121,21 +127,24 @@ if st.session_state["price_theme"] is not None:
         active_coins = st.multiselect("Coins to Plot", theme_coins, default=theme_coins)
 
     # --- 1. PLOTLY VISUALIZATION ---
-    if len(active_coins) < 2:
-        st.warning("Please select at least 2 coins to calculate a relative average.")
+    if len(theme_coins) < 2:
+        st.warning("Not enough coins in this theme to calculate a relative average.")
     else:
-        results = calculate_excess_rrg(prices, active_coins, window=smooth_win)
+        # >>> FIX: Calculate RRG using ALL theme coins, not just the active ones <<<
+        full_theme_results = calculate_excess_rrg(prices, theme_coins, window=smooth_win)
+        
         fig = go.Figure()
 
         # Explicit Bold 100-lines for X (Trend) and Y (Momentum)
         fig.add_hline(y=100, line_width=2, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
         fig.add_vline(x=100, line_width=2, line_dash="solid", line_color="rgba(255, 255, 255, 0.4)", layer="below")
 
+        # Now iterate only through the coins the user wants to SEE
         for coin in active_coins:
-            if coin not in results:
+            if coin not in full_theme_results:
                 continue
                 
-            df = results[coin].tail(trail_len)
+            df = full_theme_results[coin].tail(trail_len)
             if len(df) < 2: continue
             
             x_vals = df['x'].tolist()
@@ -191,7 +200,7 @@ if st.session_state["price_theme"] is not None:
                 ax=x_vals[-2], ay=y_vals[-2],
                 xref="x", yref="y", axref="x", ayref="y",
                 showarrow=True,
-                arrowhead=2, arrowsize=2, arrowwidth=3,  # Thickened arrow for visibility
+                arrowhead=2, arrowsize=2, arrowwidth=3,
                 arrowcolor="rgba(255, 255, 255, 0.9)"
             )
 
@@ -226,7 +235,6 @@ if st.session_state["price_theme"] is not None:
         for theme_name in themes:
             t_coins = [k for k, v in mapping.items() if v == theme_name and k in prices.columns]
             
-            # Skip if we can't do an intra-theme relative calculation
             if len(t_coins) < 2:
                 continue
                 
@@ -241,13 +249,14 @@ if st.session_state["price_theme"] is not None:
                 curr_x = df_rrg['x'].iloc[-1]
                 curr_y = df_rrg['y'].iloc[-1]
                 
-                if curr_x >= 100 and curr_y >= 100:
+                # >>> FIX: Refined exhaustive classification logic <<<
+                if curr_x > 100 and curr_y > 100:
                     leading.append(c)
-                elif curr_x >= 100 and curr_y < 100:
+                elif curr_x > 100 and curr_y <= 100:
                     weakening.append(c)
-                elif curr_x < 100 and curr_y < 100:
+                elif curr_x <= 100 and curr_y <= 100:
                     lagging.append(c)
-                else:  # curr_x < 100 and curr_y >= 100
+                elif curr_x <= 100 and curr_y > 100:
                     improving.append(c)
                     
             summary_data.append({
@@ -259,7 +268,6 @@ if st.session_state["price_theme"] is not None:
             })
             
     if summary_data:
-        # Convert to DataFrame and display without the index
         summary_df = pd.DataFrame(summary_data)
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
     else:
