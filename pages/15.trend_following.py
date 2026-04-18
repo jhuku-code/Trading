@@ -36,7 +36,7 @@ if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
 
 # ---------------------------------------------------------
-# INPUT DATA FROM SESSION STATE
+# INPUT DATA FROM SESSION STATE & SANITIZATION
 # ---------------------------------------------------------
 df_h = st.session_state.get("price_theme", None)
 
@@ -47,6 +47,8 @@ if df_h is None:
     )
     st.stop()
 
+# CRITICAL FIX: Coerce all data to numeric to prevent string comparison errors
+df_h = df_h.apply(pd.to_numeric, errors='coerce')
 # Ensure index is sorted, drop completely empty columns, and work on a copy
 df_h = df_h.sort_index().dropna(axis=1, how='all').copy()
 
@@ -80,14 +82,8 @@ def jfatl(series, fatl_len, jma_len, phase):
     return wma1 * e + wma2 * (1 - e)
 
 def nadaraya_watson_optimized(series, h, r):
-    """
-    Optimized to only calculate the last value to prevent Streamlit from freezing.
-    Returns the most recent smoothed value.
-    """
     n = len(series)
     if n == 0: return np.nan
-    
-    # We only need the very last smoothed point for the signal
     t = n - 1
     indices = np.arange(0, t)
     distances = t - indices
@@ -100,21 +96,30 @@ def nadaraya_watson_optimized(series, h, r):
     return np.sum(values * weights) / np.sum(weights)
 
 # ---------------------------------------------------------
-# SIGNAL GENERATION & RANKING ENGINE
+# SIGNAL GENERATION & DIAGNOSTICS ENGINE
 # ---------------------------------------------------------
-st.write("Processing signals... This may take a moment depending on the universe size.")
+st.write("Processing signals... Check the Diagnostics expander below if results are empty.")
 
 buy_list_data = []
 sell_list_data = []
+diagnostic_data = [] # Stores raw state of every coin for debugging
 
-# Process only the last 200 bars (adjusted for timeframe) to save compute time
+# Calculate required window
 calculation_window = max(200, lookback_30d + aema_period + 10)
+skipped_due_to_length = 0
 
 for ticker in df_h.columns:
     series = df_h[ticker].dropna()
     
+    # DIAGNOSTIC: Check if we have enough data
     if len(series) < calculation_window:
-        continue  # Skip if not enough data
+        skipped_due_to_length += 1
+        diagnostic_data.append({
+            "Ticker": ticker, "Status": f"Skipped (Len {len(series)} < {calculation_window})",
+            "Price": np.nan, "AEMA": np.nan, "JFATL": np.nan, "NW": np.nan, 
+            "Score": 0
+        })
+        continue 
         
     # Slice the series for faster processing
     series_sliced = series.iloc[-calculation_window:]
@@ -126,44 +131,74 @@ for ticker in df_h.columns:
     
     current_price = series_sliced.iloc[-1]
     
-    # 2. Calculate Returns (Momentum & Overextension)
+    # 2. Calculate Returns 
     ret_7d = (current_price / series_sliced.iloc[-lookback_7d] - 1) * 100 if len(series_sliced) >= lookback_7d else 0
     ret_30d = (current_price / series_sliced.iloc[-lookback_30d] - 1) * 100 if len(series_sliced) >= lookback_30d else 0
     
-    # 3. Evaluate "2 out of 3" Conditions
-    # Booleans evaluate to 1 (True) or 0 (False)
-    bullish_conditions = (current_price > aema) + (current_price > jtl) + (current_price > nw)
-    bearish_conditions = (current_price < aema) + (current_price < jtl) + (current_price < nw)
+    # 3. Evaluate Conditions safely (handling potential NaNs)
+    cond_aema = current_price > aema if not pd.isna(aema) else False
+    cond_jtl = current_price > jtl if not pd.isna(jtl) else False
+    cond_nw = current_price > nw if not pd.isna(nw) else False
     
+    bullish_conditions = int(cond_aema) + int(cond_jtl) + int(cond_nw)
+    
+    cond_aema_bear = current_price < aema if not pd.isna(aema) else False
+    cond_jtl_bear = current_price < jtl if not pd.isna(jtl) else False
+    cond_nw_bear = current_price < nw if not pd.isna(nw) else False
+    
+    bearish_conditions = int(cond_aema_bear) + int(cond_jtl_bear) + int(cond_nw_bear)
+    
+    # DIAGNOSTIC: Record raw math for this coin
+    diagnostic_data.append({
+        "Ticker": ticker,
+        "Status": "Processed",
+        "Price": round(current_price, 4),
+        "AEMA": round(aema, 4) if not pd.isna(aema) else "NaN",
+        "JFATL": round(jtl, 4) if not pd.isna(jtl) else "NaN",
+        "NW": round(nw, 4) if not pd.isna(nw) else "NaN",
+        "> AEMA?": cond_aema,
+        "> JFATL?": cond_jtl,
+        "> NW?": cond_nw,
+        "Bullish Score": bullish_conditions,
+        "Bearish Score": bearish_conditions
+    })
+
     # 4. Generate Signals & Rank
     if bullish_conditions >= 2:
-        # BUY RANKING: Reward 7d momentum, but heavily penalize if 30d return is massive
-        # e.g., A coin up 10% this week, but up 200% this month gets a lower score.
         buy_score = ret_7d - (ret_30d * 0.4) 
-        
         buy_list_data.append({
-            "Ticker": ticker,
-            "Price": round(current_price, 4),
-            "7D Return (%)": round(ret_7d, 2),
-            "30D Return (%)": round(ret_30d, 2),
-            "Rank Score": round(buy_score, 2),
-            "Indicators Met": bullish_conditions
+            "Ticker": ticker, "Price": round(current_price, 4),
+            "7D Return (%)": round(ret_7d, 2), "30D Return (%)": round(ret_30d, 2),
+            "Rank Score": round(buy_score, 2), "Indicators Met": bullish_conditions
         })
         
     elif bearish_conditions >= 2:
-        # SELL RANKING: Reward 7d drops, but penalize if it's already dumped 90% over 30 days
         sell_score = -ret_7d + (ret_30d * 0.4)
-        
         sell_list_data.append({
-            "Ticker": ticker,
-            "Price": round(current_price, 4),
-            "7D Return (%)": round(ret_7d, 2),
-            "30D Return (%)": round(ret_30d, 2),
-            "Rank Score": round(sell_score, 2),
-            "Indicators Met": bearish_conditions
+            "Ticker": ticker, "Price": round(current_price, 4),
+            "7D Return (%)": round(ret_7d, 2), "30D Return (%)": round(ret_30d, 2),
+            "Rank Score": round(sell_score, 2), "Indicators Met": bearish_conditions
         })
 
-# Convert to DataFrames and Sort by Rank Score (Descending)
+# ---------------------------------------------------------
+# DISPLAY DIAGNOSTICS (NEW)
+# ---------------------------------------------------------
+with st.expander("🛠️ Under the Hood: Diagnostics (Check why signals are failing)"):
+    st.write(f"**Total tickers in dataframe:** {len(df_h.columns)}")
+    st.write(f"**Required calculation window (bars):** {calculation_window}")
+    
+    if skipped_due_to_length > 0:
+        st.warning(f"⚠️ {skipped_due_to_length} tickers were skipped because they have less than {calculation_window} bars of data. If all tickers are skipped, your timeframe/lookback settings are too large for your dataset.")
+        
+    st.markdown("### Raw Indicator Data for All Tickers")
+    st.write("If AEMA, JFATL, or NW say 'NaN', your smoothing functions are failing (likely due to missing data or zeros). If 'Bullish Score' is 0 or 1 across the board, the trend is genuinely not strong enough.")
+    if diagnostic_data:
+        df_diag = pd.DataFrame(diagnostic_data)
+        st.dataframe(df_diag, use_container_width=True)
+
+# ---------------------------------------------------------
+# DISPLAY RESULTS
+# ---------------------------------------------------------
 df_buys = pd.DataFrame(buy_list_data)
 if not df_buys.empty:
     df_buys = df_buys.sort_values(by="Rank Score", ascending=False).reset_index(drop=True)
@@ -172,9 +207,6 @@ df_sells = pd.DataFrame(sell_list_data)
 if not df_sells.empty:
     df_sells = df_sells.sort_values(by="Rank Score", ascending=False).reset_index(drop=True)
 
-# ---------------------------------------------------------
-# DISPLAY RESULTS
-# ---------------------------------------------------------
 st.subheader("Signal & Return Tables")
 
 col1, col2 = st.columns(2)
