@@ -41,6 +41,7 @@ themes = sorted(theme_map_df["theme"].unique())
 st.sidebar.header("Filter Parameters")
 ma_window = st.sidebar.slider("Spread MA Window", 10, 100, 30)
 trend_ma_window = st.sidebar.slider("Long Leg Trend MA Window", 5, 100, 10)
+max_short_drawdown = st.sidebar.slider("Max Short Drawdown from ATH (%)", 10, 100, 90)
 
 # =========================
 # 🔍 CORE FUNCTION (FULL HISTORY)
@@ -74,14 +75,20 @@ def analyze_pair(df, c1, c2, ma_window):
 # 🚀 CACHED SCANNER
 # =========================
 @st.cache_data
-def run_scanner(price_df, theme_map_df, ma_window, trend_ma_window):
+def run_scanner(price_df, theme_map_df, ma_window, trend_ma_window, max_short_drawdown):
 
     mr_dict = {}
     trend_dict = {}
 
-    # Pre-calculate the trend moving average for all coins to optimize the loop
+    # 1. Pre-calculate the trend moving average for all coins (Long Filter)
     trend_ma_df = price_df.rolling(window=trend_ma_window).mean()
     is_uptrend = price_df.iloc[-1] > trend_ma_df.iloc[-1]
+
+    # 2. Pre-calculate Drawdown from ATH (Short Filter)
+    ath_prices = price_df.max()
+    current_prices = price_df.iloc[-1]
+    drawdown_pct = ((ath_prices - current_prices) / ath_prices) * 100
+    is_valid_short = drawdown_pct <= max_short_drawdown
 
     for theme in sorted(theme_map_df["theme"].unique()):
 
@@ -94,10 +101,17 @@ def run_scanner(price_df, theme_map_df, ma_window, trend_ma_window):
         for c1, c2 in combinations(coins, 2):
 
             # =====================
-            # ABSOLUTE TREND FILTER 
+            # LONG FILTER 
             # Long candidate (c1) must be > its own moving average
             # =====================
             if not is_uptrend[c1]:
+                continue
+                
+            # =====================
+            # SHORT FILTER 
+            # Short candidate (c2) must NOT be down more than X% from ATH
+            # =====================
+            if not is_valid_short[c2]:
                 continue
 
             res = analyze_pair(price_df, c1, c2, ma_window)
@@ -139,7 +153,7 @@ def run_scanner(price_df, theme_map_df, ma_window, trend_ma_window):
 # =========================
 # 🧮 RUN SCAN
 # =========================
-mr_df, trend_df = run_scanner(price_df, theme_map_df, ma_window, trend_ma_window)
+mr_df, trend_df = run_scanner(price_df, theme_map_df, ma_window, trend_ma_window, max_short_drawdown)
 
 # =========================
 # 📊 TABLE OUTPUT
