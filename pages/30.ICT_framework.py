@@ -435,7 +435,7 @@ else:
         except Exception:
             return ""
 
-    styled_long = df_long.style.applymap(_color_pct, subset=["% to SSL ▲"])
+    styled_long = df_long.style.map(_color_pct, subset=["% to SSL ▲"])
     st.dataframe(styled_long, use_container_width=True, hide_index=True)
 
 st.divider()
@@ -513,7 +513,7 @@ else:
         except Exception:
             return ""
 
-    styled_short = df_short.style.applymap(_color_pct_s, subset=["% to BSL ▲"])
+    styled_short = df_short.style.map(_color_pct_s, subset=["% to BSL ▲"])
     st.dataframe(styled_short, use_container_width=True, hide_index=True)
 
 st.divider()
