@@ -505,3 +505,422 @@ with st.expander("📖 Methodology"):
 
 **Horizon returns** are also expressed in Coin/BTC terms (relative to BTC), not raw USD.
     """)
+
+# ─────────────────────────────────────────────────────────
+# BACKTESTING ANALYSIS
+# ─────────────────────────────────────────────────────────
+st.markdown("---")
+st.header("🧪 Signal Backtesting Analysis")
+st.caption(
+    "Historical signal performance is evaluated **in-sample** using a rolling look-back. "
+    "For each historical bar, the composite signal is re-computed on data available up to that point, "
+    "then forward returns (vs BTC) are measured `fwd_bars` bars ahead."
+)
+
+# ─── Sidebar additions ───────────────────────────────────
+with st.sidebar:
+    st.subheader("Backtest Parameters")
+    fwd_days = st.slider(
+        "Forward return window (days)", min_value=1, max_value=30, value=10, step=1,
+        help="How many bars ahead to measure outcome returns."
+    )
+    bt_top_n = st.slider(
+        "Top-N coins per signal bucket", min_value=1, max_value=10, value=5, step=1,
+        help="Aggregate the N strongest buy/sell signals at each bar."
+    )
+    bt_min_history = st.slider(
+        "Min history required (days)", min_value=30, max_value=180, value=60, step=10,
+        help="Minimum bars of history needed before a bar is included in backtest."
+    )
+
+fwd_bars   = days_to_bars(fwd_days)
+bt_min_bars = days_to_bars(bt_min_history)
+
+
+# ─── Rolling signal reconstruction ───────────────────────
+@st.cache_data(ttl=300, show_spinner="Running backtest…")
+def run_backtest(
+    df_rel: pd.DataFrame,
+    aema_bars: int, jma_bars: int, nw_bars: int, nw_r: float,
+    jma_phase: float,
+    w_aema: float, w_jma: float, w_nw: float,
+    fwd_bars: int,
+    bt_min_bars: int,
+) -> pd.DataFrame:
+    """
+    For every coin and every historical bar t (where enough history exists),
+    compute the composite signal using data up to t, then record the
+    forward excess return vs BTC over the next fwd_bars bars.
+
+    Returns a long-form DataFrame with columns:
+        date, coin, composite, signal_label, fwd_return
+    """
+    total_w = (w_aema + w_jma + w_nw) or 1.0
+    records = []
+
+    for coin in df_rel.columns:
+        s = df_rel[coin].dropna()
+        n = len(s)
+        if n < bt_min_bars + fwd_bars + max(aema_bars, jma_bars, nw_bars):
+            continue
+
+        # Pre-compute smoothers on the full series (causal — no look-ahead)
+        aema_full  = adaptive_ema(s, aema_bars)
+        jfatl_full = jfatl_hybrid(s, jma_bars, jma_bars, jma_phase)
+        nw_full    = nadaraya_watson(s, nw_bars, nw_r)
+
+        vals = s.values
+        idx  = s.index
+
+        start = bt_min_bars + max(aema_bars, jma_bars, nw_bars)
+
+        for t in range(start, n - fwd_bars):
+            # Signal at bar t (only uses data up to t — causal)
+            def _dir(series_vals, t_):
+                v1 = series_vals[t_]
+                v0 = series_vals[t_ - 1]
+                if np.isnan(v1) or np.isnan(v0):
+                    return 0
+                if v1 > v0:   return  1
+                if v1 < v0:   return -1
+                return 0
+
+            sig_a = _dir(aema_full.values,  t)
+            sig_j = _dir(jfatl_full.values, t)
+            sig_n = _dir(nw_full.values,    t)
+
+            composite = (sig_a * w_aema + sig_j * w_jma + sig_n * w_nw) / total_w
+
+            # Forward return in coin/BTC ratio terms
+            fwd_ret = (vals[t + fwd_bars] / vals[t] - 1) * 100 if vals[t] != 0 else np.nan
+
+            if np.isnan(fwd_ret):
+                continue
+
+            # Categorise signal
+            if composite >= 0.9:    label = "Strong Buy"
+            elif composite >= 0.4:  label = "Weak Buy"
+            elif composite <= -0.9: label = "Strong Sell"
+            elif composite <= -0.4: label = "Weak Sell"
+            else:                   label = "Neutral"
+
+            records.append({
+                "date":         idx[t],
+                "coin":         coin,
+                "composite":    composite,
+                "signal_label": label,
+                "fwd_return":   fwd_ret,
+            })
+
+    return pd.DataFrame(records)
+
+
+with st.spinner("Running backtest (this may take a moment on large universes)…"):
+    df_bt = run_backtest(
+        df_btc_rel,
+        aema_bars, jma_bars, nw_bars, nw_r,
+        jma_phase,
+        w_aema, w_jma, w_nw,
+        fwd_bars,
+        bt_min_bars,
+    )
+
+if df_bt.empty:
+    st.warning("Not enough history to run backtest. Try reducing 'Min history required' or the forward window.")
+    st.stop()
+
+# ─── Summary stats ────────────────────────────────────────
+SIGNAL_ORDER = ["Strong Buy", "Weak Buy", "Neutral", "Weak Sell", "Strong Sell"]
+SIGNAL_COLORS = {
+    "Strong Buy":  "#22c55e",
+    "Weak Buy":    "#86efac",
+    "Neutral":     "#94a3b8",
+    "Weak Sell":   "#fca5a5",
+    "Strong Sell": "#ef4444",
+}
+
+def win_rate(series: pd.Series) -> float:
+    """% of observations where fwd_return > 0."""
+    valid = series.dropna()
+    if len(valid) == 0:
+        return np.nan
+    return (valid > 0).sum() / len(valid) * 100
+
+
+summary = (
+    df_bt.groupby("signal_label")["fwd_return"]
+    .agg(
+        Count="count",
+        Avg_Return="mean",
+        Median_Return="median",
+        Std_Return="std",
+        Win_Rate=win_rate,
+        P10=lambda x: np.percentile(x.dropna(), 10),
+        P90=lambda x: np.percentile(x.dropna(), 90),
+    )
+    .reset_index()
+    .rename(columns={"signal_label": "Signal"})
+)
+summary["Sharpe_proxy"] = summary["Avg_Return"] / summary["Std_Return"].replace(0, np.nan)
+summary = summary.set_index("Signal").reindex(
+    [s for s in SIGNAL_ORDER if s in summary["Signal"].values or s in summary.index]
+).reset_index()
+
+
+tab_bt_summary, tab_bt_dist, tab_bt_cum, tab_bt_coin = st.tabs([
+    "📋 Summary Stats",
+    "📊 Return Distributions",
+    "📈 Cumulative Return",
+    "🔍 Coin-Level Detail",
+])
+
+
+# ── Tab 1: Summary Stats ──────────────────────────────────
+with tab_bt_summary:
+    st.subheader(f"Signal Performance — {fwd_days}d Forward Return (vs BTC)")
+
+    # Metric cards
+    cols = st.columns(len(summary))
+    for i, row in summary.iterrows():
+        sig = row["Signal"]
+        with cols[i]:
+            color = SIGNAL_COLORS.get(sig, "#94a3b8")
+            st.markdown(
+                f"""
+                <div style="border-left:4px solid {color};padding:8px 12px;
+                            background:rgba(0,0,0,0.03);border-radius:4px;margin-bottom:8px;">
+                    <b style="color:{color}">{sig}</b><br>
+                    <small>n={int(row['Count']):,}</small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.metric("Avg Excess Ret", f"{row['Avg_Return']:+.2f}%")
+            st.metric("Win Rate",       f"{row['Win_Rate']:.1f}%")
+            st.metric("Median",         f"{row['Median_Return']:+.2f}%")
+            st.metric("Sharpe proxy",   f"{row['Sharpe_proxy']:+.2f}" if not np.isnan(row['Sharpe_proxy']) else "—")
+
+    st.markdown("---")
+
+    # Full table
+    st.dataframe(
+        summary.style.format({
+            "Avg_Return":     "{:+.2f}%",
+            "Median_Return":  "{:+.2f}%",
+            "Std_Return":     "{:.2f}%",
+            "Win_Rate":       "{:.1f}%",
+            "P10":            "{:+.2f}%",
+            "P90":            "{:+.2f}%",
+            "Sharpe_proxy":   "{:+.2f}",
+        }).background_gradient(subset=["Avg_Return", "Win_Rate"], cmap="RdYlGn"),
+        use_container_width=True,
+    )
+
+    st.caption(
+        "**Avg Excess Return** = average (coin/BTC) % change over the forward window, aggregated across all signal occurrences. "
+        "**Win Rate** = % of signals where coin outperformed BTC. "
+        "**Sharpe proxy** = Avg / Std (unnormalised, directional quality measure). "
+        "**P10/P90** = 10th and 90th percentile of forward returns."
+    )
+
+
+# ── Tab 2: Return Distributions ──────────────────────────
+with tab_bt_dist:
+    st.subheader("Forward Return Distributions by Signal Type")
+
+    fig_dist_bt = go.Figure()
+    for sig in SIGNAL_ORDER:
+        grp = df_bt[df_bt["signal_label"] == sig]["fwd_return"].dropna()
+        if grp.empty:
+            continue
+        fig_dist_bt.add_trace(go.Violin(
+            x=[sig] * len(grp),
+            y=grp.values,
+            name=sig,
+            box_visible=True,
+            meanline_visible=True,
+            line_color=SIGNAL_COLORS.get(sig, "#94a3b8"),
+            fillcolor=SIGNAL_COLORS.get(sig, "#94a3b8"),
+            opacity=0.6,
+            points="outliers",
+        ))
+
+    fig_dist_bt.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+    fig_dist_bt.update_layout(
+        title=f"Distribution of {fwd_days}d Forward Returns (vs BTC) by Signal",
+        yaxis_title="Forward Return (%)",
+        xaxis_title="Signal Type",
+        height=450,
+        showlegend=False,
+        violinmode="group",
+        margin=dict(t=50, b=40),
+    )
+    st.plotly_chart(fig_dist_bt, use_container_width=True)
+
+    # Average return bar chart with error bars
+    fig_avg = go.Figure()
+    for _, row in summary.iterrows():
+        sig = row["Signal"]
+        fig_avg.add_trace(go.Bar(
+            x=[sig],
+            y=[row["Avg_Return"]],
+            error_y=dict(type="data", array=[row["Std_Return"] / np.sqrt(max(row["Count"], 1))], visible=True),
+            marker_color=SIGNAL_COLORS.get(sig, "#94a3b8"),
+            name=sig,
+            text=[f"{row['Avg_Return']:+.2f}%"],
+            textposition="outside",
+        ))
+
+    fig_avg.add_hline(y=0, line_dash="solid", line_color="white", line_width=1)
+    fig_avg.update_layout(
+        title=f"Mean {fwd_days}d Forward Return ± SE by Signal",
+        yaxis_title="Mean Forward Return (%)",
+        height=380,
+        showlegend=False,
+        margin=dict(t=50, b=40),
+    )
+    st.plotly_chart(fig_avg, use_container_width=True)
+
+
+# ── Tab 3: Cumulative Return ──────────────────────────────
+with tab_bt_cum:
+    st.subheader("Cumulative Excess Return — Top-N Signal Strategy")
+    st.caption(
+        f"Each bar: take the **top {bt_top_n} strongest buy signals** and **bottom {bt_top_n} strongest sell signals** "
+        f"(by composite score). Equal-weight their forward returns. "
+        "Long-only and long-short equity curves are shown."
+    )
+
+    # Build daily (by date) aggregate returns for top-N longs and top-N shorts
+    def aggregate_top_n(group: pd.DataFrame, n: int, direction: str) -> float:
+        """Average fwd_return of top-N by |composite| in the given direction."""
+        if direction == "buy":
+            top = group[group["composite"] > 0].nlargest(n, "composite")
+        else:
+            top = group[group["composite"] < 0].nsmallest(n, "composite")
+        if top.empty:
+            return np.nan
+        return top["fwd_return"].mean()
+
+    daily_long  = df_bt.groupby("date").apply(aggregate_top_n, n=bt_top_n, direction="buy")
+    daily_short = df_bt.groupby("date").apply(aggregate_top_n, n=bt_top_n, direction="sell")
+
+    daily_long  = daily_long.sort_index().dropna()
+    daily_short = daily_short.sort_index().dropna()
+
+    # Align
+    all_dates = daily_long.index.union(daily_short.index)
+    daily_long  = daily_long.reindex(all_dates)
+    daily_short = daily_short.reindex(all_dates)
+
+    # Long-short: long the buys, short the sells (short = expect negative fwd_return, so negate)
+    long_short = daily_long.fillna(0) - daily_short.fillna(0)
+
+    # Cumulative returns (arithmetic, in % points)
+    cum_long       = daily_long.cumsum()
+    cum_short      = (-daily_short).cumsum()   # short leg profit = negative of avg sell return
+    cum_long_short = long_short.cumsum()
+
+    fig_cum = go.Figure()
+    fig_cum.add_trace(go.Scatter(
+        x=cum_long.index, y=cum_long.values,
+        name=f"Long top-{bt_top_n} buys",
+        line=dict(color="#22c55e", width=2),
+        mode="lines",
+    ))
+    fig_cum.add_trace(go.Scatter(
+        x=cum_short.index, y=cum_short.values,
+        name=f"Short top-{bt_top_n} sells",
+        line=dict(color="#ef4444", width=2),
+        mode="lines",
+    ))
+    fig_cum.add_trace(go.Scatter(
+        x=cum_long_short.index, y=cum_long_short.values,
+        name="Long-Short combined",
+        line=dict(color="#f59e0b", width=2.5, dash="dot"),
+        mode="lines",
+    ))
+    fig_cum.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
+
+    fig_cum.update_layout(
+        title=f"Cumulative Excess Return (vs BTC) — Top-{bt_top_n} Signal Strategy",
+        yaxis_title="Cumulative Return (% pts, vs BTC)",
+        height=450,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(t=60, b=40),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_cum, use_container_width=True)
+
+    # Rolling win-rate over time
+    roll_win = (daily_long > 0).rolling(20).mean() * 100
+    fig_wr = go.Figure(go.Scatter(
+        x=roll_win.index, y=roll_win.values,
+        fill="tozeroy",
+        line=dict(color="#3b82f6", width=1.5),
+        name="Rolling 20-bar Win Rate (long leg)",
+    ))
+    fig_wr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50% break-even")
+    fig_wr.update_layout(
+        title="Rolling 20-bar Win Rate — Long Leg (top-N buy signals)",
+        yaxis_title="Win Rate (%)",
+        yaxis_range=[0, 100],
+        height=300,
+        margin=dict(t=50, b=40),
+    )
+    st.plotly_chart(fig_wr, use_container_width=True)
+
+
+# ── Tab 4: Coin-Level Detail ──────────────────────────────
+with tab_bt_coin:
+    st.subheader("Per-Coin Signal Performance")
+
+    coin_bt_summary = (
+        df_bt[df_bt["signal_label"].isin(["Strong Buy", "Weak Buy"])]
+        .groupby("coin")["fwd_return"]
+        .agg(
+            Count="count",
+            Avg_Return="mean",
+            Win_Rate=win_rate,
+            Std_Return="std",
+        )
+        .reset_index()
+        .rename(columns={"coin": "Coin"})
+        .sort_values("Avg_Return", ascending=False)
+    )
+    coin_bt_summary["Sharpe"] = coin_bt_summary["Avg_Return"] / coin_bt_summary["Std_Return"].replace(0, np.nan)
+
+    if not coin_bt_summary.empty:
+        fig_coin_perf = go.Figure(go.Bar(
+            x=coin_bt_summary["Coin"],
+            y=coin_bt_summary["Avg_Return"],
+            marker=dict(
+                color=coin_bt_summary["Avg_Return"],
+                colorscale="RdYlGn",
+                cmin=-5, cmax=5,
+                colorbar=dict(title="Avg Ret %"),
+            ),
+            text=coin_bt_summary["Avg_Return"].apply(lambda x: f"{x:+.2f}%"),
+            textposition="outside",
+        ))
+        fig_coin_perf.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_coin_perf.update_layout(
+            title=f"Avg {fwd_days}d Forward Return (vs BTC) per Coin — Buy Signals Only",
+            yaxis_title="Avg Forward Return (%)",
+            height=420,
+            xaxis_tickangle=-45,
+            margin=dict(t=50, b=80),
+        )
+        st.plotly_chart(fig_coin_perf, use_container_width=True)
+
+        st.dataframe(
+            coin_bt_summary.style.format({
+                "Avg_Return": "{:+.2f}%",
+                "Win_Rate":   "{:.1f}%",
+                "Std_Return": "{:.2f}%",
+                "Sharpe":     "{:+.2f}",
+            }).background_gradient(subset=["Avg_Return", "Win_Rate"], cmap="RdYlGn"),
+            use_container_width=True,
+        )
+    else:
+        st.info("No buy signal history found for coin-level analysis.")
