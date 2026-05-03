@@ -1,6 +1,6 @@
 """
 =============================================================================
- SIGNAL CONSOLIDATOR (Long/Short Market-Neutral)
+ PAGE 16 — SIGNAL CONSOLIDATOR (Long/Short Market-Neutral)
 =============================================================================
 
 PURPOSE
@@ -104,6 +104,80 @@ st.caption(
     "B (BTC-rel), and C (absolute) momentum signals. Standalone — fetches own data."
 )
 
+# Column reference — explains the abbreviated column names that appear in tables below.
+with st.expander("📖 Column reference — what these names mean", expanded=False):
+    st.markdown(
+        """
+**Score columns**
+
+| Column | Meaning |
+|---|---|
+| **Score** | Final hybrid score used to rank coins. <br/> *Hard mode*: avg(Theme-rel z, BTC-rel z, Absolute z). <br/> *Soft mode*: same average minus λ × Σ max(0, −z_bucket)² (λ-penalty for buckets pulling against the trade). For sell-side both are sign-flipped so a higher score = stronger sell. |
+| **Theme-rel z**  (Bucket A) | Cross-sectional z-score of momentum **vs the coin's theme peers**. Mean of three lookbacks (14d, 30d, 60d) of the coin's excess log-return over the median coin in its theme. |
+| **BTC-rel z**  (Bucket B) | CS z-score of momentum **vs BTC**. Mean of three lookbacks (14d, 30d, 90d) of the Coin/BTC log-return. |
+| **Absolute z**  (Bucket C) | CS z-score of **absolute momentum**. Mean of (a) 30d & 60d ATR-vol-scaled returns and (b) multi-MA trend agreement count (price > SMA-20 + price > SMA-50 + price > SMA-100). |
+
+**Extension / risk columns**
+
+| Column | Meaning |
+|---|---|
+| **price_z_60** | How many σ the close sits above (+) or below (−) its own 60-bar mean. > +2 = extended overbought; < −2 = extended oversold. |
+| **range_pct_90** | Position within the 90-bar high-low range. 0 = at 90d low, 1 = at 90d high. > 0.92 trips the buy-extension gate; < 0.08 trips the sell-extension gate. |
+| **ATR_pct** | 14-bar Average True Range as a % of price — a proxy for realized volatility. Useful when sizing positions. |
+
+**Gating (Stage 3)**
+
+| Mode | Buy qualified when… | Sell qualified when… |
+|---|---|---|
+| **Hard binary** | all 3 buckets `> 0` AND extension/jump/liquidity OK | all 3 buckets `< 0` AND extension/jump/liquidity OK (mirrored) |
+| **Soft penalty** | any coin passing extension/jump/liquidity; the score is just penalized for negative buckets via `λ · Σ max(0, −z)²` | mirror — coin passes mirrored extension; score penalized for **positive** buckets |
+        """
+    )
+
+with st.expander("📖 **Column key** — what the scores and metrics mean", expanded=False):
+    st.markdown(
+        """
+| Column | Meaning |
+|---|---|
+| **Theme-rel z** *(bucket A)* | Cross-sectional z-score of how the coin has moved **vs other coins in its theme**. Mean of 3 horizons (14/30/60 bars). Captures intra-theme leadership. |
+| **BTC-rel z** *(bucket B)* | Cross-sectional z-score of the **Coin/BTC ratio's return** at 14/30/90 bars. Captures alpha vs the market beta. |
+| **Absolute z** *(bucket C)* | Cross-sectional z-score of **ATR-scaled returns** (30/60d) plus multi-MA trend agreement (price vs SMA-20/50/100). Captures absolute-price strength. |
+| **Score** | The final ranking score. **Hard gate**: simple mean of the three bucket z-scores, only computed when all three are positive (buy) or all three negative (sell). **Soft gate**: mean − λ·Σmax(0,−z)² penalty for any bucket pulling the wrong way. |
+| **price_z_60** | Standardised distance of price from its 60-bar mean. **>2** = stretched; buy candidates above this are rejected. |
+| **range_pct_90** | Where price sits in its 90-bar high–low range. **>0.92** = near-top; buy candidates above this are rejected. |
+| **ATR_pct** | Average True Range as % of price. Volatility scale. |
+| **Cumulative log-return (%)** *(validation charts)* | Compounded log-return of holding the top-bin or bottom-bin basket through non-overlapping rebalances. **Q-top** (or D-top) = highest-score bin, **Q-bot** = lowest. **abs** = absolute return; **BTC-ex** = BTC-excess return (relevant for L/S MN). |
+        """
+    )
+
+# -- GLOSSARY --
+with st.expander("📖 Column glossary — what does each value mean?"):
+    st.markdown(
+        """
+**Score** — the final ranking score for the gate type. Hard binary uses `(z_Theme + z_BTC + z_Abs)/3`
+on coins that pass all gates. Soft penalty uses the same average minus
+`λ × Σ max(0, −z_bucket)²`. Higher = stronger conviction.
+
+**Bucket scores (averaged cross-sectional z-scores within each bucket):**
+- **`z_Theme`** — theme-relative momentum bucket (was `z_A`). Average of CS z-scores of
+  30d / 60d / 14d excess log-return vs the coin's theme median.
+  Positive ⇒ outperforming theme peers.
+- **`z_BTC`** — BTC-relative momentum bucket (was `z_B`). Average of CS z-scores of
+  30d / 90d / 14d Coin/BTC log-returns. Positive ⇒ outperforming BTC.
+- **`z_Abs`** — absolute / universe-wide momentum bucket (was `z_C`). Average of CS z-scores of
+  30d / 60d ATR-scaled returns + a multi-MA trend agreement count
+  (price > SMA-20, > SMA-50, > SMA-100). Positive ⇒ strong absolute uptrend in vol-adjusted terms.
+
+**Filter / context columns:**
+- **`price_z (60d)`** — number of σ the current close is above its own 60-bar mean. Buy reject if > 2.0.
+- **`range_pct (90d)`** — where the current close sits in the 90-bar high-low range (0=low, 1=high). Buy reject if > 0.92.
+- **`ATR_pct`** — 14-bar ATR as a percentage of price. Coin's typical bar move size.
+
+**Conventions:** all returns are log-returns. All z-scores are cross-sectional
+(within a single bar, across the universe). All rolling windows use past data only — no lookahead.
+        """
+    )
+
 # =============================================================================
 # 2. SIDEBAR CONFIG
 # =============================================================================
@@ -169,12 +243,7 @@ with st.sidebar:
     bt_min_history_bars = st.number_input(
         "Min history before backtest starts (bars)",
         min_value=60, max_value=500, value=120, step=10,
-        help="Skip the first N bars of history when computing IC and decile metrics."
-    )
-    bt_eval_step = st.number_input(
-        "Score evaluation step (bars)",
-        min_value=1, max_value=20, value=1, step=1,
-        help="1 = evaluate scores every bar (slow). 5 = every 5th bar (faster)."
+        help="Skip the first N bars of history when computing forward-return curves."
     )
 
     st.markdown("---")
@@ -594,10 +663,10 @@ def build_signal_table(scores_row: pd.Series, R: dict, last_ts) -> pd.DataFrame:
         rows.append({
             "Coin": coin,
             "Theme": R["coin_to_theme"].get(coin, "UNKNOWN"),
-            "Score": round(float(s[coin]), 3),
-            "z_A": round(float(R["bucket_A"].iloc[-1].get(coin, np.nan)), 3),
-            "z_B": round(float(R["bucket_B"].iloc[-1].get(coin, np.nan)), 3),
-            "z_C": round(float(R["bucket_C"].iloc[-1].get(coin, np.nan)), 3),
+            "Score": round(float(s[coin]), 2),
+            "Theme-rel z": round(float(R["bucket_A"].iloc[-1].get(coin, np.nan)), 2),
+            "BTC-rel z": round(float(R["bucket_B"].iloc[-1].get(coin, np.nan)), 2),
+            "Absolute z": round(float(R["bucket_C"].iloc[-1].get(coin, np.nan)), 2),
             "price_z_60": round(float(R["price_z_60"].iloc[-1].get(coin, np.nan)), 2),
             "range_pct_90": round(float(R["range_pct_90"].iloc[-1].get(coin, np.nan)), 2),
             "ATR_pct": round(float(R["atr_pct"].iloc[-1].get(coin, np.nan)) * 100, 2),
@@ -629,8 +698,9 @@ with tab_hard:
         else:
             st.dataframe(
                 hard_buy_tbl.style
+                .format(precision=2)
                 .background_gradient(subset=["Score"], cmap="Greens")
-                .background_gradient(subset=["z_A", "z_B", "z_C"], cmap="RdYlGn", vmin=-2, vmax=2)
+                .background_gradient(subset=["Theme-rel z", "BTC-rel z", "Absolute z"], cmap="RdYlGn", vmin=-2, vmax=2)
                 .background_gradient(subset=["price_z_60"], cmap="RdYlGn_r", vmin=-3, vmax=3),
                 hide_index=True,
                 use_container_width=True,
@@ -643,8 +713,9 @@ with tab_hard:
         else:
             st.dataframe(
                 hard_sell_tbl.style
+                .format(precision=2)
                 .background_gradient(subset=["Score"], cmap="Reds")
-                .background_gradient(subset=["z_A", "z_B", "z_C"], cmap="RdYlGn", vmin=-2, vmax=2)
+                .background_gradient(subset=["Theme-rel z", "BTC-rel z", "Absolute z"], cmap="RdYlGn", vmin=-2, vmax=2)
                 .background_gradient(subset=["price_z_60"], cmap="RdYlGn_r", vmin=-3, vmax=3),
                 hide_index=True,
                 use_container_width=True,
@@ -654,7 +725,7 @@ with tab_hard:
 # ---------- SOFT ----------
 with tab_soft:
     st.markdown(
-        f"**Soft penalty**: score = mean(z_A, z_B, z_C) − λ·Σmax(0, −z)² for buy "
+        f"**Soft penalty**: score = mean(z_Theme, z_BTC, z_Abs) − λ·Σmax(0, −z)² for buy "
         f"(reverse for sell). λ = **{lambda_penalty}**. "
         f"Negative-bucket coins are penalised but not rejected. "
         f"Top-{int(top_n)} per side after extension/jump/liquidity gates."
@@ -670,8 +741,9 @@ with tab_soft:
         else:
             st.dataframe(
                 soft_buy_tbl.style
+                .format(precision=2)
                 .background_gradient(subset=["Score"], cmap="Greens")
-                .background_gradient(subset=["z_A", "z_B", "z_C"], cmap="RdYlGn", vmin=-2, vmax=2)
+                .background_gradient(subset=["Theme-rel z", "BTC-rel z", "Absolute z"], cmap="RdYlGn", vmin=-2, vmax=2)
                 .background_gradient(subset=["price_z_60"], cmap="RdYlGn_r", vmin=-3, vmax=3),
                 hide_index=True,
                 use_container_width=True,
@@ -684,8 +756,9 @@ with tab_soft:
         else:
             st.dataframe(
                 soft_sell_tbl.style
+                .format(precision=2)
                 .background_gradient(subset=["Score"], cmap="Reds")
-                .background_gradient(subset=["z_A", "z_B", "z_C"], cmap="RdYlGn", vmin=-2, vmax=2)
+                .background_gradient(subset=["Theme-rel z", "BTC-rel z", "Absolute z"], cmap="RdYlGn", vmin=-2, vmax=2)
                 .background_gradient(subset=["price_z_60"], cmap="RdYlGn_r", vmin=-3, vmax=3),
                 hide_index=True,
                 use_container_width=True,
@@ -727,41 +800,41 @@ with tab_diag:
         options=sorted(R["close"].columns.tolist()),
     )
     if sel_coin:
-        # Latest values
+        # Latest values — use descriptive names with horizons
         last_row = {
-            "z_A1": R["z_A1"].iloc[-1].get(sel_coin, np.nan),
-            "z_A2": R["z_A2"].iloc[-1].get(sel_coin, np.nan),
-            "z_A3": R["z_A3"].iloc[-1].get(sel_coin, np.nan),
-            "bucket_A": R["bucket_A"].iloc[-1].get(sel_coin, np.nan),
-            "z_B1": R["z_B1"].iloc[-1].get(sel_coin, np.nan),
-            "z_B2": R["z_B2"].iloc[-1].get(sel_coin, np.nan),
-            "z_B3": R["z_B3"].iloc[-1].get(sel_coin, np.nan),
-            "bucket_B": R["bucket_B"].iloc[-1].get(sel_coin, np.nan),
-            "z_C1": R["z_C1"].iloc[-1].get(sel_coin, np.nan),
-            "z_C2": R["z_C2"].iloc[-1].get(sel_coin, np.nan),
-            "z_C3": R["z_C3"].iloc[-1].get(sel_coin, np.nan),
-            "bucket_C": R["bucket_C"].iloc[-1].get(sel_coin, np.nan),
-            "avg_z": R["avg_z"].iloc[-1].get(sel_coin, np.nan),
+            "Theme-rel z (30d)":      R["z_A1"].iloc[-1].get(sel_coin, np.nan),
+            "Theme-rel z (60d)":      R["z_A2"].iloc[-1].get(sel_coin, np.nan),
+            "Theme-rel z (14d)":      R["z_A3"].iloc[-1].get(sel_coin, np.nan),
+            "Theme-rel z  (avg, A)":  R["bucket_A"].iloc[-1].get(sel_coin, np.nan),
+            "BTC-rel z (30d)":        R["z_B1"].iloc[-1].get(sel_coin, np.nan),
+            "BTC-rel z (90d)":        R["z_B2"].iloc[-1].get(sel_coin, np.nan),
+            "BTC-rel z (14d)":        R["z_B3"].iloc[-1].get(sel_coin, np.nan),
+            "BTC-rel z  (avg, B)":    R["bucket_B"].iloc[-1].get(sel_coin, np.nan),
+            "Absolute z (30d ATR-scaled)": R["z_C1"].iloc[-1].get(sel_coin, np.nan),
+            "Absolute z (60d ATR-scaled)": R["z_C2"].iloc[-1].get(sel_coin, np.nan),
+            "Absolute z (Multi-MA trend)": R["z_C3"].iloc[-1].get(sel_coin, np.nan),
+            "Absolute z  (avg, C)":   R["bucket_C"].iloc[-1].get(sel_coin, np.nan),
+            "Composite avg z":        R["avg_z"].iloc[-1].get(sel_coin, np.nan),
         }
         df_view = pd.DataFrame.from_dict(last_row, orient="index", columns=["Latest z"])
-        df_view["Latest z"] = df_view["Latest z"].astype(float).round(3)
+        df_view["Latest z"] = df_view["Latest z"].astype(float).round(2)
         st.dataframe(df_view, use_container_width=False)
 
         # Time series chart of buckets
         sub_df = pd.DataFrame({
-            "Bucket A": R["bucket_A"][sel_coin],
-            "Bucket B": R["bucket_B"][sel_coin],
-            "Bucket C": R["bucket_C"][sel_coin],
-            "Avg z": R["avg_z"][sel_coin],
+            "Theme-rel z (A)":  R["bucket_A"][sel_coin],
+            "BTC-rel z (B)":    R["bucket_B"][sel_coin],
+            "Absolute z (C)":   R["bucket_C"][sel_coin],
+            "Composite avg z": R["avg_z"][sel_coin],
         })
         fig_buc = go.Figure()
         for col, color in zip(
-            ["Bucket A", "Bucket B", "Bucket C", "Avg z"],
+            ["Theme-rel z (A)", "BTC-rel z (B)", "Absolute z (C)", "Composite avg z"],
             ["#60a5fa", "#a78bfa", "#34d399", "#fbbf24"],
         ):
             fig_buc.add_trace(go.Scatter(
                 x=sub_df.index, y=sub_df[col], name=col, mode="lines",
-                line=dict(color=color, width=1.5 if col != "Avg z" else 2.5),
+                line=dict(color=color, width=1.5 if col != "Composite avg z" else 2.5),
             ))
         fig_buc.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.4)
         fig_buc.update_layout(
@@ -828,157 +901,159 @@ def compute_btc_excess_forward_returns(
 @st.cache_data(show_spinner="Running validation backtest…", ttl=600)
 def run_validation(
     R_close: pd.DataFrame,
-    bucket_A: pd.DataFrame,
-    bucket_B: pd.DataFrame,
-    bucket_C: pd.DataFrame,
-    avg_z: pd.DataFrame,
     hard_buy_score: pd.DataFrame,
     hard_sell_score: pd.DataFrame,
     soft_buy_score: pd.DataFrame,
     soft_sell_score: pd.DataFrame,
     min_history_bars: int,
-    eval_step: int,
 ) -> Dict:
     """
-    Compute IC and decile-wise forward returns.
-    Returns a dict of result DataFrames.
+    Cumulative-return validation.
+
+    For each gate side (hard/soft × buy/sell) and each holding period h ∈ {5,10,15,30},
+    sample at NON-OVERLAPPING intervals (every h bars) starting from `min_history_bars`.
+    At each sample t:
+      - rank coins with valid scores into n_bins,
+      - compute mean forward h-bar log-return for the bottom bin (Q1) and top bin (Q-top),
+      - in BOTH absolute and BTC-excess return space.
+    Cumsum per series → cumulative log-return curve. The final-period
+    summary spread (Q-top − Q-bot, sign-flipped for sell) is also returned.
+
+    Returns nested dict: results[side]['series'][h] = DataFrame indexed by date,
+                          results[side]['summary']    = DataFrame summary.
     """
     horizons = [5, 10, 15, 30]
 
     fwd_abs = compute_forward_returns(R_close, horizons)
     fwd_btc = compute_btc_excess_forward_returns(R_close, horizons)
 
-    # Restrict to backtest window
-    eval_idx = R_close.index[min_history_bars::eval_step]
-    eval_idx = eval_idx[: -max(horizons)]  # drop tail where forward returns aren't observable
+    def compute_qcurve(score_df: pd.DataFrame, n_bins: int, side: str):
+        """
+        Returns (series_dict, summary_df).
+        series_dict[h] = DataFrame[date, [Qbot_abs, Qtop_abs, Qbot_btc, Qtop_btc]] cumsum'd.
+        """
+        series_out = {}
+        summary_rows = []
+        base_idx = R_close.index
+        if min_history_bars >= len(base_idx):
+            return series_out, pd.DataFrame()
 
-    # ---------- IC ANALYSIS PER BUCKET ----------
-    def per_bucket_IC(signal_df: pd.DataFrame, fwd_dict: Dict[int, pd.DataFrame]) -> pd.DataFrame:
-        rows = []
         for h in horizons:
-            ic_list = []
-            for t in eval_idx:
-                if t not in signal_df.index:
+            # Non-overlapping samples: every h bars, starting at min_history_bars,
+            # ending h bars before the last (so forward return is observable).
+            last_eligible_pos = len(base_idx) - h - 1
+            if last_eligible_pos <= min_history_bars:
+                series_out[h] = pd.DataFrame()
+                summary_rows.append({
+                    "Horizon": f"{h}d", "Q-top abs (final %)": np.nan,
+                    "Q-bot abs (final %)": np.nan, "Spread abs (correct dir, %)": np.nan,
+                    "Q-top BTC-ex (final %)": np.nan, "Q-bot BTC-ex (final %)": np.nan,
+                    "Spread BTC-ex (correct dir, %)": np.nan, "n samples": 0,
+                })
+                continue
+
+            sample_positions = list(range(min_history_bars, last_eligible_pos + 1, h))
+            sample_idx = base_idx[sample_positions]
+
+            records = []
+            for t in sample_idx:
+                if t not in score_df.index:
                     continue
-                s = signal_df.loc[t]
-                r = fwd_dict[h].loc[t]
-                joined = pd.concat([s, r], axis=1, keys=["s", "r"]).dropna()
-                if len(joined) < 5:
+                s = score_df.loc[t].dropna()
+                if len(s) < n_bins:
                     continue
-                # Spearman = Pearson on ranks
-                rs = joined["s"].rank()
-                rr = joined["r"].rank()
-                if rs.std() == 0 or rr.std() == 0:
+                try:
+                    bins = pd.qcut(s, n_bins, labels=False, duplicates="drop") + 1
+                except ValueError:
                     continue
-                ic = rs.corr(rr)
-                ic_list.append(ic)
-            if ic_list:
-                arr = np.array(ic_list)
-                rows.append({
-                    "Horizon (bars)": h,
-                    "IC mean": np.nanmean(arr),
-                    "IC std": np.nanstd(arr),
-                    "IR (mean/std)": np.nanmean(arr) / (np.nanstd(arr) + 1e-9),
-                    "Pos IC %": (arr > 0).mean() * 100,
-                    "n samples": len(arr),
+                top_bin_id = int(bins.max())
+                bot_bin_id = int(bins.min())
+                if top_bin_id == bot_bin_id:
+                    continue  # all coins in one bin → no spread
+                qtop_coins = bins[bins == top_bin_id].index
+                qbot_coins = bins[bins == bot_bin_id].index
+
+                r_abs = fwd_abs[h].loc[t] if t in fwd_abs[h].index else None
+                r_btc = fwd_btc[h].loc[t] if t in fwd_btc[h].index else None
+                if r_abs is None or r_btc is None:
+                    continue
+
+                qtop_abs = float(r_abs.reindex(qtop_coins).dropna().mean())
+                qbot_abs = float(r_abs.reindex(qbot_coins).dropna().mean())
+                qtop_btc = float(r_btc.reindex(qtop_coins).dropna().mean())
+                qbot_btc = float(r_btc.reindex(qbot_coins).dropna().mean())
+
+                records.append({
+                    "date": t,
+                    "Qbot_abs": qbot_abs, "Qtop_abs": qtop_abs,
+                    "Qbot_btc": qbot_btc, "Qtop_btc": qtop_btc,
+                })
+
+            if records:
+                df = pd.DataFrame(records).set_index("date")
+                df = df.cumsum()  # cumulative log returns
+                series_out[h] = df
+
+                # Convert log-cumulative to % for the final-row summary
+                final_log = df.iloc[-1]
+                qtop_abs_pct = (np.exp(final_log["Qtop_abs"]) - 1.0) * 100
+                qbot_abs_pct = (np.exp(final_log["Qbot_abs"]) - 1.0) * 100
+                qtop_btc_pct = (np.exp(final_log["Qtop_btc"]) - 1.0) * 100
+                qbot_btc_pct = (np.exp(final_log["Qbot_btc"]) - 1.0) * 100
+
+                if side == "buy":
+                    spread_abs = qtop_abs_pct - qbot_abs_pct
+                    spread_btc = qtop_btc_pct - qbot_btc_pct
+                else:  # sell — Q-top is the strongest sell, expected to UNDERPERFORM
+                    spread_abs = qbot_abs_pct - qtop_abs_pct
+                    spread_btc = qbot_btc_pct - qtop_btc_pct
+
+                summary_rows.append({
+                    "Horizon": f"{h}d",
+                    "Q-top abs (final %)": qtop_abs_pct,
+                    "Q-bot abs (final %)": qbot_abs_pct,
+                    "Spread abs (correct dir, %)": spread_abs,
+                    "Q-top BTC-ex (final %)": qtop_btc_pct,
+                    "Q-bot BTC-ex (final %)": qbot_btc_pct,
+                    "Spread BTC-ex (correct dir, %)": spread_btc,
+                    "n samples": len(df),
                 })
             else:
-                rows.append({
-                    "Horizon (bars)": h, "IC mean": np.nan, "IC std": np.nan,
-                    "IR (mean/std)": np.nan, "Pos IC %": np.nan, "n samples": 0,
+                series_out[h] = pd.DataFrame()
+                summary_rows.append({
+                    "Horizon": f"{h}d", "Q-top abs (final %)": np.nan,
+                    "Q-bot abs (final %)": np.nan, "Spread abs (correct dir, %)": np.nan,
+                    "Q-top BTC-ex (final %)": np.nan, "Q-bot BTC-ex (final %)": np.nan,
+                    "Spread BTC-ex (correct dir, %)": np.nan, "n samples": 0,
                 })
-        return pd.DataFrame(rows)
 
-    ic_A_abs = per_bucket_IC(bucket_A, fwd_abs)
-    ic_B_abs = per_bucket_IC(bucket_B, fwd_abs)
-    ic_C_abs = per_bucket_IC(bucket_C, fwd_abs)
-    ic_avg_abs = per_bucket_IC(avg_z, fwd_abs)
+        summary_df = pd.DataFrame(summary_rows)
+        return series_out, summary_df
 
-    ic_A_btc = per_bucket_IC(bucket_A, fwd_btc)
-    ic_B_btc = per_bucket_IC(bucket_B, fwd_btc)
-    ic_C_btc = per_bucket_IC(bucket_C, fwd_btc)
-    ic_avg_btc = per_bucket_IC(avg_z, fwd_btc)
+    # Hard mode → 5 quintiles (narrow universe)
+    hard_buy_series, hard_buy_summary = compute_qcurve(hard_buy_score, n_bins=5, side="buy")
+    hard_sell_series, hard_sell_summary = compute_qcurve(hard_sell_score, n_bins=5, side="sell")
 
-    # ---------- DECILE FORWARD RETURNS ----------
-    def decile_fwd_returns(
-        score_df: pd.DataFrame,
-        fwd_dict: Dict[int, pd.DataFrame],
-        n_bins: int = 10,
-    ) -> pd.DataFrame:
-        """
-        For each evaluation timestamp:
-          - Take coins with valid score.
-          - Bucket into deciles by score.
-          - Record forward returns per decile.
-        Average forward returns by decile, by horizon.
-        Returns wide DataFrame: index = decile (1..10), columns = horizon.
-        """
-        bucket_records = {h: {b: [] for b in range(1, n_bins + 1)} for h in horizons}
-        for t in eval_idx:
-            if t not in score_df.index:
-                continue
-            s = score_df.loc[t].dropna()
-            if len(s) < n_bins:  # need at least one obs per bin
-                continue
-            try:
-                bins = pd.qcut(s, n_bins, labels=False, duplicates="drop") + 1
-            except ValueError:
-                continue
-            for h in horizons:
-                if t not in fwd_dict[h].index:
-                    continue
-                fwd_row = fwd_dict[h].loc[t]
-                for coin, b in bins.items():
-                    if pd.isna(fwd_row.get(coin)):
-                        continue
-                    bucket_records[h][int(b)].append(float(fwd_row[coin]))
-        # Aggregate
-        out_rows = []
-        for b in range(1, n_bins + 1):
-            row = {"Decile": b}
-            for h in horizons:
-                vals = bucket_records[h][b]
-                row[f"{h}d mean"] = float(np.mean(vals)) if vals else np.nan
-                row[f"{h}d n"] = len(vals)
-            out_rows.append(row)
-        return pd.DataFrame(out_rows).set_index("Decile")
-
-    # Hard mode — narrow universe, use 5 quintiles to avoid empty bins
-    hard_buy_decile_abs = decile_fwd_returns(hard_buy_score, fwd_abs, n_bins=5)
-    hard_buy_decile_btc = decile_fwd_returns(hard_buy_score, fwd_btc, n_bins=5)
-    hard_sell_decile_abs = decile_fwd_returns(hard_sell_score, fwd_abs, n_bins=5)
-    hard_sell_decile_btc = decile_fwd_returns(hard_sell_score, fwd_btc, n_bins=5)
-
-    # Soft mode — broader universe, use 10 deciles
-    soft_buy_decile_abs = decile_fwd_returns(soft_buy_score, fwd_abs, n_bins=10)
-    soft_buy_decile_btc = decile_fwd_returns(soft_buy_score, fwd_btc, n_bins=10)
-    soft_sell_decile_abs = decile_fwd_returns(soft_sell_score, fwd_abs, n_bins=10)
-    soft_sell_decile_btc = decile_fwd_returns(soft_sell_score, fwd_btc, n_bins=10)
+    # Soft mode → 10 deciles (broader universe)
+    soft_buy_series, soft_buy_summary = compute_qcurve(soft_buy_score, n_bins=10, side="buy")
+    soft_sell_series, soft_sell_summary = compute_qcurve(soft_sell_score, n_bins=10, side="sell")
 
     return {
         "horizons": horizons,
-        "ic_A_abs": ic_A_abs, "ic_B_abs": ic_B_abs, "ic_C_abs": ic_C_abs, "ic_avg_abs": ic_avg_abs,
-        "ic_A_btc": ic_A_btc, "ic_B_btc": ic_B_btc, "ic_C_btc": ic_C_btc, "ic_avg_btc": ic_avg_btc,
-        "hard_buy_decile_abs": hard_buy_decile_abs,
-        "hard_buy_decile_btc": hard_buy_decile_btc,
-        "hard_sell_decile_abs": hard_sell_decile_abs,
-        "hard_sell_decile_btc": hard_sell_decile_btc,
-        "soft_buy_decile_abs": soft_buy_decile_abs,
-        "soft_buy_decile_btc": soft_buy_decile_btc,
-        "soft_sell_decile_abs": soft_sell_decile_abs,
-        "soft_sell_decile_btc": soft_sell_decile_btc,
-        "n_eval_bars": len(eval_idx),
+        "hard_buy_series": hard_buy_series, "hard_buy_summary": hard_buy_summary,
+        "hard_sell_series": hard_sell_series, "hard_sell_summary": hard_sell_summary,
+        "soft_buy_series": soft_buy_series, "soft_buy_summary": soft_buy_summary,
+        "soft_sell_series": soft_sell_series, "soft_sell_summary": soft_sell_summary,
     }
 
 
 run_bt = st.button("🧪 Run / Refresh Validation", type="primary")
 if run_bt or "sc_validation" not in st.session_state:
     st.session_state["sc_validation"] = run_validation(
-        R["close"], R["bucket_A"], R["bucket_B"], R["bucket_C"], R["avg_z"],
+        R["close"],
         R["hard_buy_score"], R["hard_sell_score"],
         R["soft_buy_score"], R["soft_sell_score"],
         min_history_bars=int(bt_min_history_bars),
-        eval_step=int(bt_eval_step),
     )
 
 V = st.session_state.get("sc_validation")
@@ -987,142 +1062,155 @@ if V is None:
     st.info("Click **Run / Refresh Validation** above.")
     st.stop()
 
-st.caption(f"Backtest used **{V['n_eval_bars']}** evaluation timestamps.")
+# Quick coverage banner — sample counts from the summary tables
+def _sample_count(summary_df: pd.DataFrame) -> int:
+    """Read 'n samples' from a summary DataFrame across horizons. Returns max as a banner figure."""
+    if summary_df is None or summary_df.empty or "n samples" not in summary_df.columns:
+        return 0
+    try:
+        return int(summary_df["n samples"].max())
+    except Exception:
+        return 0
 
 
-# ---------- IC TABLE ----------
-st.subheader("Information Coefficient (Spearman) by bucket and horizon")
-ic_tab_abs, ic_tab_btc = st.tabs(["📈 vs Absolute Forward Returns", "🟠 vs BTC-Excess Forward Returns"])
-
-
-def render_IC_block(label_to_df: Dict[str, pd.DataFrame]):
-    cols = st.columns(len(label_to_df))
-    for col, (label, df) in zip(cols, label_to_df.items()):
-        with col:
-            st.markdown(f"**{label}**")
-            st.dataframe(
-                df.style.format({
-                    "IC mean": "{:+.3f}",
-                    "IC std": "{:.3f}",
-                    "IR (mean/std)": "{:+.2f}",
-                    "Pos IC %": "{:.0f}%",
-                }).background_gradient(
-                    subset=["IC mean"], cmap="RdYlGn", vmin=-0.1, vmax=0.1
-                ).background_gradient(
-                    subset=["IR (mean/std)"], cmap="RdYlGn", vmin=-0.5, vmax=0.5
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-with ic_tab_abs:
-    render_IC_block({
-        "Bucket A": V["ic_A_abs"],
-        "Bucket B": V["ic_B_abs"],
-        "Bucket C": V["ic_C_abs"],
-        "Avg z (composite)": V["ic_avg_abs"],
-    })
-
-with ic_tab_btc:
-    render_IC_block({
-        "Bucket A": V["ic_A_btc"],
-        "Bucket B": V["ic_B_btc"],
-        "Bucket C": V["ic_C_btc"],
-        "Avg z (composite)": V["ic_avg_btc"],
-    })
-
-
-# ---------- DECILE FORWARD RETURNS ----------
-st.markdown("---")
-st.subheader("Quantile-binned forward returns (5 / 10 / 15 / 30 bars)")
+_n_max = max(
+    _sample_count(V.get("hard_buy_summary")),
+    _sample_count(V.get("soft_buy_summary")),
+)
 st.caption(
-    "Coins are sorted into bins by their **weighted score** at each historical timestamp, "
-    "then average forward return per bin is reported. "
-    "**Hard gate uses 5 quintiles** (qualified universe is narrow). "
-    "**Soft gate uses 10 deciles** (broader universe). "
-    "For BUY ranking, top bin = highest score (expected to outperform). "
-    "For SELL ranking, top bin = strongest sell signal (expected to underperform on absolute, "
-    "or have the most negative BTC-excess return). "
-    "**Spread (correct dir)** flips sign for sell so positive = working as intended."
+    f"Backtest uses non-overlapping holding periods. "
+    f"Max rebalance count across horizons: **{_n_max}**."
 )
 
 
-def plot_decile_bars(df: pd.DataFrame, title: str, color_seq: List[str]) -> go.Figure:
-    """Grouped bar chart: quantile bins on X (5 or 10), one bar group per horizon."""
+# =============================================================================
+# RENDERING HELPERS — cumulative-return line charts and 2dp summary tables
+# =============================================================================
+def plot_cumret_chart(
+    series_df: pd.DataFrame,
+    h: int,
+    n_bins: int,
+    side: str,
+    gate: str,
+) -> go.Figure:
+    """
+    Plot cumulative-log-return curves for the top and bottom bins,
+    in BOTH absolute and BTC-excess return space, on a single chart.
+
+    series_df columns expected: ['Qbot_abs', 'Qtop_abs', 'Qbot_btc', 'Qtop_btc']
+                                already cumsum'd (cumulative log-return).
+    Y-axis is rendered as % (log-return × 100). For ranges < ~30 % this is
+    visually indistinguishable from compounded simple return.
+    """
     fig = go.Figure()
-    horizons_in = [c for c in df.columns if c.endswith(" mean")]
-    n_bins = len(df.index)
-    for h_col, color in zip(horizons_in, color_seq):
-        h_label = h_col.replace(" mean", "")
-        fig.add_trace(go.Bar(
-            x=df.index.astype(str), y=df[h_col],
-            name=h_label,
-            marker_color=color,
-            text=[f"{v*100:+.2f}%" if pd.notna(v) else "—" for v in df[h_col]],
-            textposition="outside",
-            textfont=dict(size=9),
-        ))
-    fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
-    bin_label = "Decile" if n_bins == 10 else f"Quantile (1=lowest, {n_bins}=highest)"
+    if series_df is None or series_df.empty:
+        fig.update_layout(
+            title=f"{gate.title()} {side.upper()} — {h}-bar holding (no data)",
+            template="plotly_dark", height=320,
+        )
+        return fig
+
+    # Display labels: "Q5" / "Q1" for hard (n_bins=5), "D10" / "D1" for soft (n_bins=10)
+    top_lab = f"Q{n_bins}" if n_bins != 10 else "D10"
+    bot_lab = "Q1" if n_bins != 10 else "D1"
+
+    x = series_df.index
+    fig.add_trace(go.Scatter(
+        x=x, y=series_df["Qtop_abs"] * 100,
+        name=f"{top_lab} (top) — abs", mode="lines",
+        line=dict(color="#22c55e", width=2.2),
+        hovertemplate="%{y:+.2f}%<extra>" + f"{top_lab} abs" + "</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=series_df["Qbot_abs"] * 100,
+        name=f"{bot_lab} (bot) — abs", mode="lines",
+        line=dict(color="#ef4444", width=2.2),
+        hovertemplate="%{y:+.2f}%<extra>" + f"{bot_lab} abs" + "</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=series_df["Qtop_btc"] * 100,
+        name=f"{top_lab} (top) — BTC-ex", mode="lines",
+        line=dict(color="#10b981", width=2.0, dash="dash"),
+        hovertemplate="%{y:+.2f}%<extra>" + f"{top_lab} BTC-ex" + "</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=series_df["Qbot_btc"] * 100,
+        name=f"{bot_lab} (bot) — BTC-ex", mode="lines",
+        line=dict(color="#f97316", width=2.0, dash="dash"),
+        hovertemplate="%{y:+.2f}%<extra>" + f"{bot_lab} BTC-ex" + "</extra>",
+    ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="white", opacity=0.35)
+    title_side = "BUY" if side == "buy" else "SELL"
     fig.update_layout(
-        title=title,
-        xaxis_title=bin_label,
-        yaxis_title="Mean forward log-return",
-        barmode="group",
-        height=360,
+        title=f"{gate.title()} {title_side} — {h}-bar holding period",
+        xaxis_title="Rebalance date",
+        yaxis_title="Cumulative log-return (%)",
         template="plotly_dark",
-        legend=dict(orientation="h", y=-0.18),
-        margin=dict(t=60, b=80),
+        height=340,
+        legend=dict(orientation="h", y=-0.22, font=dict(size=10)),
+        hovermode="x unified",
+        margin=dict(t=50, b=70, l=10, r=10),
     )
     return fig
 
 
-def spread_table(df: pd.DataFrame, side: str) -> pd.DataFrame:
-    """
-    Top-bin minus bottom-bin spread per horizon.
-    Works for any n_bins because it uses df.index.max() / .min().
-    """
-    rows = []
-    horizons_in = [c for c in df.columns if c.endswith(" mean")]
-    if df.empty or len(df.index) < 2:
-        return pd.DataFrame()
-    top_bin = df.index.max()
-    bot_bin = df.index.min()
-    for h_col in horizons_in:
-        h_label = h_col.replace(" mean", "")
-        d_top = df.loc[top_bin, h_col]
-        d_bot = df.loc[bot_bin, h_col]
-        if side == "buy":
-            spread = d_top - d_bot   # higher bin expected to outperform
-        else:
-            spread = d_bot - d_top   # for sell, lowest bin (1) is the WEAKEST sell signal
-                                     # so d_bot - d_top measures expected underperformance of strong sells
-        rows.append({
-            "Horizon": h_label,
-            f"Q{top_bin} mean": d_top,
-            f"Q{bot_bin} mean": d_bot,
-            "Spread (correct dir)": spread,
-        })
-    return pd.DataFrame(rows)
-
-
-def render_spread_table(sp: pd.DataFrame):
-    """Render a spread table using whatever numeric columns it has."""
-    if sp.empty:
-        st.info("No spread data (insufficient samples).")
+def render_summary_table(summary_df: pd.DataFrame, side: str):
+    """Render the 2dp summary table for a side. Includes spread (correct dir)."""
+    if summary_df is None or summary_df.empty:
+        st.info("No summary data.")
         return
-    numeric_cols = [c for c in sp.columns if c != "Horizon"]
-    fmt = {c: "{:+.4f}" for c in numeric_cols}
-    st.dataframe(
-        sp.style.format(fmt).background_gradient(
-            subset=["Spread (correct dir)"], cmap="RdYlGn"
-        ),
-        hide_index=True, use_container_width=True,
-    )
+    df = summary_df.copy()
+    # Ensure n samples is integer (it's already int but safe)
+    if "n samples" in df.columns:
+        df["n samples"] = df["n samples"].astype(int)
+    pct_cols = [c for c in df.columns if c.endswith("%)") and c != "n samples"]
+    fmt = {c: "{:+.2f}" for c in pct_cols}
+    spread_cols = [c for c in pct_cols if c.startswith("Spread ")]
+    styled = df.style.format(fmt)
+    if spread_cols:
+        styled = styled.background_gradient(
+            subset=spread_cols, cmap="RdYlGn", vmin=-15, vmax=15
+        )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
 
 
-horizon_colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444"]
+# =============================================================================
+# CUMULATIVE-RETURN CHARTS
+# =============================================================================
+st.markdown("---")
+st.subheader("Cumulative-return validation — top vs bottom bins")
+st.caption(
+    "At each non-overlapping rebalance date (every h bars from the start of the backtest window), "
+    "coins are sorted into bins by their **weighted score**. "
+    "The chart shows the cumulative log-return (%) of the **top bin** and **bottom bin** — "
+    "in **absolute** terms (solid lines) and in **BTC-excess** terms (dashed). "
+    "**Hard gate** uses 5 quintiles (qualified universe is narrow). "
+    "**Soft gate** uses 10 deciles (broader universe). "
+    "For BUY, top should outperform bottom. For SELL, the top bin = strongest sell candidate, "
+    "so it should underperform the bottom bin (the **Spread (correct dir)** in the summary "
+    "flips the sign for sell so a positive spread always means the model is working)."
+)
+
+
+HORIZONS = [5, 10, 15, 30]
+
+
+def render_holding_period_grid(series_dict: Dict[int, pd.DataFrame], n_bins: int, side: str, gate: str):
+    """
+    Render a 2x2 grid: one chart per holding period.
+    Each chart has 4 lines (Q-top abs, Q-bot abs, Q-top BTC-ex, Q-bot BTC-ex).
+    """
+    rows = [HORIZONS[:2], HORIZONS[2:]]  # [[5, 10], [15, 30]]
+    for row in rows:
+        cols = st.columns(2)
+        for col, h in zip(cols, row):
+            with col:
+                st.plotly_chart(
+                    plot_cumret_chart(series_dict.get(h, pd.DataFrame()), h, n_bins, side, gate),
+                    use_container_width=True,
+                )
+
 
 mode_tab_hard, mode_tab_soft = st.tabs([
     "🟦 Hard Binary Gate",
@@ -1132,96 +1220,40 @@ mode_tab_hard, mode_tab_soft = st.tabs([
 # --------- HARD ---------
 with mode_tab_hard:
     st.markdown(
-        "Decile bins are computed **only over coins that pass the hard gate** at each timestamp. "
-        "Sample sizes per decile are smaller, but the test is more conservative."
+        "Bins are computed **only over coins that pass the hard gate** (all 3 buckets agree "
+        "in direction + extension/jump/liquidity OK) at each rebalance date. "
+        "Quintiles (5 bins) are used since the qualified universe is narrow."
     )
+    sub_buy, sub_sell = st.tabs(["🟢 BUY side", "🔴 SELL side"])
 
-    sub_abs, sub_btc = st.tabs(["vs Absolute Returns", "vs BTC-Excess Returns"])
+    with sub_buy:
+        render_holding_period_grid(V["hard_buy_series"], n_bins=5, side="buy", gate="Hard")
+        st.markdown("**Final cumulative-return summary (each row is a separate holding period)**")
+        render_summary_table(V["hard_buy_summary"], side="buy")
 
-    with sub_abs:
-        cL, cR = st.columns(2)
-        with cL:
-            st.markdown("**🟢 Hard BUY decile returns (absolute)**")
-            st.plotly_chart(
-                plot_decile_bars(V["hard_buy_decile_abs"], "Hard BUY", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["hard_buy_decile_abs"], "buy")
-            render_spread_table(sp)
-        with cR:
-            st.markdown("**🔴 Hard SELL decile returns (absolute)**")
-            st.plotly_chart(
-                plot_decile_bars(V["hard_sell_decile_abs"], "Hard SELL", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["hard_sell_decile_abs"], "sell")
-            render_spread_table(sp)
-
-    with sub_btc:
-        cL, cR = st.columns(2)
-        with cL:
-            st.markdown("**🟢 Hard BUY decile returns (BTC-excess)**")
-            st.plotly_chart(
-                plot_decile_bars(V["hard_buy_decile_btc"], "Hard BUY (BTC-excess)", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["hard_buy_decile_btc"], "buy")
-            render_spread_table(sp)
-        with cR:
-            st.markdown("**🔴 Hard SELL decile returns (BTC-excess)**")
-            st.plotly_chart(
-                plot_decile_bars(V["hard_sell_decile_btc"], "Hard SELL (BTC-excess)", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["hard_sell_decile_btc"], "sell")
-            render_spread_table(sp)
+    with sub_sell:
+        render_holding_period_grid(V["hard_sell_series"], n_bins=5, side="sell", gate="Hard")
+        st.markdown("**Final cumulative-return summary (each row is a separate holding period)**")
+        render_summary_table(V["hard_sell_summary"], side="sell")
 
 # --------- SOFT ---------
 with mode_tab_soft:
     st.markdown(
-        "Decile bins are computed over **all coins passing extension/jump/liquidity** at each "
-        "timestamp (broader universe). Soft score includes the λ-penalty for inconsistent buckets."
+        "Bins are computed over **all coins passing extension/jump/liquidity** at each "
+        "rebalance date (broader universe). The soft score includes a λ-penalty for "
+        "buckets pulling against the trade direction. Deciles (10 bins) are used."
     )
+    sub_buy, sub_sell = st.tabs(["🟢 BUY side", "🔴 SELL side"])
 
-    sub_abs, sub_btc = st.tabs(["vs Absolute Returns", "vs BTC-Excess Returns"])
+    with sub_buy:
+        render_holding_period_grid(V["soft_buy_series"], n_bins=10, side="buy", gate="Soft")
+        st.markdown("**Final cumulative-return summary (each row is a separate holding period)**")
+        render_summary_table(V["soft_buy_summary"], side="buy")
 
-    with sub_abs:
-        cL, cR = st.columns(2)
-        with cL:
-            st.markdown("**🟢 Soft BUY decile returns (absolute)**")
-            st.plotly_chart(
-                plot_decile_bars(V["soft_buy_decile_abs"], "Soft BUY", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["soft_buy_decile_abs"], "buy")
-            render_spread_table(sp)
-        with cR:
-            st.markdown("**🔴 Soft SELL decile returns (absolute)**")
-            st.plotly_chart(
-                plot_decile_bars(V["soft_sell_decile_abs"], "Soft SELL", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["soft_sell_decile_abs"], "sell")
-            render_spread_table(sp)
-
-    with sub_btc:
-        cL, cR = st.columns(2)
-        with cL:
-            st.markdown("**🟢 Soft BUY decile returns (BTC-excess)**")
-            st.plotly_chart(
-                plot_decile_bars(V["soft_buy_decile_btc"], "Soft BUY (BTC-excess)", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["soft_buy_decile_btc"], "buy")
-            render_spread_table(sp)
-        with cR:
-            st.markdown("**🔴 Soft SELL decile returns (BTC-excess)**")
-            st.plotly_chart(
-                plot_decile_bars(V["soft_sell_decile_btc"], "Soft SELL (BTC-excess)", horizon_colors),
-                use_container_width=True,
-            )
-            sp = spread_table(V["soft_sell_decile_btc"], "sell")
-            render_spread_table(sp)
+    with sub_sell:
+        render_holding_period_grid(V["soft_sell_series"], n_bins=10, side="sell", gate="Soft")
+        st.markdown("**Final cumulative-return summary (each row is a separate holding period)**")
+        render_summary_table(V["soft_sell_summary"], side="sell")
 
 
 # =============================================================================
