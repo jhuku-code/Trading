@@ -18,6 +18,7 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
+import io
 import time
 from datetime import datetime, timezone
 
@@ -819,6 +820,64 @@ def _chart_leaderboard(lb: pd.DataFrame, n_elite: int, n_contra: int) -> go.Figu
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7b — EXCEL EXPORT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _positions_to_df(raw: dict, group: str) -> pd.DataFrame:
+    """
+    Flatten raw position dict {address: [position dicts]} into a clean
+    DataFrame suitable for display and Excel export.
+    No calculations — just the raw fields as returned by the API.
+    """
+    rows = []
+    for addr, positions in raw.items():
+        for p in positions:
+            rows.append({
+                "group":           group,
+                "wallet_address":  addr,
+                "coin":            p.get("coin", ""),
+                "direction":       p.get("direction", "").upper(),
+                "size":            p.get("size", 0),
+                "entry_price":     p.get("entry_px", 0),
+                "notional_usd":    round(p.get("notional", 0), 2),
+                "leverage":        p.get("leverage", 0),
+                "unrealized_pnl":  round(p.get("unrealized_pnl", 0), 2),
+            })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["group","wallet_address","coin","direction",
+                 "size","entry_price","notional_usd","leverage","unrealized_pnl"])
+
+
+def _build_excel(sheets: dict) -> bytes:
+    """
+    Build a multi-sheet Excel workbook in memory.
+    sheets = {"Sheet Name": dataframe, ...}
+    Returns raw bytes suitable for st.download_button.
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            if df is None or df.empty:
+                pd.DataFrame(["No data available"]).to_excel(
+                    writer, sheet_name=sheet_name[:31], index=False, header=False)
+            else:
+                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return buf.getvalue()
+
+
+def _dl_btn(label: str, data: bytes, filename: str, help_text: str = ""):
+    """Thin wrapper so every download button looks the same."""
+    st.download_button(
+        label=label,
+        data=data,
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help=help_text,
+        use_container_width=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8 — DATA LOADING  (session_state cache — survives page switches)
 #
 #  We use st.session_state rather than st.cache_data so that:
@@ -1436,45 +1495,227 @@ def main():
 
     # ── Raw Data ──────────────────────────────────────────────────────────────
     with tab_raw:
-        # Issue #4 — explain elite vs contra clearly
+
+        # ── Build the four base DataFrames ────────────────────────────────────
+        ts_str   = datetime.now().strftime("%Y%m%d_%H%M")
+        lb_full  = leaderboard.copy()                       # full leaderboard
+        if not lb_full.empty:
+            lb_full.insert(0, "rank", range(1, len(lb_full) + 1))
+            lb_full.columns = [c.replace("_", " ").title()
+                                for c in lb_full.columns]
+
+        elite_disp_raw  = meta.get("elite_display_raw",  meta.get("elite_raw",  {}))
+        contra_disp_raw = meta.get("contra_display_raw", meta.get("contra_raw", {}))
+
+        elite_pos_df    = _positions_to_df(elite_disp_raw,  "elite")
+        contra_pos_df   = _positions_to_df(contra_disp_raw, "contra")
+        all_pos_df      = pd.concat([elite_pos_df, contra_pos_df],
+                                    ignore_index=True) if not (
+                            elite_pos_df.empty and contra_pos_df.empty) else pd.DataFrame()
+
+        # ── Concept explainer ─────────────────────────────────────────────────
         st.markdown(
-            "<div style='background:#0d1f3c;border:1px solid #1e3a5f;border-radius:10px;"
-            "padding:14px 18px;margin-bottom:20px;font-size:0.82rem;line-height:1.9;'>"
-            "<b style='color:#00ff88;'>🟢 Elite wallets</b> — top N traders by recent PnL. "
-            "Their positions are the <b>signal</b>: when they're long a coin, that's a "
-            "bullish indicator.<br>"
-            "<b style='color:#ff4444;'>🔴 Contra wallets</b> — bottom N traders by recent PnL. "
-            "These are the <b>worst performers</b> — the fade group. A coin where they're "
-            "long while elites are short = SHORT signal (not because they hold short "
-            "positions, but because fading consistent losers is the signal).<br>"
-            "<span style='color:#64748b;'>⚠️ = position excluded from signals "
-            f"(dust &lt;${MIN_NOTIONAL_USD:,} or leverage &gt;{MAX_LEVERAGE_SIGNAL}x). "
-            "Still shown here for transparency.</span>"
-            "</div>",
+            "<div style='background:#0d1f3c;border:1px solid #1e3a5f;"
+            "border-radius:10px;padding:14px 18px;margin-bottom:20px;"
+            "font-size:0.82rem;line-height:1.9;'>"
+            "<b style='color:#00ff88;'>🟢 Elite wallets</b> — top N traders by "
+            "recent PnL. Their positions are the <b>signal leg</b>.<br>"
+            "<b style='color:#ff4444;'>🔴 Contra wallets</b> — bottom N traders by "
+            "recent PnL (the <b>worst performers</b> — fade group). NOT a 'short "
+            "positions' list. Fading them is the signal.<br>"
+            "<span style='color:#64748b;font-size:0.75rem;'>"
+            f"⚠️ = excluded from signals (dust &lt;${MIN_NOTIONAL_USD:,} "
+            f"or leverage &gt;{MAX_LEVERAGE_SIGNAL}x). Shown here for transparency."
+            "</span></div>",
             unsafe_allow_html=True,
         )
-        col_e, col_c = st.columns(2)
-        with col_e:
-            st.markdown("<div class='wt-section'>Elite Wallets — Open Positions</div>",
-                        unsafe_allow_html=True)
-            _render_wallet_table(meta, leaderboard, "elite")
-        with col_c:
-            st.markdown("<div class='wt-section'>Contra Wallets — Open Positions</div>",
-                        unsafe_allow_html=True)
-            _render_wallet_table(meta, leaderboard, "contra")
 
-        st.markdown("<div class='wt-section'>Full Signal Table</div>",
+        # ── MASTER DOWNLOAD — all sheets in one workbook ──────────────────────
+        st.markdown("<div class='wt-section'>Download All Data</div>",
                     unsafe_allow_html=True)
-        st.dataframe(signals, use_container_width=True, hide_index=True)
+        st.markdown(
+            "<div style='background:#0d1f3c;border:1px solid #1e4d8c;"
+            "border-radius:10px;padding:16px 20px;margin-bottom:8px;'>"
+            "<div style='font-family:Space Mono,monospace;color:#38bdf8;"
+            "font-size:0.82rem;letter-spacing:1px;margin-bottom:10px;'>"
+            "📥 MASTER WORKBOOK — 4 sheets in one file</div>"
+            "<div style='font-size:0.78rem;color:#94a3b8;line-height:1.8;'>"
+            "Sheet 1 · <b>Leaderboard</b> — all wallets ranked by PnL<br>"
+            "Sheet 2 · <b>Elite Positions</b> — all open positions, top N wallets<br>"
+            "Sheet 3 · <b>Contra Positions</b> — all open positions, bottom N wallets<br>"
+            "Sheet 4 · <b>All Positions</b> — elite + contra combined<br>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+        master_xlsx = _build_excel({
+            "Leaderboard":      lb_full if not lb_full.empty else pd.DataFrame(),
+            "Elite Positions":  elite_pos_df,
+            "Contra Positions": contra_pos_df,
+            "All Positions":    all_pos_df,
+        })
+        _dl_btn(
+            f"⬇️  Download Master Workbook  ({ts_str}).xlsx",
+            master_xlsx,
+            f"hyperliquid_whale_data_{ts_str}.xlsx",
+            "All four tables as separate sheets in one Excel file",
+        )
 
-        st.markdown("<div class='wt-section'>Leaderboard Snapshot (Top 50)</div>",
+        st.divider()
+
+        # ── TABLE 1 — Full Leaderboard ────────────────────────────────────────
+        st.markdown("<div class='wt-section'>Table 1 — Full Leaderboard</div>",
                     unsafe_allow_html=True)
-        if not leaderboard.empty:
-            st.dataframe(
-                leaderboard.head(50).style.format(
-                    {"pnl": "${:,.0f}", "account_value": "${:,.0f}"}),
-                use_container_width=True, height=400,
+
+        n_rows = len(lb_full) if not lb_full.empty else 0
+        col_info, col_dl = st.columns([4, 1])
+        with col_info:
+            st.caption(
+                f"{n_rows:,} wallets · Sorted by PnL descending · "
+                f"Top {n_elite} = Elite (🟢) · Bottom {n_contra} = Contra (🔴) · "
+                f"Window: monthly"
             )
+        with col_dl:
+            _dl_btn(
+                "⬇️ Download",
+                _build_excel({"Leaderboard": lb_full}),
+                f"hl_leaderboard_{ts_str}.xlsx",
+            )
+
+        if not lb_full.empty:
+            # Colour-code elite / contra rows
+            def _colour_lb(row):
+                rank = row.get("Rank", row.get("rank", 0))
+                if rank <= n_elite:
+                    return ["background-color:#052e1a; color:#00ff88"] * len(row)
+                if rank > n_rows - n_contra:
+                    return ["background-color:#2a0a0a; color:#ff4444"] * len(row)
+                return [""] * len(row)
+
+            styled = lb_full.style.apply(_colour_lb, axis=1).format(
+                {c: "${:,.0f}" for c in lb_full.columns
+                 if "Pnl" in c or "Value" in c}
+            )
+            st.dataframe(styled, use_container_width=True,
+                         height=500, hide_index=True)
+        else:
+            st.info("Leaderboard not available.")
+
+        st.divider()
+
+        # ── TABLE 2 — Elite Wallet Positions ─────────────────────────────────
+        st.markdown("<div class='wt-section'>Table 2 — Elite Wallet Positions</div>",
+                    unsafe_allow_html=True)
+
+        col_info2, col_dl2 = st.columns([4, 1])
+        with col_info2:
+            n_e_pos = len(elite_pos_df)
+            n_e_wal = elite_pos_df["wallet_address"].nunique() if n_e_pos else 0
+            st.caption(
+                f"{n_e_pos:,} positions across {n_e_wal} wallets · "
+                f"Unfiltered (includes dust & high-leverage) · "
+                f"⚠️ = excluded from signal calculation"
+            )
+        with col_dl2:
+            _dl_btn(
+                "⬇️ Download",
+                _build_excel({"Elite Positions": elite_pos_df}),
+                f"hl_elite_positions_{ts_str}.xlsx",
+            )
+
+        if not elite_pos_df.empty:
+            disp_e = elite_pos_df.copy()
+            disp_e["in_signal"] = disp_e.apply(
+                lambda r: ("⚠️ dust" if r["notional_usd"] < MIN_NOTIONAL_USD
+                           else "⚠️ high-lev" if r["leverage"] > MAX_LEVERAGE_SIGNAL
+                           else "✅"), axis=1)
+            st.dataframe(
+                disp_e,
+                column_config={
+                    "wallet_address": st.column_config.TextColumn("Wallet", width="medium"),
+                    "notional_usd":   st.column_config.NumberColumn("Notional ($)", format="$%.2f"),
+                    "unrealized_pnl": st.column_config.NumberColumn("uPnL ($)", format="$%.2f"),
+                    "leverage":       st.column_config.NumberColumn("Lev", format="%.1fx"),
+                    "in_signal":      st.column_config.TextColumn("In Signal?"),
+                },
+                use_container_width=True, height=420, hide_index=True,
+            )
+        else:
+            st.info("No elite positions available.")
+
+        st.divider()
+
+        # ── TABLE 3 — Contra Wallet Positions ────────────────────────────────
+        st.markdown("<div class='wt-section'>Table 3 — Contra Wallet Positions</div>",
+                    unsafe_allow_html=True)
+
+        col_info3, col_dl3 = st.columns([4, 1])
+        with col_info3:
+            n_c_pos = len(contra_pos_df)
+            n_c_wal = contra_pos_df["wallet_address"].nunique() if n_c_pos else 0
+            st.caption(
+                f"{n_c_pos:,} positions across {n_c_wal} wallets · "
+                f"Unfiltered · "
+                f"⚠️ = excluded from signal calculation"
+            )
+        with col_dl3:
+            _dl_btn(
+                "⬇️ Download",
+                _build_excel({"Contra Positions": contra_pos_df}),
+                f"hl_contra_positions_{ts_str}.xlsx",
+            )
+
+        if not contra_pos_df.empty:
+            disp_c = contra_pos_df.copy()
+            disp_c["in_signal"] = disp_c.apply(
+                lambda r: ("⚠️ dust" if r["notional_usd"] < MIN_NOTIONAL_USD
+                           else "⚠️ high-lev" if r["leverage"] > MAX_LEVERAGE_SIGNAL
+                           else "✅"), axis=1)
+            st.dataframe(
+                disp_c,
+                column_config={
+                    "wallet_address": st.column_config.TextColumn("Wallet", width="medium"),
+                    "notional_usd":   st.column_config.NumberColumn("Notional ($)", format="$%.2f"),
+                    "unrealized_pnl": st.column_config.NumberColumn("uPnL ($)", format="$%.2f"),
+                    "leverage":       st.column_config.NumberColumn("Lev", format="%.1fx"),
+                    "in_signal":      st.column_config.TextColumn("In Signal?"),
+                },
+                use_container_width=True, height=420, hide_index=True,
+            )
+        else:
+            st.info("No contra positions available.")
+
+        st.divider()
+
+        # ── TABLE 4 — All Positions Combined ─────────────────────────────────
+        st.markdown("<div class='wt-section'>Table 4 — All Positions Combined</div>",
+                    unsafe_allow_html=True)
+
+        col_info4, col_dl4 = st.columns([4, 1])
+        with col_info4:
+            st.caption(
+                f"{len(all_pos_df):,} total positions · "
+                "Elite + Contra merged · group column identifies each"
+            )
+        with col_dl4:
+            _dl_btn(
+                "⬇️ Download",
+                _build_excel({"All Positions": all_pos_df}),
+                f"hl_all_positions_{ts_str}.xlsx",
+            )
+
+        if not all_pos_df.empty:
+            st.dataframe(
+                all_pos_df,
+                column_config={
+                    "wallet_address": st.column_config.TextColumn("Wallet", width="medium"),
+                    "notional_usd":   st.column_config.NumberColumn("Notional ($)", format="$%.2f"),
+                    "unrealized_pnl": st.column_config.NumberColumn("uPnL ($)", format="$%.2f"),
+                    "leverage":       st.column_config.NumberColumn("Lev", format="%.1fx"),
+                },
+                use_container_width=True, height=500, hide_index=True,
+            )
+        else:
+            st.info("No position data available.")
 
 
 main()
