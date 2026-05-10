@@ -122,54 +122,47 @@ _DEFAULT_DIV_THRESH   = 40
 #
 #  ENDPOINT NOTES (from official SDK audit):
 #
-#  POST https://api.hyperliquid.xyz/info  — handles all standard queries:
+#  POST https://api.hyperliquid.xyz/info  — all standard queries:
 #    clearinghouseState, allMids, metaAndAssetCtxs, userFills, etc.
 #    "leaderboard" is NOT a valid /info type per the official SDK.
 #
 #  GET  https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
-#    This is the undocumented stats endpoint used by the Hyperliquid
-#    frontend for the all-time leaderboard. Tried first.
+#    Undocumented stats endpoint used by the HL frontend. Returns hundreds
+#    of rows sorted by all-time PnL. This is our only leaderboard source.
 #
-#  If the stats endpoint fails (e.g. IP block, CORS, geo-restriction)
-#  the app falls back to a curated list of publicly-known top traders.
+#  CONTRA WALLET DESIGN:
+#    Elite   = leaderboard.head(N_ELITE)  — top N by PnL
+#    Contra  = leaderboard.tail(N_CONTRA) — bottom N by PnL (biggest losers)
+#    Both come from the same Hyperliquid leaderboard. No external source needed.
+#    The leaderboard must have at least N_ELITE + N_CONTRA + 50 rows for the
+#    two groups to be meaningfully separated.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _INFO_URL  = "https://api.hyperliquid.xyz/info"
 _STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+# Window priority: month first (most regime-relevant), then broader windows.
+# Issue #10 — all-time PnL ranking: monthly window surfaces recent edge, not
+# bull-market luck from 2023. Falls back to wider windows if month lacks rows.
+_STATS_WINDOWS = ["month", "week", "allTime", "day"]
 _HEADERS   = {"Content-Type": "application/json"}
 _BATCH     = 10      # wallet addresses per batch
 _DELAY     = 0.25    # seconds between batches
 
-# Curated list of publicly-known top Hyperliquid traders
-# (sourced from Dune Analytics HL leaderboard & community research).
-# Used as ultimate fallback when the live leaderboard endpoint is unavailable.
-# Update periodically — these are real mainnet addresses.
-_KNOWN_ELITE_WALLETS = [
-    "0x1F4AeE47bB2fEA0D52F4fAA56cC3Cd02c90Ad5d",
-    "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
-    "0x4c2ca4e64d5e6ed15f68a03e0c45337ab36d81b7",
-    "0xf89d7b9c864f589bbf53a82105107622b35eaa40",
-    "0x6defa41d2b4a2c4d7a13b9a3a8d43c5d9e7f1b2c",
-    "0x0903d5882f57e352d02bbc12abd386a3f2a00f60",
-    "0x98ef0f2e8b6f3f6ee6b7e5a4c7d2b8f1e3a9c5d",
-    "0xa2f1e3b8c4d7f2a6e9b3c5d1f8a4e7b2c6d9f3a",
-    "0xb3c5e8a1d4f7b2e6a9c3d5f1b8e4a7c2d6f9b3e",
-    "0x2e8f1a4b7c3d6e9f2a5b8c1d4e7f0a3b6c9d2e5",
-    "0x5c9b2e7f4a1d8b5e2c9f6a3d0b7e4c1f8a5b2e9",
-    "0x8f4a1e7b3c6d9f2a5e8b1c4d7f0a3e6b9c2d5f8",
-    "0x1b5e8c2f7a4d1b8e5c2f9a6d3b0e7c4f1a8e5b2",
-    "0x4e7a2d9f6b3e0a7d4f1b8e5c2a9f6d3b0e7c4f1",
-    "0x7c1f4b9e6a3d0f7c4b1e8a5d2f9c6b3e0a7d4f1",
-    "0xa6b3e9f2c7d4a1e8b5c2f9d6a3b0e7c4f1a8b5",
-    "0xd4f1b8e5c2a9f6d3b0e7c4f1a8e5b2c9f6d3b0",
-    "0x3b0e7c4f1a8e5b2c9f6d3b0e7c4f1a8e5b2c9f6",
-    "0x9f6d3b0e7c4f1a8e5b2c9f6d3b0e7c4f1a8e5b2",
-    "0xc9f6d3b0e7c4f1a8e5b2c9f6d3b0e7c4f1a8e5b",
-]
+# Minimum leaderboard rows needed for a valid elite/contra split.
+_MIN_LB_ROWS = 90
 
-_KNOWN_CONTRA_WALLETS = [
-    "0x0000000000000000000000000000000000000000",  # placeholder — replaced at runtime
-]
+# Issue #8 — notional size filter: positions below this USD value are dust /
+# UI tests and should not influence directional signals.
+MIN_NOTIONAL_USD = 500
+
+# Issue #9 — leverage quality filter: positions above this leverage are likely
+# intraday scalps, not directional conviction. Excluded from signal matrix
+# but still shown in Raw Data tab for reference.
+MAX_LEVERAGE_SIGNAL = 25
+
+# Issue #6 — minimum participation gate: if fewer than this % of elite+contra
+# wallets have any open position, the scan is too thin to trust.
+MIN_PARTICIPATION_PCT = 20
 
 # Store last API error for display in the UI
 _last_api_error: str = ""
@@ -219,66 +212,93 @@ def fetch_leaderboard() -> tuple:
     """
     Returns (DataFrame[address, pnl, account_value], is_live: bool).
 
-    Tries endpoints in order:
-      1. GET stats-data.hyperliquid.xyz/Mainnet/leaderboard  (undocumented stats API)
-      2. Known elite wallet list  (publicly sourced, no API needed)
+    Source: GET stats-data.hyperliquid.xyz/Mainnet/leaderboard
+    Retried with multiple window params: allTime, month, week, day.
 
-    NOTE: 'leaderboard' is NOT a valid type for POST /info per the official SDK.
+    Elite   = returned_df.head(N_ELITE)   — top performers
+    Contra  = returned_df.tail(N_CONTRA)  — bottom performers (biggest losers)
+    Both come from the same HL data — no external source needed.
+
+    Returns is_live=False (→ mock) only if every window attempt fails OR the
+    returned leaderboard has fewer rows than _MIN_LB_ROWS, which would make
+    the elite/contra split meaningless.
     """
     global _last_api_error
 
-    # ── Attempt 1: stats-data leaderboard endpoint ────────────────────────────
-    data = _get(_STATS_URL)
-    if data:
-        # Response shape: {"leaderboardRows": [{ethAddress, accountValue, pnl, ...}]}
-        # or flat list format depending on API version
+    def _parse_rows(data) -> pd.DataFrame:
+        """Extract and normalise rows from any known response shape."""
+        if not data:
+            return pd.DataFrame()
         rows_raw = (data.get("leaderboardRows") if isinstance(data, dict)
                     else data if isinstance(data, list) else None)
-        if rows_raw:
-            rows = [
-                {
-                    "address":       r.get("ethAddress", r.get("address", "")),
-                    "pnl":           float(r.get("pnl", r.get("windowPnl", 0))),
-                    "account_value": float(r.get("accountValue", 0)),
-                }
-                for r in rows_raw
-                if r.get("ethAddress") or r.get("address")
-            ]
-            df = pd.DataFrame(rows)
+        if not rows_raw:
+            return pd.DataFrame()
+        rows = [
+            {
+                "address":       r.get("ethAddress", r.get("address", "")),
+                "pnl":           float(r.get("pnl", r.get("windowPnl", 0))),
+                "account_value": float(r.get("accountValue", 0)),
+            }
+            for r in rows_raw
+            if r.get("ethAddress") or r.get("address")
+        ]
+        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        if not df.empty:
             df = df[df["address"] != ""].copy()
-            if not df.empty:
-                return df.sort_values("pnl", ascending=False).reset_index(drop=True), True
+        return df
 
-    # ── Attempt 2: known wallet fallback ─────────────────────────────────────
-    # Verify at least one known wallet is reachable via clearinghouseState
-    test = _post({"type": "clearinghouseState",
-                  "user": _KNOWN_ELITE_WALLETS[0]}, timeout=10)
-    if test is not None:
-        # clearinghouseState works — build a synthetic leaderboard from known addresses
-        _last_api_error = ("Leaderboard endpoint unavailable. "
-                           "Using known whale addresses + live position data.")
-        rows = [{"address": a, "pnl": 0.0, "account_value": 0.0}
-                for a in _KNOWN_ELITE_WALLETS]
-        return pd.DataFrame(rows), True   # is_live=True because positions will be real
+    # ── Try base URL with no window param first ───────────────────────────────
+    data = _get(_STATS_URL)
+    df   = _parse_rows(data)
+    if not df.empty and len(df) >= _MIN_LB_ROWS:
+        return df.sort_values("pnl", ascending=False).reset_index(drop=True), True
 
-    # ── Total failure ─────────────────────────────────────────────────────────
+    # ── Retry with explicit window params ─────────────────────────────────────
+    for window in _STATS_WINDOWS:
+        data = _get(f"{_STATS_URL}?window={window}")
+        df   = _parse_rows(data)
+        if not df.empty and len(df) >= _MIN_LB_ROWS:
+            return df.sort_values("pnl", ascending=False).reset_index(drop=True), True
+
+    # ── Last check: did we get *something* but not enough rows? ───────────────
+    if not df.empty:
+        _last_api_error = (
+            f"Leaderboard returned only {len(df)} rows — need ≥{_MIN_LB_ROWS} "
+            f"for a valid elite/contra split. Falling back to demo data."
+        )
+
     return _mock_leaderboard(), False
 
 
-def fetch_positions(address: str) -> list:
-    """Open positions for one wallet address."""
+def fetch_positions(address: str, for_signal: bool = True) -> list:
+    """
+    Open perpetuals positions for one wallet address.
+
+    for_signal=True  (default): applies quality filters for signal computation
+      - Notional < MIN_NOTIONAL_USD is excluded (dust / UI test positions)
+      - Leverage > MAX_LEVERAGE_SIGNAL is excluded (likely intraday scalp)
+    for_signal=False: returns all positions unfiltered (for Raw Data display)
+    """
     data = _post({"type": "clearinghouseState", "user": address})
     if not data or "assetPositions" not in data:
         return []
     out = []
     for ap in data.get("assetPositions", []):
-        p    = ap.get("position", {})
-        size = float(p.get("szi", 0))
+        p        = ap.get("position", {})
+        size     = float(p.get("szi", 0))
         if size == 0:
             continue
         lev_raw  = p.get("leverage", {})
         leverage = (float(lev_raw.get("value", lev_raw.get("rawUsd", 1)))
                     if isinstance(lev_raw, dict) else float(lev_raw or 1))
+        notional = abs(float(p.get("positionValue", 0)))
+
+        if for_signal:
+            if notional < MIN_NOTIONAL_USD:
+                continue   # Issue #8: ignore dust positions
+            if leverage > MAX_LEVERAGE_SIGNAL:
+                continue   # Issue #9: ignore high-leverage scalps
+
         out.append({
             "coin":           p.get("coin", "UNKNOWN"),
             "direction":      "long" if size > 0 else "short",
@@ -286,7 +306,7 @@ def fetch_positions(address: str) -> list:
             "entry_px":       float(p.get("entryPx", 0)),
             "unrealized_pnl": float(p.get("unrealizedPnl", 0)),
             "leverage":       round(leverage, 1),
-            "notional":       abs(float(p.get("positionValue", 0))),
+            "notional":       notional,
         })
     return out
 
@@ -311,24 +331,32 @@ def fetch_prices() -> dict:
 
 def _build_position_matrix(addresses: list) -> tuple:
     """
-    Batch-fetches positions. Returns (dir_df, notional_df, raw_dict).
-    dir_df: wallets × coins, values +1=long / -1=short / 0=flat
+    Batch-fetches positions for signal computation (filtered) and display (raw).
+
+    Returns (dir_df, notional_df, signal_raw, display_raw) where:
+      dir_df       — wallets × coins, +1=long / -1=short / 0=flat  [filtered]
+      notional_df  — wallets × coins, USD notional                  [filtered]
+      signal_raw   — {address: [filtered positions]}  used for signal maths
+      display_raw  — {address: [all positions]}       used for Raw Data tab
     """
-    raw, all_coins = {}, set()
+    signal_raw, display_raw, all_coins = {}, {}, set()
+
     for i, addr in enumerate(addresses):
-        positions = fetch_positions(addr)
-        raw[addr] = positions
-        all_coins.update(p["coin"] for p in positions)
+        sig_pos  = fetch_positions(addr, for_signal=True)   # filtered
+        disp_pos = fetch_positions(addr, for_signal=False)  # unfiltered
+        signal_raw[addr]  = sig_pos
+        display_raw[addr] = disp_pos
+        all_coins.update(p["coin"] for p in sig_pos)
         if (i + 1) % _BATCH == 0:
             time.sleep(_DELAY)
 
     if not all_coins:
         empty = pd.DataFrame(index=addresses)
-        return empty, empty, raw
+        return empty, empty, signal_raw, display_raw
 
     coins = sorted(all_coins)
     dir_rows, not_rows = {}, {}
-    for addr, positions in raw.items():
+    for addr, positions in signal_raw.items():
         pos_map = {p["coin"]: p for p in positions}
         dir_rows[addr] = {c: (1 if pos_map[c]["direction"] == "long" else -1)
                            if c in pos_map else 0 for c in coins}
@@ -337,7 +365,7 @@ def _build_position_matrix(addresses: list) -> tuple:
 
     return (pd.DataFrame(dir_rows, index=coins).T,
             pd.DataFrame(not_rows, index=coins).T,
-            raw)
+            signal_raw, display_raw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,7 +402,13 @@ def compute_signals(
     SHORT  :  score ≤ −div_threshold
     NEUTRAL:  |score| < div_threshold
 
-    All 4 strategy parameters are passed explicitly — no hidden globals.
+    Issue #3/#7 — min_wallets now applies PER GROUP (each side must have
+    at least min_wallets positions in a coin). This ensures both the signal
+    leg AND the fade leg are present before a signal fires.
+
+    Issue #6 — participation gate: if fewer than MIN_PARTICIPATION_PCT of
+    wallets have any open position, the scan is flagged as low-quality.
+
     Returns (signals_df, meta_dict).
     """
     if use_mock:
@@ -384,8 +418,15 @@ def compute_signals(
     elite_addrs  = leaderboard.head(n_elite)["address"].tolist()
     contra_addrs = leaderboard.tail(n_contra)["address"].tolist()
 
-    elite_dir,  elite_not,  elite_raw  = _build_position_matrix(elite_addrs)
-    contra_dir, contra_not, contra_raw = _build_position_matrix(contra_addrs)
+    # _build_position_matrix now returns 4 values (signal_raw, display_raw)
+    elite_dir,  elite_not,  elite_sig_raw,  elite_disp_raw  = _build_position_matrix(elite_addrs)
+    contra_dir, contra_not, contra_sig_raw, contra_disp_raw = _build_position_matrix(contra_addrs)
+
+    # ── Issue #6: participation gate ──────────────────────────────────────────
+    elite_active  = sum(1 for v in elite_sig_raw.values()  if v)
+    contra_active = sum(1 for v in contra_sig_raw.values() if v)
+    total_wallets = len(elite_addrs) + len(contra_addrs)
+    participation = (elite_active + contra_active) / max(total_wallets, 1) * 100
 
     all_coins = list(set(elite_dir.columns) | set(contra_dir.columns))
     funding   = funding_rates or {}
@@ -400,7 +441,10 @@ def compute_signals(
 
         e_pos = e_col[e_col != 0]
         c_pos = c_col[c_col != 0]
-        if len(e_pos) + len(c_pos) < min_wallets:
+
+        # Issue #3/#7: require min_wallets from EACH group, not combined total.
+        # This guarantees both a signal leg and a fade leg are present.
+        if len(e_pos) < min_wallets or len(c_pos) < min_wallets:
             continue
 
         e_long_pct = (e_pos > 0).sum() / max(len(e_pos), 1) * 100
@@ -433,12 +477,18 @@ def compute_signals(
                         .reset_index(drop=True))
 
     meta = {
-        "elite_addresses":  elite_addrs,
-        "contra_addresses": contra_addrs,
-        "elite_raw":        elite_raw,
-        "contra_raw":       contra_raw,
-        "fetch_seconds":    round(time.time() - t0, 1),
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "elite_addresses":    elite_addrs,
+        "contra_addresses":   contra_addrs,
+        "elite_raw":          elite_sig_raw,    # filtered — used for signal recompute
+        "contra_raw":         contra_sig_raw,
+        "elite_display_raw":  elite_disp_raw,   # unfiltered — used for Raw Data tab
+        "contra_display_raw": contra_disp_raw,
+        "participation_pct":  round(participation, 1),
+        "elite_active":       elite_active,
+        "contra_active":      contra_active,
+        "low_participation":  participation < MIN_PARTICIPATION_PCT,
+        "fetch_seconds":      round(time.time() - t0, 1),
+        "timestamp":          datetime.now(timezone.utc).isoformat(),
         "is_mock":          False,
         "leaderboard":      leaderboard,
         "params":           dict(n_elite=n_elite, n_contra=n_contra,
@@ -448,11 +498,14 @@ def compute_signals(
 
 
 def _build_wallet_detail(raw: dict, leaderboard: pd.DataFrame, group: str) -> pd.DataFrame:
+    """Builds display table from raw (unfiltered) positions. Flags dust/high-lev rows."""
     rows = []
     for addr, positions in raw.items():
         pnl_row    = leaderboard[leaderboard["address"] == addr]
         wallet_pnl = float(pnl_row["pnl"].values[0]) if not pnl_row.empty else 0.0
         for p in positions:
+            is_dust    = p["notional"] < MIN_NOTIONAL_USD
+            is_scalp   = p["leverage"] > MAX_LEVERAGE_SIGNAL
             rows.append({
                 "wallet":         addr[:8] + "…" + addr[-6:],
                 "group":          group,
@@ -463,6 +516,7 @@ def _build_wallet_detail(raw: dict, leaderboard: pd.DataFrame, group: str) -> pd
                 "leverage":       p["leverage"],
                 "entry_px":       p["entry_px"],
                 "upnl":           round(p["unrealized_pnl"]),
+                "excluded":       "⚠️ dust" if is_dust else ("⚠️ high-lev" if is_scalp else "✅"),
             })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -817,11 +871,10 @@ def _run_fetch(n_elite: int, n_contra: int, min_wallets: int,
                 lb, n_elite, n_contra, min_wallets, div_threshold, funding, prices,
             )
             meta["is_mock"] = False
-            # Tag where the leaderboard came from
-            lb_src = ("stats-data.hyperliquid.xyz"
-                      if len(lb) > len(_KNOWN_ELITE_WALLETS)
-                      else "known wallets fallback")
-            meta["data_source"] = f"Live — {lb_src}"
+            meta["data_source"] = (
+                f"Live — stats-data.hyperliquid.xyz "
+                f"({len(lb)} wallets, elite top {n_elite}, contra bottom {n_contra})"
+            )
 
     cache = {**meta, "signals": signals, "is_mock": meta["is_mock"],
              "data_source": meta.get("data_source", "unknown")}
@@ -839,10 +892,26 @@ def _recompute_signals(cache: dict, n_elite: int, n_contra: int,
         return _mock_signals(div_threshold)
 
     lb           = cache.get("leaderboard", pd.DataFrame())
-    elite_addrs  = lb.head(n_elite)["address"].tolist()
-    contra_addrs = lb.tail(n_contra)["address"].tolist()
     elite_raw    = cache.get("elite_raw", {})
     contra_raw   = cache.get("contra_raw", {})
+
+    # ── Bounds guard: sliders may request more wallets than were fetched ──────
+    # elite_raw and contra_raw only contain addresses fetched during _run_fetch.
+    # If the user raises n_elite/n_contra via slider, cap to what we have so
+    # we don't silently drop addresses or produce an empty matrix.
+    fetched_elite  = list(elite_raw.keys())
+    fetched_contra = list(contra_raw.keys())
+    n_elite_eff    = min(n_elite,  len(fetched_elite))
+    n_contra_eff   = min(n_contra, len(fetched_contra))
+
+    # Also ensure elite and contra don't overlap in the leaderboard
+    if not lb.empty and len(lb) >= n_elite_eff + n_contra_eff:
+        elite_addrs  = lb.head(n_elite_eff)["address"].tolist()
+        contra_addrs = lb.tail(n_contra_eff)["address"].tolist()
+    else:
+        # Leaderboard too small or missing — fall back to fetched key order
+        elite_addrs  = fetched_elite[:n_elite_eff]
+        contra_addrs = fetched_contra[:n_contra_eff]
     funding      = {}   # funding/prices not re-fetched on param change
     px           = {}
 
@@ -875,7 +944,8 @@ def _recompute_signals(cache: dict, n_elite: int, n_contra: int,
                  else pd.Series(0, index=contra_addrs))
         e_pos = e_col[e_col != 0]
         c_pos = c_col[c_col != 0]
-        if len(e_pos) + len(c_pos) < min_wallets:
+        # Issue #3/#7: per-group minimum — both sides must be represented
+        if len(e_pos) < min_wallets or len(c_pos) < min_wallets:
             continue
         e_long = (e_pos > 0).sum() / max(len(e_pos), 1) * 100
         c_long = (c_pos > 0).sum() / max(len(c_pos), 1) * 100
@@ -923,28 +993,55 @@ def _render_sidebar() -> tuple:
 
         # ── Strategy Parameters ───────────────────────────────────────────────
         st.markdown("**Strategy Parameters**")
-        st.caption("Adjust and click Refresh to apply to a new API fetch. "
-                   "Parameter changes on existing data apply instantly.")
+        st.caption("Sliders update signals instantly. Click Refresh to fetch new data.")
 
         n_elite = st.slider(
-            "Elite wallets (top N by PnL)",
+            "Elite wallets (top N by monthly PnL)",
             min_value=5, max_value=50, value=_DEFAULT_N_ELITE, step=5,
-            help="Wallets ranked in the top N by total PnL — your signal generators",
+            help=(
+                "Wallets ranked in the top N by recent PnL — your SIGNAL generators. "
+                "These are traders with demonstrated edge. When they're net long a coin, "
+                "that's a bullish signal."
+            ),
         )
         n_contra = st.slider(
-            "Contra wallets (bottom N by PnL)",
+            "Contra wallets (bottom N by monthly PnL)",
             min_value=5, max_value=50, value=_DEFAULT_N_CONTRA, step=5,
-            help="Wallets ranked in the bottom N — used as a fade signal",
+            help=(
+                "Wallets ranked in the bottom N by recent PnL — the FADE group. "
+                "NOT a 'short positions' list. These are the worst-performing traders. "
+                "When they're heavily long a coin that elite wallets are short, that's "
+                "a SHORT signal — you're fading the crowd that consistently loses."
+            ),
         )
         min_wallets = st.slider(
-            "Min wallets per coin",
-            min_value=2, max_value=10, value=_DEFAULT_MIN_WALLETS, step=1,
-            help="Coin must appear in at least this many wallets to generate a signal",
+            "Min wallets per group (each side)",
+            min_value=1, max_value=5, value=_DEFAULT_MIN_WALLETS, step=1,
+            help=(
+                "A coin must have at least this many positions in BOTH the elite group "
+                "AND the contra group to generate a signal. Ensures both the signal leg "
+                "and the fade leg are present. Setting to 1 gives the most signals; "
+                "higher values are more conservative."
+            ),
         )
         div_threshold = st.slider(
             "Divergence threshold (±)",
             min_value=10, max_value=70, value=_DEFAULT_DIV_THRESH, step=5,
             help="Score must exceed ±this value to declare LONG or SHORT",
+        )
+
+        st.divider()
+
+        # ── Quality filters (informational) ───────────────────────────────────
+        st.markdown(
+            f"<div style='font-size:0.75rem;color:#94a3b8;line-height:1.9;'>"
+            f"<b>Signal quality filters</b> (fixed):<br>"
+            f"🗑️ Dust filter: &lt;${MIN_NOTIONAL_USD:,} notional excluded<br>"
+            f"⚡ Leverage cap: &gt;{MAX_LEVERAGE_SIGNAL}x excluded (scalps)<br>"
+            f"📅 Leaderboard: ranked by <b>monthly PnL</b><br>"
+            f"<span style='color:#64748b;font-size:0.70rem;'>These are shown in Raw Data tab</span>"
+            f"</div>",
+            unsafe_allow_html=True,
         )
 
         st.divider()
@@ -1037,6 +1134,23 @@ def _render_header(meta: dict):
             f"<div class='wt-mock-banner'>{msg}</div>",
             unsafe_allow_html=True,
         )
+    else:
+        # Live data — check for elite/contra overlap risk
+        lb   = meta.get("leaderboard", pd.DataFrame())
+        n_e  = p.get("n_elite",  _DEFAULT_N_ELITE)
+        n_c  = p.get("n_contra", _DEFAULT_N_CONTRA)
+        n_lb = len(lb)
+        if n_lb > 0 and n_lb < n_e + n_c + 50:
+            st.markdown(
+                f"<div style='background:#1c1500;border:1px solid #854d0e;"
+                f"border-radius:8px;padding:10px 16px;margin-bottom:12px;"
+                f"color:#fbbf24;font-size:0.82rem;'>"
+                f"⚠️ <b>Leaderboard only has {n_lb} rows.</b> "
+                f"With Elite={n_e} + Contra={n_c}, there is less than 50 rows of separation "
+                f"between the two groups — signals may be unreliable. "
+                f"Reduce Elite or Contra wallet counts in the sidebar.</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def _render_kpis(signals: pd.DataFrame):
@@ -1091,7 +1205,8 @@ def _render_signal_table(df: pd.DataFrame, signal_type: str):
 
 
 def _render_wallet_table(meta: dict, leaderboard: pd.DataFrame, group: str):
-    raw = meta.get(f"{group}_raw", {})
+    # Use unfiltered display_raw so ALL positions appear, with exclusion flags
+    raw = meta.get(f"{group}_display_raw", meta.get(f"{group}_raw", {}))
     if not raw:
         st.info("No wallet data available.")
         return
@@ -1104,11 +1219,16 @@ def _render_wallet_table(meta: dict, leaderboard: pd.DataFrame, group: str):
         lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
     st.dataframe(
         df[["wallet","wallet_pnl_usd","coin","direction",
-            "notional","leverage","entry_px","upnl"]],
+            "notional","leverage","entry_px","upnl","excluded"]],
         column_config={
             "wallet_pnl_usd": st.column_config.NumberColumn(
                 "Wallet PnL ($)", format="$%.0f"),
-            "leverage": st.column_config.NumberColumn("Lev", format="%dx"),
+            "leverage":  st.column_config.NumberColumn("Lev", format="%dx"),
+            "excluded":  st.column_config.TextColumn(
+                "In signal?",
+                help=(f"✅ = included in signal. "
+                      f"⚠️ dust = notional <${MIN_NOTIONAL_USD:,} (excluded). "
+                      f"⚠️ high-lev = leverage >{MAX_LEVERAGE_SIGNAL}x (excluded).")),
         },
         use_container_width=True, height=400, hide_index=True,
     )
@@ -1288,7 +1408,12 @@ def main():
                 )
         with cz:
             st.markdown("**Coverage**")
-            total = len(signals)
+            total        = len(signals)
+            part_pct     = meta.get("participation_pct", 0)
+            e_active     = meta.get("elite_active", 0)
+            c_active     = meta.get("contra_active", 0)
+            low_part     = meta.get("low_participation", False)
+            part_col     = _RED if low_part else (_YLW if part_pct < 40 else _GREEN)
             st.metric("Coins scanned", total)
             st.metric("With signals",  len(long_df) + len(short_df))
             st.metric("Signal rate",
@@ -1296,9 +1421,38 @@ def main():
             st.metric("Avg div (longs)",
                       f"{long_df['divergence_score'].mean():.1f}"
                       if not long_df.empty else "—")
+            st.markdown(
+                f"<div style='margin-top:12px;background:var(--card);"
+                f"border:1px solid {'#7f1d1d' if low_part else '#1e3a5f'};"
+                f"border-radius:8px;padding:12px;font-size:0.80rem;'>"
+                f"<b style='color:{part_col};'>Scan Participation</b><br>"
+                f"<span style='color:#94a3b8;'>Elite active: {e_active}/{n_elite}<br>"
+                f"Contra active: {c_active}/{n_contra}<br>"
+                f"Total: <b style='color:{part_col};'>{part_pct:.0f}%</b></span>"
+                f"{'<br><span style=\"color:#f87171;\">⚠️ Low participation — signals unreliable</span>' if low_part else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
     # ── Raw Data ──────────────────────────────────────────────────────────────
     with tab_raw:
+        # Issue #4 — explain elite vs contra clearly
+        st.markdown(
+            "<div style='background:#0d1f3c;border:1px solid #1e3a5f;border-radius:10px;"
+            "padding:14px 18px;margin-bottom:20px;font-size:0.82rem;line-height:1.9;'>"
+            "<b style='color:#00ff88;'>🟢 Elite wallets</b> — top N traders by recent PnL. "
+            "Their positions are the <b>signal</b>: when they're long a coin, that's a "
+            "bullish indicator.<br>"
+            "<b style='color:#ff4444;'>🔴 Contra wallets</b> — bottom N traders by recent PnL. "
+            "These are the <b>worst performers</b> — the fade group. A coin where they're "
+            "long while elites are short = SHORT signal (not because they hold short "
+            "positions, but because fading consistent losers is the signal).<br>"
+            "<span style='color:#64748b;'>⚠️ = position excluded from signals "
+            f"(dust &lt;${MIN_NOTIONAL_USD:,} or leverage &gt;{MAX_LEVERAGE_SIGNAL}x). "
+            "Still shown here for transparency.</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         col_e, col_c = st.columns(2)
         with col_e:
             st.markdown("<div class='wt-section'>Elite Wallets — Open Positions</div>",
