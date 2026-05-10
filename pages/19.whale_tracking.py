@@ -136,8 +136,17 @@ def _post(payload: dict, timeout: int = 20):
         return None
 
 
-def fetch_leaderboard() -> pd.DataFrame:
-    """Leaderboard sorted descending by PnL. Falls back to mock on API failure."""
+def fetch_leaderboard() -> tuple:
+    """
+    Returns (DataFrame, is_live: bool).
+
+    is_live=True  -> real data came back from Hyperliquid API.
+    is_live=False -> API failed; DataFrame contains mock data instead.
+
+    We return an explicit boolean rather than guessing from address format,
+    because mock addresses (0x000...001) happen to be valid-looking 42-char
+    hex strings and would otherwise pass a format check as "live".
+    """
     data = _post({"type": "leaderboard"})
     if data and "leaderboardRows" in data:
         rows = [
@@ -152,8 +161,8 @@ def fetch_leaderboard() -> pd.DataFrame:
         df = pd.DataFrame(rows)
         df = df[df["address"] != ""].copy()
         if not df.empty:
-            return df.sort_values("pnl", ascending=False).reset_index(drop=True)
-    return _mock_leaderboard()
+            return df.sort_values("pnl", ascending=False).reset_index(drop=True), True
+    return _mock_leaderboard(), False
 
 
 def fetch_positions(address: str) -> list:
@@ -692,10 +701,11 @@ def _run_fetch(n_elite: int, n_contra: int, min_wallets: int,
         )
         meta["is_mock"] = True
     else:
-        lb = fetch_leaderboard()
-        # Detect real vs mock fallback (real addresses are 42-char 0x… strings)
-        sample  = lb["address"].iloc[0] if len(lb) > 0 else ""
-        is_live = len(sample) == 42 and sample.startswith("0x")
+        # fetch_leaderboard() returns (df, is_live) — the explicit flag is the
+        # only reliable way to distinguish real API data from the mock fallback,
+        # because mock addresses are valid-looking 42-char hex strings that
+        # would fool any address-format check.
+        lb, is_live = fetch_leaderboard()
 
         if not is_live:
             signals, meta = compute_signals(
