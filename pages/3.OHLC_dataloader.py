@@ -20,7 +20,7 @@ st.sidebar.header("Settings")
 default_excel_relpath = Path("Input-Files") / "Themes_mapping.xlsx"
 st.sidebar.write(f"Using: `{default_excel_relpath}`")
 
-timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h"], index=0)
+timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h", "30m", "15m"], index=0)
 limit = st.sidebar.number_input("OHLC limit", value=90, min_value=10, max_value=2000)
 sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.2)
 
