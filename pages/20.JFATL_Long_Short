@@ -1,20 +1,19 @@
-"""
-================================================================================
-JFATL Long/Short Signal Scanner
-================================================================================
-Scans all coins from the OHLC dataloader for JFATL crossover signals.
-- LONG signals:  price crossed ABOVE JFATL line within the last N bars
-- SHORT signals: price crossed BELOW JFATL line within the last N bars
 
-JFATL = JMA-smoothed FATL (Fast Adaptive Trendline)
-  Step 1: FATL = SMA(close, fatl_period)
-  Step 2: Blend two WMAs of the FATL at different lengths using a phase parameter
-          jfatl = WMA(fatl, jma_period) * e + WMA(fatl, jma_period/2) * (1 - e)
-          where e = 0.5 * (phase + 1)
+# ================================================================================
+# JFATL Long/Short Signal Scanner
+# ================================================================================
+# Scans all coins from the OHLC dataloader for JFATL crossover signals.
+# - LONG signals:  price crossed ABOVE JFATL line within the last N bars
+# - SHORT signals: price crossed BELOW JFATL line within the last N bars
 
-Pine Script source: Multi-Indicator Trading Signals_v2 (v6)
-================================================================================
-"""
+# JFATL = JMA-smoothed FATL (Fast Adaptive Trendline)
+#  Step 1: FATL = SMA(close, fatl_period)
+# Step 2: Blend two WMAs of the FATL at different lengths using a phase parameter
+#          jfatl = WMA(fatl, jma_period) * e + WMA(fatl, jma_period/2) * (1 - e)
+#          where e = 0.5 * (phase + 1)
+
+# Pine Script source: Multi-Indicator Trading Signals_v2 (v6)
+# ================================================================================
 
 import streamlit as st
 import pandas as pd
