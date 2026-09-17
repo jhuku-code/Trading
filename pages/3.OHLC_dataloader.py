@@ -14,6 +14,12 @@ Pagination:
   backwards from the latest candle in batches of 1000, stitching the
   results together. This lets us reliably pull 1500+ bars per coin.
 
+Rate limiting:
+  - ccxt's built-in rate limiter is enabled (100ms between requests)
+  - load_markets() retries with exponential backoff (Streamlit Cloud
+    shared IPs are frequently throttled by Bybit)
+  - Configurable sleep between per-coin fetches
+
 Exchange notes:
   - Market format: {SYM}/USDT:USDT (linear perpetual swap)
   - Max candles per request: 1000
@@ -57,7 +63,7 @@ st.sidebar.write(f"Using: `{default_excel_relpath}`")
 timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h", "30m", "15m"], index=0)
 limit = st.sidebar.number_input("OHLC limit", value=90, min_value=10, max_value=2000,
                                  help="Total candles per coin. Pagination handles limits > 1000 automatically.")
-sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.20, step=0.05,
+sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.30, step=0.05,
                                          help="Delay between API calls to respect rate limits")
 
 
@@ -82,8 +88,28 @@ def read_theme_excel(path):
 
 @st.cache_resource
 def get_exchange():
-    """Initialize Bybit exchange and load market metadata."""
-    ex = ccxt.bybit()
+    """
+    Initialize Bybit exchange with built-in rate limiting.
+    Retries load_markets() with exponential backoff because Streamlit Cloud's
+    shared IPs frequently trigger Bybit's rate limiter on the initial
+    metadata fetch.
+    """
+    ex = ccxt.bybit({
+        'enableRateLimit': True,  # ccxt auto-throttles to respect Bybit's limits
+        'rateLimit': 100,         # minimum ms between requests (~10 req/sec)
+    })
+
+    # Retry load_markets with backoff — 1s, 2s, 4s between attempts
+    for attempt in range(3):
+        try:
+            ex.load_markets()
+            return ex
+        except (ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable) as e:
+            wait = 2 ** attempt
+            st.toast(f"⏳ Rate limited on load_markets(), retrying in {wait}s...")
+            time.sleep(wait)
+
+    # Final attempt — let it raise if still failing
     ex.load_markets()
     return ex
 
@@ -194,6 +220,26 @@ def fetch_ohlc_multiindex(exchange, symbols, timeframe, limit):
             fetched += 1
 
             time.sleep(sleep_seconds)
+
+        except ccxt.RateLimitExceeded:
+            # If rate-limited mid-fetch, wait and retry once for this symbol
+            st.toast(f"⏳ Rate limited on {sym}, waiting 3s and retrying...")
+            time.sleep(3)
+            try:
+                ohlcv = fetch_ohlcv_paginated(exchange, market_id, timeframe, limit, sleep_seconds)
+                if ohlcv:
+                    df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+                    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+                    df = df.set_index("ts")
+                    df = df[["o", "h", "l", "c"]]
+                    df.columns = pd.MultiIndex.from_product([[sym], df.columns])
+                    frames.append(df)
+                    fetched += 1
+                else:
+                    failed += 1
+            except Exception:
+                st.warning(f"⚠️ {sym}: failed after rate-limit retry")
+                failed += 1
 
         except Exception as e:
             st.warning(f"⚠️ {sym}: {e}")
