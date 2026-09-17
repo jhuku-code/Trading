@@ -1,18 +1,23 @@
 """
 ================================================================================
-OHLC MultiIndex Data Loader — Binance USDT-M Futures
+OHLC MultiIndex Data Loader — Bybit USDT-M Linear Perpetuals
 ================================================================================
 Fetches OHLC candle data for all coins listed in Themes_mapping.xlsx from
-Binance USDT-margined perpetual futures (binanceusdm) via ccxt.
+Bybit linear perpetual futures via ccxt.
 
 Output: a single DataFrame with MultiIndex columns (symbol, field) where
 field ∈ {o, h, l, c}, stored in st.session_state["ohlc_multi"].
 Also derives a flat close-price DataFrame in st.session_state["close_prices"].
 
+Pagination:
+  Bybit caps at 1000 candles per request. For limits > 1000 we paginate
+  backwards from the latest candle in batches of 1000, stitching the
+  results together. This lets us reliably pull 1500+ bars per coin.
+
 Exchange notes:
-  - Market format: {SYM}/USDT:USDT (perpetual linear swap)
-  - Max candles per request: 1500
-  - Rate limit: handled via configurable sleep between calls
+  - Market format: {SYM}/USDT:USDT (linear perpetual swap)
+  - Max candles per request: 1000
+  - No US-IP geo-blocking (works on Streamlit Cloud)
 ================================================================================
 """
 
@@ -30,6 +35,19 @@ st.set_page_config(page_title="OHLC Data (MultiIndex)", layout="wide")
 st.title("OHLC MultiIndex Data Loader")
 
 
+# =================== Constants ===================
+BYBIT_MAX_CANDLES = 1000  # Bybit's per-request ceiling
+
+# Timeframe → milliseconds lookup for pagination offset calculations
+TF_TO_MS = {
+    "1d":  86_400_000,
+    "4h":  14_400_000,
+    "1h":   3_600_000,
+    "30m":  1_800_000,
+    "15m":    900_000,
+}
+
+
 # =================== Sidebar ===================
 st.sidebar.header("Settings")
 
@@ -37,8 +55,8 @@ default_excel_relpath = Path("Input-Files") / "Themes_mapping.xlsx"
 st.sidebar.write(f"Using: `{default_excel_relpath}`")
 
 timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h", "30m", "15m"], index=0)
-limit = st.sidebar.number_input("OHLC limit", value=90, min_value=10, max_value=1500,
-                                 help="Max candles per coin. Binance futures supports up to 1500.")
+limit = st.sidebar.number_input("OHLC limit", value=90, min_value=10, max_value=2000,
+                                 help="Total candles per coin. Pagination handles limits > 1000 automatically.")
 sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.20, step=0.05,
                                          help="Delay between API calls to respect rate limits")
 
@@ -64,15 +82,76 @@ def read_theme_excel(path):
 
 @st.cache_resource
 def get_exchange():
-    """Initialize Binance USDT-M futures exchange and load market metadata."""
-    ex = ccxt.binanceusdm()
+    """Initialize Bybit exchange and load market metadata."""
+    ex = ccxt.bybit()
     ex.load_markets()
     return ex
 
 
+def fetch_ohlcv_paginated(exchange, market_id, timeframe, total_limit, sleep_s):
+    """
+    Fetch up to `total_limit` candles for a single market, paginating
+    backwards in chunks of BYBIT_MAX_CANDLES (1000).
+
+    Strategy:
+      1) First call: no `since` → returns the most recent chunk.
+      2) Use the earliest timestamp from that chunk to calculate `since`
+         for the next (older) batch, stepping back by chunk_size * tf_ms.
+      3) Repeat until we have enough bars or the exchange returns nothing.
+      4) Sort ascending by timestamp, deduplicate, and trim to total_limit.
+
+    Returns a list of [timestamp_ms, o, h, l, c, v] lists, oldest first.
+    """
+    tf_ms = TF_TO_MS[timeframe]  # milliseconds per candle
+    all_candles = []
+    remaining = total_limit
+
+    # -- First fetch: latest candles (no `since`) --
+    chunk_size = min(remaining, BYBIT_MAX_CANDLES)
+    candles = exchange.fetch_ohlcv(market_id, timeframe=timeframe, limit=chunk_size)
+
+    if not candles:
+        return []
+
+    all_candles.extend(candles)
+    remaining -= len(candles)
+
+    # -- Paginate backwards if we need more bars --
+    while remaining > 0 and len(candles) == chunk_size:
+        # Earliest timestamp in current batch → step back by one full chunk
+        earliest_ts = candles[0][0]
+        since = earliest_ts - (min(remaining, BYBIT_MAX_CANDLES) * tf_ms)
+
+        chunk_size = min(remaining, BYBIT_MAX_CANDLES)
+
+        time.sleep(sleep_s)  # rate-limit pause between paginated calls
+
+        candles = exchange.fetch_ohlcv(market_id, timeframe=timeframe,
+                                        since=since, limit=chunk_size)
+
+        if not candles:
+            break  # no more history available
+
+        all_candles.extend(candles)
+        remaining -= len(candles)
+
+    # -- Deduplicate by timestamp, sort oldest-first, trim to requested limit --
+    seen = {}
+    for c in all_candles:
+        seen[c[0]] = c  # last-write-wins dedup on timestamp
+
+    sorted_candles = sorted(seen.values(), key=lambda x: x[0])
+
+    # Keep the most recent `total_limit` candles
+    if len(sorted_candles) > total_limit:
+        sorted_candles = sorted_candles[-total_limit:]
+
+    return sorted_candles
+
+
 def fetch_ohlc_multiindex(exchange, symbols, timeframe, limit):
     """
-    Fetch OHLC candles for each symbol from Binance USDT-M futures.
+    Fetch OHLC candles for each symbol from Bybit linear perpetuals.
 
     Returns a single DataFrame with:
       - DatetimeIndex (UTC timestamps)
@@ -84,13 +163,22 @@ def fetch_ohlc_multiindex(exchange, symbols, timeframe, limit):
     frames = []
     fetched = 0
     failed = 0
+    progress_bar = st.progress(0, text="Starting...")
 
-    for sym in symbols:
-        # Binance USDT-M perpetual market format: SYM/USDT:USDT
+    for i, sym in enumerate(symbols):
+        # Bybit linear perpetual market format: SYM/USDT:USDT
         market_id = f"{sym}/USDT:USDT"
+        progress_bar.progress((i + 1) / len(symbols),
+                              text=f"Fetching {sym} ({i + 1}/{len(symbols)})")
 
         try:
-            ohlcv = exchange.fetch_ohlcv(market_id, timeframe=timeframe, limit=limit)
+            # Use paginated fetch to handle limits > 1000
+            ohlcv = fetch_ohlcv_paginated(exchange, market_id, timeframe, limit, sleep_seconds)
+
+            if not ohlcv:
+                st.warning(f"⚠️ {sym}: no data returned")
+                failed += 1
+                continue
 
             df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
@@ -112,15 +200,17 @@ def fetch_ohlc_multiindex(exchange, symbols, timeframe, limit):
             failed += 1
             continue
 
+    progress_bar.empty()  # clean up progress bar after completion
+
     if not frames:
         st.error("No data fetched for any symbol. Check your Themes_mapping.xlsx entries "
-                 "against available Binance futures listings.")
+                 "against available Bybit perpetual listings.")
         return pd.DataFrame()
 
     # Outer join on timestamps — coins with fewer bars get NaN-filled
     final_df = pd.concat(frames, axis=1).sort_index()
 
-    st.toast(f"✅ Fetched {fetched} coins ({failed} failed)")
+    st.toast(f"✅ Fetched {fetched} coins, {failed} failed | {final_df.shape[0]} bars")
 
     return final_df
 
@@ -133,7 +223,7 @@ if st.sidebar.button("🔄 Fetch OHLC Data"):
 
     ex = get_exchange()
 
-    with st.spinner(f"Fetching {len(symbols)} coins from Binance USDT-M futures..."):
+    with st.spinner(f"Fetching {len(symbols)} coins from Bybit linear perpetuals..."):
         ohlc_df = fetch_ohlc_multiindex(ex, symbols, timeframe, limit)
 
     if not ohlc_df.empty:
