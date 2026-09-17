@@ -167,7 +167,11 @@ min_bars_required = fatl_period + jma_period + cross_lookback + 1
 for ticker, df in ohlc_multi.items():
     # ---- Validate dataframe has required columns ----
     # Normalize column names to lowercase for robustness
+    if not isinstance(df, pd.DataFrame):
+        continue
+    df = df.copy()
     df.columns = [c.lower() for c in df.columns]
+
 
     if "close" not in df.columns:
         skipped.append(ticker)
