@@ -1,34 +1,15 @@
 """
 ================================================================================
-OHLC MultiIndex Data Loader — Bybit Public REST API (no ccxt)
+OHLC MultiIndex Data Loader — Bybit Public REST API (Diagnostic Build)
 ================================================================================
-Fetches OHLC candle data for all coins listed in Themes_mapping.xlsx from
-Bybit's v5 public kline API for linear perpetual futures.
+Hardcoded test symbols for debugging. Verbose error logging on every API call
+to diagnose connectivity/format issues from Streamlit Cloud.
 
-Why direct REST instead of ccxt:
-  ccxt's Bybit driver calls load_markets() which fetches spot + inverse +
-  linear + option metadata in multiple requests. Streamlit Cloud's shared
-  IPs consistently trigger Bybit's rate limiter on these metadata calls.
-  The public kline endpoint needs no auth and no market metadata — just
-  the symbol string and interval.
-
-Output: a single DataFrame with MultiIndex columns (symbol, field) where
-field ∈ {o, h, l, c}, stored in st.session_state["ohlc_multi"].
-Also derives a flat close-price DataFrame in st.session_state["close_prices"].
-
-Pagination:
-  Bybit caps at 1000 candles per request. For limits > 1000 we paginate
-  backwards using the `end` timestamp parameter in chunks of 1000.
-
-API reference:
-  https://bybit-exchange.github.io/docs/v5/market/kline
-  Endpoint: GET https://api.bybit.com/v5/market/kline
-  Public, no auth required.
+Once working, swap TEST_SYMBOLS back to the Excel-based loader.
 ================================================================================
 """
 
 import time
-from pathlib import Path
 from datetime import datetime
 
 import requests
@@ -41,12 +22,17 @@ st.set_page_config(page_title="OHLC Data (MultiIndex)", layout="wide")
 st.title("OHLC MultiIndex Data Loader")
 
 
+# =================== Hardcoded Test Symbols ===================
+# Bybit linear perpetual format: just append USDT (no slash, no colon)
+# These are high-liquidity pairs guaranteed to exist on Bybit futures
+TEST_SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+
+
 # =================== Constants ===================
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
-BYBIT_MAX_CANDLES = 1000  # per-request ceiling
+BYBIT_MAX_CANDLES = 1000
 
 # Timeframe display → Bybit API interval mapping
-# Bybit intervals: 1,3,5,15,30,60,120,240,360,720,D,W,M
 TF_TO_BYBIT = {
     "1d":  "D",
     "4h":  "240",
@@ -55,7 +41,7 @@ TF_TO_BYBIT = {
     "15m": "15",
 }
 
-# Timeframe → milliseconds for pagination offset calculations
+# Timeframe → milliseconds for pagination
 TF_TO_MS = {
     "1d":  86_400_000,
     "4h":  14_400_000,
@@ -68,14 +54,12 @@ TF_TO_MS = {
 # =================== Sidebar ===================
 st.sidebar.header("Settings")
 
-default_excel_relpath = Path("Input-Files") / "Themes_mapping.xlsx"
-st.sidebar.write(f"Using: `{default_excel_relpath}`")
+st.sidebar.write(f"**Test symbols:** {', '.join(TEST_SYMBOLS)}")
 
 timeframe = st.sidebar.selectbox("Timeframe", ["1d", "4h", "1h", "30m", "15m"], index=0)
 limit = st.sidebar.number_input("OHLC limit", value=90, min_value=10, max_value=2000,
-                                 help="Total candles per coin. Pagination handles limits > 1000 automatically.")
-sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.20, step=0.05,
-                                         help="Delay between API calls to respect rate limits")
+                                 help="Total candles per coin. Pagination handles limits > 1000.")
+sleep_seconds = st.sidebar.number_input("Sleep (s)", value=0.30, step=0.05)
 
 
 # =================== Session State Init ===================
@@ -89,69 +73,89 @@ if "last_fetch" not in st.session_state:
     st.session_state["last_fetch"] = None
 
 
-# =================== Helpers ===================
-
-@st.cache_data
-def read_theme_excel(path):
-    """Load the coin-to-theme mapping spreadsheet."""
-    return pd.read_excel(path, engine="openpyxl")
-
+# =================== API Functions ===================
 
 def bybit_fetch_klines(symbol: str, interval: str, limit: int = 1000,
                         end: int = None) -> list:
     """
     Call Bybit's v5 public kline endpoint for a single symbol.
+    Includes verbose diagnostic logging for every failure mode.
 
-    Args:
-        symbol:   Bybit market symbol, e.g. "BTCUSDT"
-        interval: Bybit interval string, e.g. "30", "60", "D"
-        limit:    Number of candles (max 1000)
-        end:      End timestamp in milliseconds (None = latest)
-
-    Returns:
-        List of [timestamp_ms, open, high, low, close] (oldest first).
-        Bybit returns newest-first, so we reverse here for consistency.
-
-    Raises on HTTP errors after 3 retries with backoff.
+    Returns list of [ts_ms, o, h, l, c] oldest first, or [] on failure.
     """
+    # Bybit expects symbol like "BTCUSDT" for linear perps
+    bybit_symbol = f"{symbol}USDT"
+
     params = {
         "category": "linear",
-        "symbol": symbol,
+        "symbol": bybit_symbol,
         "interval": interval,
         "limit": min(limit, BYBIT_MAX_CANDLES),
     }
     if end is not None:
         params["end"] = end
 
-    # Retry with backoff for transient rate-limit / server errors
+    last_status = None
+    last_body = None
+
     for attempt in range(3):
-        resp = requests.get(BYBIT_KLINE_URL, params=params, timeout=15)
+        try:
+            resp = requests.get(BYBIT_KLINE_URL, params=params, timeout=15)
+            last_status = resp.status_code
+            last_body = resp.text[:300]  # capture response for diagnostics
 
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("retCode") == 0 and data.get("result", {}).get("list"):
-                # Bybit returns: [ts, o, h, l, c, volume, turnover] newest-first
-                raw = data["result"]["list"]
-                # Extract [ts, o, h, l, c], convert strings to float, reverse to oldest-first
-                candles = [
-                    [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
-                    for r in raw
-                ]
-                candles.reverse()
-                return candles
+            if resp.status_code == 200:
+                data = resp.json()
+
+                if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+                    # Success — parse candles
+                    raw = data["result"]["list"]
+                    candles = [
+                        [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
+                        for r in raw
+                    ]
+                    candles.reverse()  # Bybit returns newest-first; we want oldest-first
+                    return candles
+
+                else:
+                    # HTTP 200 but Bybit returned an error or empty data
+                    st.warning(
+                        f"⚠️ **{bybit_symbol}**: Bybit returned retCode={data.get('retCode')}, "
+                        f"retMsg='{data.get('retMsg', 'n/a')}'"
+                    )
+                    return []
+
+            elif resp.status_code == 429:
+                # Rate limited — backoff and retry
+                wait = 2 * (attempt + 1)
+                st.toast(f"⏳ {bybit_symbol}: rate limited, waiting {wait}s (attempt {attempt+1}/3)")
+                time.sleep(wait)
+
             else:
-                # Valid response but no data (delisted / unlisted symbol)
-                return []
+                # Other HTTP error
+                time.sleep(1)
 
-        elif resp.status_code == 429:
-            # Rate limited — backoff and retry
-            wait = 2 * (attempt + 1)
-            time.sleep(wait)
-        else:
-            # Other HTTP error — backoff and retry
+        except requests.exceptions.ConnectionError as e:
+            last_status = "ConnectionError"
+            last_body = str(e)[:300]
             time.sleep(1)
 
-    return []  # all retries exhausted
+        except requests.exceptions.Timeout:
+            last_status = "Timeout"
+            last_body = "Request timed out after 15s"
+            time.sleep(1)
+
+        except Exception as e:
+            last_status = type(e).__name__
+            last_body = str(e)[:300]
+            time.sleep(1)
+
+    # All retries exhausted — show exactly what happened
+    st.warning(
+        f"⚠️ **{bybit_symbol}**: failed after 3 retries — "
+        f"status={last_status}, response: `{last_body}`"
+    )
+    return []
 
 
 def fetch_ohlcv_paginated(symbol: str, timeframe: str, total_limit: int,
@@ -160,23 +164,15 @@ def fetch_ohlcv_paginated(symbol: str, timeframe: str, total_limit: int,
     Fetch up to `total_limit` candles for a single symbol, paginating
     backwards in chunks of 1000.
 
-    Strategy:
-      1) First call: no `end` → returns the most recent 1000 candles.
-      2) Use the earliest timestamp from that chunk as the new `end`
-         for the next (older) batch.
-      3) Repeat until we have enough bars or the API returns nothing.
-      4) Deduplicate, sort oldest-first, trim to total_limit (keeping latest).
-
     Returns list of [ts_ms, o, h, l, c], oldest first.
     """
     interval = TF_TO_BYBIT[timeframe]
-    bybit_symbol = f"{symbol}USDT"  # Bybit format: no slash, no colon
     all_candles = []
     remaining = total_limit
 
     # -- First fetch: latest candles --
     chunk_size = min(remaining, BYBIT_MAX_CANDLES)
-    candles = bybit_fetch_klines(bybit_symbol, interval, limit=chunk_size)
+    candles = bybit_fetch_klines(symbol, interval, limit=chunk_size)
 
     if not candles:
         return []
@@ -187,15 +183,13 @@ def fetch_ohlcv_paginated(symbol: str, timeframe: str, total_limit: int,
     # -- Paginate backwards if we need more bars --
     while remaining > 0 and len(candles) >= chunk_size:
         # Earliest timestamp in current batch → use as `end` for next batch
-        # Subtract 1ms so we don't re-fetch the boundary candle
-        end_ts = candles[0][0] - 1
+        end_ts = candles[0][0] - 1  # -1ms to avoid boundary overlap
 
         chunk_size = min(remaining, BYBIT_MAX_CANDLES)
 
         time.sleep(sleep_s)
 
-        candles = bybit_fetch_klines(bybit_symbol, interval,
-                                      limit=chunk_size, end=end_ts)
+        candles = bybit_fetch_klines(symbol, interval, limit=chunk_size, end=end_ts)
 
         if not candles:
             break
@@ -224,62 +218,44 @@ def fetch_ohlc_multiindex(symbols: list, timeframe: str, limit: int) -> pd.DataF
     Returns a single DataFrame with:
       - DatetimeIndex (UTC timestamps)
       - MultiIndex columns: (symbol, field) where field ∈ {o, h, l, c}
-
-    Coins that fail to fetch (unlisted, delisted, no data) are logged
-    as warnings and skipped — the rest proceed normally.
     """
     frames = []
     fetched = 0
     failed = 0
     failed_symbols = []
-    progress_bar = st.progress(0, text="Starting...")
 
     for i, sym in enumerate(symbols):
-        progress_bar.progress((i + 1) / len(symbols),
-                              text=f"Fetching {sym} ({i + 1}/{len(symbols)})")
+        st.write(f"**[{i+1}/{len(symbols)}]** Fetching `{sym}USDT` ...")
 
-        try:
-            ohlcv = fetch_ohlcv_paginated(sym, timeframe, limit, sleep_seconds)
+        ohlcv = fetch_ohlcv_paginated(sym, timeframe, limit, sleep_seconds)
 
-            if not ohlcv:
-                failed += 1
-                failed_symbols.append(sym)
-                continue
-
-            df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c"])
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            df = df.set_index("ts")
-
-            # MultiIndex columns → (symbol, field)
-            df.columns = pd.MultiIndex.from_product([[sym], df.columns])
-
-            frames.append(df)
-            fetched += 1
-
-            time.sleep(sleep_seconds)
-
-        except Exception as e:
-            st.warning(f"⚠️ {sym}: {e}")
+        if not ohlcv:
+            st.error(f"❌ {sym}: no data returned")
             failed += 1
             failed_symbols.append(sym)
             continue
 
-    progress_bar.empty()
+        df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        df = df.set_index("ts")
+
+        # MultiIndex columns → (symbol, field)
+        df.columns = pd.MultiIndex.from_product([[sym], df.columns])
+
+        frames.append(df)
+        fetched += 1
+        st.write(f"✅ {sym}: {len(ohlcv)} bars fetched")
+
+        time.sleep(sleep_seconds)
 
     if not frames:
-        st.error("No data fetched for any symbol. Check your Themes_mapping.xlsx entries "
-                 "against available Bybit perpetual listings.")
+        st.error("No data fetched for any symbol. See warnings above for details.")
         return pd.DataFrame()
 
     # Outer join on timestamps — coins with fewer bars get NaN-filled
     final_df = pd.concat(frames, axis=1).sort_index()
 
-    st.toast(f"✅ Fetched {fetched} coins, {failed} failed | {final_df.shape[0]} bars")
-
-    # Show failed symbols in a collapsed expander if any
-    if failed_symbols:
-        with st.expander(f"⚠️ {failed} symbol(s) returned no data"):
-            st.write(", ".join(sorted(failed_symbols)))
+    st.success(f"✅ Done — {fetched} coins fetched, {failed} failed, {final_df.shape[0]} total bars")
 
     return final_df
 
@@ -287,23 +263,16 @@ def fetch_ohlc_multiindex(symbols: list, timeframe: str, limit: int) -> pd.DataF
 # =================== Fetch Button ===================
 if st.sidebar.button("🔄 Fetch OHLC Data"):
 
-    df_map = read_theme_excel(default_excel_relpath)
-    symbols = df_map["Symbol"].str.upper().tolist()
+    symbols = [s.upper().strip() for s in TEST_SYMBOLS]
 
-    with st.spinner(f"Fetching {len(symbols)} coins from Bybit linear perpetuals..."):
+    with st.spinner(f"Fetching {len(symbols)} test coins from Bybit..."):
         ohlc_df = fetch_ohlc_multiindex(symbols, timeframe, limit)
 
     if not ohlc_df.empty:
-        # -------- Store in session state --------
         st.session_state["ohlc_multi"] = ohlc_df
-
-        # Derived close-only DataFrame (for pages that expect a flat close matrix)
         st.session_state["close_prices"] = ohlc_df.xs("c", level=1, axis=1)
-
         st.session_state["last_fetch"] = datetime.utcnow()
         st.session_state["timeframe"] = timeframe
-
-        st.success("OHLC data loaded successfully!")
 
 
 # =================== Display ===================
