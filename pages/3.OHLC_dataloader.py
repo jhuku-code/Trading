@@ -89,27 +89,28 @@ def read_theme_excel(path):
 @st.cache_resource
 def get_exchange():
     """
-    Initialize Bybit exchange with built-in rate limiting.
-    Retries load_markets() with exponential backoff because Streamlit Cloud's
-    shared IPs frequently trigger Bybit's rate limiter on the initial
-    metadata fetch.
+    Initialize Bybit exchange — restricted to linear swaps only.
+    By setting defaultType='swap' and defaultSubType='linear', ccxt skips
+    spot/inverse/option market metadata fetches, cutting load_markets()
+    API calls from ~5 to ~1 and avoiding rate-limit triggers.
     """
     ex = ccxt.bybit({
-        'enableRateLimit': True,  # ccxt auto-throttles to respect Bybit's limits
-        'rateLimit': 100,         # minimum ms between requests (~10 req/sec)
+        'enableRateLimit': True,
+        'rateLimit': 200,
+        'options': {
+            'defaultType': 'swap',
+            'defaultSubType': 'linear',
+        },
     })
 
-    # Retry load_markets with backoff — 1s, 2s, 4s between attempts
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             ex.load_markets()
             return ex
-        except (ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable) as e:
-            wait = 2 ** attempt
-            st.toast(f"⏳ Rate limited on load_markets(), retrying in {wait}s...")
+        except (ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable):
+            wait = 3 * (attempt + 1)  # 3s, 6s, 9s, 12s, 15s
             time.sleep(wait)
 
-    # Final attempt — let it raise if still failing
     ex.load_markets()
     return ex
 
