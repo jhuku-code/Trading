@@ -13,6 +13,9 @@ JFATL = JMA-smoothed FATL (Fast Adaptive Trendline)
           where e = 0.5 * (phase + 1)
 
 Pine Script source: Multi-Indicator Trading Signals_v2 (v6)
+
+Data source: ohlc_multi session state — a single DataFrame with MultiIndex
+columns of shape (symbol, field) where field in {o, h, l, c}.
 ================================================================================
 """
 
@@ -25,12 +28,16 @@ st.set_page_config(page_title="JFATL Long/Short", layout="wide")
 st.title("JFATL Long/Short Signal Scanner")
 
 # =================== Session State Gate ===================
-# All pages read OHLC data from the shared session state key populated by the dataloader page
+# ohlc_multi is a single DataFrame with MultiIndex columns: (symbol, field)
+# NOT a dict — this is the structure produced by the OHLC dataloader page
 if "ohlc_multi" not in st.session_state or st.session_state["ohlc_multi"] is None:
     st.warning("⚠️ No OHLC data found in session. Please load data from the **OHLC Dataloader** page first.")
     st.stop()
 
-ohlc_multi = st.session_state["ohlc_multi"]  # dict of {ticker: DataFrame} with OHLC columns
+ohlc_multi = st.session_state["ohlc_multi"]  # DataFrame with MultiIndex columns (symbol, field)
+
+# Extract the list of coin symbols from the top level of the MultiIndex
+all_symbols = ohlc_multi.columns.get_level_values(0).unique().tolist()
 
 
 # =================== Helper Functions ===================
@@ -64,18 +71,19 @@ def compute_jfatl(close: pd.Series, fatl_period: int, jma_period: int, phase: fl
              + WMA(fatl, jma_period / 2) * (1 - e) — fast WMA component
 
     The dual-WMA blend controlled by 'phase' lets the user dial between
-    a smoother (phase→-1, favoring the fast WMA) and a laggier
-    (phase→+1, favoring the slow WMA) trendline.
+    a smoother (phase->-1, favoring the fast WMA) and a laggier
+    (phase->+1, favoring the slow WMA) trendline.
     """
     # Step 1: FATL = Simple Moving Average of close prices
     fatl = close.rolling(window=fatl_period, min_periods=fatl_period).mean()
 
     # Step 2: Phase-based blending coefficient
-    e = 0.5 * (phase + 1.0)  # phase=0.5 → e=0.75
+    e = 0.5 * (phase + 1.0)  # phase=0.5 -> e=0.75
 
     # Step 3: Two WMAs of the FATL at different lookback lengths
-    wma_slow = compute_wma(fatl, jma_period)               # WMA(fatl, 120) — laggier
-    wma_fast = compute_wma(fatl, max(int(jma_period / 2), 1))  # WMA(fatl, 60)  — faster
+    half_period = max(int(jma_period / 2), 1)
+    wma_slow = compute_wma(fatl, jma_period)       # WMA(fatl, 120) — laggier
+    wma_fast = compute_wma(fatl, half_period)       # WMA(fatl, 60)  — faster
 
     # Step 4: Blend
     jfatl = wma_slow * e + wma_fast * (1.0 - e)
@@ -113,7 +121,7 @@ def detect_crossovers(close: pd.Series, jfatl: pd.Series, lookback: int):
         curr_jfatl = jfatl.iloc[idx_curr]
         prev_jfatl = jfatl.iloc[idx_prev]
 
-        # Skip if any value is NaN (insufficient warm-up data)
+        # Skip if any value is NaN (insufficient warm-up data or missing coin data)
         if pd.isna(curr_close) or pd.isna(prev_close) or pd.isna(curr_jfatl) or pd.isna(prev_jfatl):
             continue
 
@@ -151,8 +159,8 @@ cross_lookback = st.sidebar.number_input("Crossover Lookback (bars)", min_value=
 st.sidebar.markdown("---")
 st.sidebar.caption(
     f"**Effective blend:** e = {0.5 * (phase + 1):.2f}  \n"
-    f"Slow WMA({jma_period}) × {0.5 * (phase + 1):.2f} + "
-    f"Fast WMA({max(int(jma_period / 2), 1)}) × {1 - 0.5 * (phase + 1):.2f}"
+    f"Slow WMA({jma_period}) x {0.5 * (phase + 1):.2f} + "
+    f"Fast WMA({max(int(jma_period / 2), 1)}) x {1 - 0.5 * (phase + 1):.2f}"
 )
 
 
@@ -164,24 +172,18 @@ skipped = []        # coins with insufficient data for JFATL warm-up
 # Minimum bars needed: fatl_period + jma_period + crossover lookback
 min_bars_required = fatl_period + jma_period + cross_lookback + 1
 
-for ticker, df in ohlc_multi.items():
-    # ---- Validate dataframe has required columns ----
-    # Normalize column names to lowercase for robustness
-    if not isinstance(df, pd.DataFrame):
+for sym in all_symbols:
+    # ---- Extract this coin's close prices from the MultiIndex DataFrame ----
+    # ohlc_multi[(sym, 'c')] gives the close series for this symbol
+    try:
+        close = ohlc_multi[(sym, "c")].dropna().astype(float)
+    except KeyError:
+        skipped.append(sym)
         continue
-    df = df.copy()
-    df.columns = [c.lower() for c in df.columns]
-
-
-    if "close" not in df.columns:
-        skipped.append(ticker)
-        continue
-
-    close = df["close"].astype(float)
 
     # ---- Skip coins with insufficient history for indicator warm-up ----
     if len(close) < min_bars_required:
-        skipped.append(ticker)
+        skipped.append(sym)
         continue
 
     # ---- Compute JFATL line ----
@@ -191,19 +193,19 @@ for ticker, df in ohlc_multi.items():
     last_close = close.iloc[-1]
     last_jfatl = jfatl.iloc[-1]
     if pd.isna(last_jfatl):
-        skipped.append(ticker)
+        skipped.append(sym)
         continue
 
     # ---- Detect crossovers within the lookback window ----
     is_long, is_short, bars_ago = detect_crossovers(close, jfatl, cross_lookback)
 
-    # ---- % price difference: (close - jfatl) / jfatl × 100 ----
+    # ---- % price difference: (close - jfatl) / jfatl x 100 ----
     # Positive = price above JFATL (bullish spread); Negative = price below (bearish spread)
     pct_diff = ((last_close - last_jfatl) / last_jfatl) * 100.0
 
     if is_long:
         long_signals.append({
-            "Coin": ticker,
+            "Coin": sym,
             "Close": round(last_close, 2),
             "JFATL": round(last_jfatl, 2),
             "Spread %": round(pct_diff, 2),       # how far above JFATL the price is
@@ -212,7 +214,7 @@ for ticker, df in ohlc_multi.items():
 
     if is_short:
         short_signals.append({
-            "Coin": ticker,
+            "Coin": sym,
             "Close": round(last_close, 2),
             "JFATL": round(last_jfatl, 2),
             "Spread %": round(pct_diff, 2),        # how far below JFATL the price is
@@ -226,7 +228,7 @@ for ticker, df in ohlc_multi.items():
 col1, col2, col3 = st.columns(3)
 col1.metric("🟢 Long Signals", len(long_signals))
 col2.metric("🔴 Short Signals", len(short_signals))
-col3.metric("Total Coins Scanned", len(ohlc_multi) - len(skipped))
+col3.metric("Total Coins Scanned", len(all_symbols) - len(skipped))
 
 st.markdown("---")
 
