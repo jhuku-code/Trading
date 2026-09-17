@@ -44,7 +44,7 @@ def read_theme_excel(path):
 
 @st.cache_resource
 def get_exchange():
-    ex = ccxt.binanceusdm()
+    ex = ccxt.kucoin()
     ex.load_markets()
     return ex
 
@@ -54,7 +54,7 @@ def fetch_ohlc_multiindex(exchange, symbols, timeframe, limit):
 
     for sym in symbols:
         try:
-            ohlcv = exchange.fetch_ohlcv(f"{sym}/USDT:USDT", timeframe=timeframe, limit=limit)
+            ohlcv = exchange.fetch_ohlcv(f"{sym}/USDT", timeframe=timeframe, limit=limit)
 
             df = pd.DataFrame(
                 ohlcv,
