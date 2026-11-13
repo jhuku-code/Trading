@@ -41,15 +41,20 @@ def get_exchange():
     return ex
 
 def fetch_prices(exchange, symbols, timeframe, limit):
-    frames = []
+    close_frames, high_frames, low_frames = [], [], []
 
     for sym in symbols:
         try:
             ohlcv = exchange.fetch_ohlcv(f"{sym}/USDT", timeframe=timeframe, limit=limit)
+            if not ohlcv:
+                continue
             df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            df = df.drop_duplicates("ts").set_index("ts").sort_index()
 
-            frames.append(df.set_index("ts")["c"].rename(sym))
+            close_frames.append(df["c"].rename(sym))
+            high_frames.append(df["h"].rename(sym))
+            low_frames.append(df["l"].rename(sym))
 
             time.sleep(sleep_seconds)
 
@@ -57,7 +62,10 @@ def fetch_prices(exchange, symbols, timeframe, limit):
             print(f"Error fetching {sym}: {e}")
             continue
 
-    return pd.concat(frames, axis=1)
+    def combine(frames):
+        return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+
+    return combine(close_frames), combine(high_frames), combine(low_frames)
 
 def compute_returns(price_df):
     lookbacks = [1,3,5,10,15,30,60]
@@ -123,10 +131,16 @@ if st.sidebar.button("🔄 Fetch Data"):
     ex = get_exchange()
 
     with st.spinner("Fetching prices..."):
-        prices = fetch_prices(ex, symbols, timeframe, limit)
+        prices, highs, lows = fetch_prices(ex, symbols, timeframe, limit)
+
+    if prices.empty:
+        st.error("No price data was fetched. Check the symbols and exchange connectivity.")
+        st.stop()
 
     # ---------------- STORE FOR OTHER PAGES ----------------
     st.session_state["price_theme"] = prices.copy()
+    st.session_state["high_theme"] = highs.copy()
+    st.session_state["low_theme"] = lows.copy()
 
     st.session_state["theme_values"] = [
         mapping.get(col, "UNKNOWN") for col in prices.columns
